@@ -4141,8 +4141,6 @@ class TestSessionModelHold:
         """A failed build isn't retried at every send, which would rebuild it
         under the registry-wide client lock for each held session; the next
         registry change retries it, and a successful bind ends the hold."""
-        import logging
-
         reg = self._registry()
         session = _make_session(registry=reg, model_alias="gw")
         self._delete_gw(reg)
