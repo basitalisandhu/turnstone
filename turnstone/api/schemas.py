@@ -82,11 +82,30 @@ class AuthLoginRequest(BaseModel):
     token: str = Field(default="", description="Raw stored ts_ API token; JWT exchange is refused")
 
 
+class UserAvatar(BaseModel):
+    """How a page draws a person: one initial on a palette colour, or an uploaded picture."""
+
+    color: int = Field(ge=0, le=5, description="Palette index of the generated avatar's colour")
+    initial: str = Field(
+        description="The letter drawn on the colour; empty when the name has no letter or digit"
+    )
+    picture: str | None = Field(
+        default=None,
+        description=(
+            "Version of the uploaded picture, or null for none; the PNG is served at "
+            "/v1/api/users/{user_id}/avatar?v={picture}"
+        ),
+    )
+
+
 class AuthLoginResponse(BaseModel):
     """POST /v1/api/auth/login success response."""
 
     status: str = Field(default="ok")
     user_id: str = Field(default="", description="Authenticated user ID")
+    username: str = Field(default="", description="Login username (user accounts)")
+    display_name: str = Field(default="", description="Display name, else username (user accounts)")
+    avatar: UserAvatar | None = Field(default=None, description="Avatar (user accounts)")
     role: str = Field(description="Legacy role", examples=["full", "read"])
     scopes: str = Field(
         default="", description="Comma-separated scopes", examples=["read,write,approve"]
@@ -121,12 +140,25 @@ class UserInfo(BaseModel):
     username: str
     display_name: str
     created: str
+    avatar: UserAvatar | None = None
 
 
 class ListUsersResponse(BaseModel):
     """GET /v1/api/admin/users response."""
 
     users: list[UserInfo]
+
+
+class SetUserAvatarColorRequest(BaseModel):
+    """PUT /v1/api/users/{user_id}/avatar request body."""
+
+    color: int = Field(ge=0, le=5, description="Palette index of the avatar's colour")
+
+
+class UserAvatarResponse(BaseModel):
+    """The caller's avatar after a change."""
+
+    avatar: UserAvatar
 
 
 class CreateTokenRequest(BaseModel):
@@ -188,6 +220,8 @@ class AuthSetupResponse(BaseModel):
     status: str = Field(default="ok")
     user_id: str
     username: str
+    display_name: str = Field(default="", description="Display name, else username")
+    avatar: UserAvatar | None = None
     role: str = Field(default="full")
     scopes: str = Field(default="approve,read,write")
     jwt: str = Field(default="", description="JWT session token")
@@ -209,9 +243,19 @@ class AuthWhoamiResponse(BaseModel):
     """GET /v1/api/auth/whoami response."""
 
     user_id: str
+    username: str = Field(
+        default="",
+        description=(
+            "Display name, else username (user accounts); unlike login, setup and refresh, "
+            "where username is the login name"
+        ),
+    )
+    display_name: str = Field(default="", description="Display name, else username (user accounts)")
+    avatar: UserAvatar | None = Field(default=None, description="Avatar (user accounts)")
     permissions: str = ""
     scopes: str = Field(default="", description="Comma-separated effective transport scopes")
     can_refresh: bool = Field(default=False, description="Eligible for human-session renewal")
+    exp: int | None = Field(default=None, description="Session cookie expiry in epoch seconds")
 
 
 # ---------------------------------------------------------------------------

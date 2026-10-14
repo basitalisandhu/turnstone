@@ -102,9 +102,16 @@ Authenticate with a password or raw stored API token and receive a JWT. JWT inpu
   "scopes": "approve,read,write",
   "can_refresh": true,
   "jwt": "eyJhbGciOiJIUzI1NiIs...",
-  "user_id": "u_abc123"
+  "user_id": "u_abc123",
+  "username": "alice",
+  "display_name": "Alice Smith",
+  "avatar": {"color": 2, "initial": "A", "picture": null}
 }
 ```
+
+`username` is the login name, `display_name` the display name (else the login name), and `avatar`
+the person's [avatar descriptor](#user-avatars). All three are absent for a principal with no user
+account.
 
 The response also sets a surface-scoped HttpOnly cookie containing the JWT
 (`turnstone_auth_server` on turnstone-server, `turnstone_auth_console` on turnstone-console).
@@ -124,9 +131,10 @@ scopes and return `can_refresh: false`.
 ### `POST /v1/api/auth/refresh`
 
 Renew a currently valid, non-service password/OIDC session using current role permissions. The
-success response includes the login fields, `can_refresh: true`, and `exp` in epoch seconds, and
-sets a fresh session cookie. An empty permission set or an ineligible credential source returns
-403. Permission-store failure returns 503 without replacing or clearing the existing cookie.
+success response includes the login fields (`username`, `display_name` and `avatar` among them),
+`can_refresh: true`, and `exp` in epoch seconds, and sets a fresh session cookie. An empty
+permission set or an ineligible credential source returns 403. Permission-store failure returns
+503 without replacing or clearing the existing cookie.
 
 API-derived JWTs have a fixed lifetime and cannot renew here; exchange a still-valid raw API token
 through login instead. Proxy, coordinator, service, and other JWT sources cannot use this endpoint.
@@ -135,8 +143,10 @@ Ordinary use of existing JWTs continues until their original expiry.
 ### `GET /v1/api/auth/whoami`
 
 Return the authenticated identity, named `permissions`, effective `scopes`, and `can_refresh`.
-Renewal eligibility uses the same credential source/scope rule as the refresh endpoint. Cookie
-sessions also include their `exp` when available.
+For a user account it also returns `display_name` and `avatar`, and `username`, which here holds
+the display name (else the login name), as it always has. Renewal eligibility uses the same
+credential source/scope rule as the refresh endpoint. Cookie sessions also include their `exp`
+when available.
 
 ---
 
@@ -222,6 +232,8 @@ this endpoint.
   "status": "ok",
   "user_id": "u_abc123",
   "username": "admin",
+  "display_name": "Admin",
+  "avatar": {"color": 3, "initial": "A", "picture": null},
   "role": "full",
   "scopes": "approve,read,write",
   "jwt": "eyJhbGciOiJIUzI1NiIs..."
@@ -244,6 +256,57 @@ Returned when one or more users already exist in the database.
 ```json
 {"error": "Auth is not enabled"}
 ```
+
+---
+
+### User avatars
+
+A person's avatar is one initial on one of six colours, or a picture they uploaded. Responses that
+carry a signed-in person's name carry their avatar descriptor:
+
+```json
+{"color": 2, "initial": "J", "picture": "3f2a9c41d0b7e655"}
+```
+
+`color` is a palette index from 0 to 5. `initial` is the letter to draw; it is empty when neither
+name has a letter or digit. `picture` is the version of the uploaded picture, or `null`.
+
+#### `GET /v1/api/users/{user_id}/avatar`
+
+Returns the user's uploaded picture as a 256px PNG, or `404` when there is none. Any signed-in
+caller may fetch any user's picture. With `?v=` set to the descriptor's `picture` the response may
+be cached for a year; without it, it revalidates against its ETag.
+
+#### `PUT /v1/api/users/{user_id}/avatar`
+
+Sets your colour: `{"color": 4}`. Returns `{"avatar": {...}}`.
+
+#### `PUT /v1/api/users/{user_id}/avatar/picture`
+
+Uploads your picture as multipart form data with a `file` field: PNG, JPEG or WebP, at most 4 MB,
+and at most 4096 by 4096 pixels for JPEG or 2048 by 2048 for PNG and WebP. A JPEG saved in more than
+100 progressive passes is refused, since each pass costs a decode of the whole picture. The server
+crops the centre square, applies the EXIF orientation and stores a 256px PNG with no metadata from
+the upload. It does not convert colours to sRGB first, so a picture tagged with a wider colour space
+such as Display P3 looks a little duller; the upload dialog converts to sRGB before it sends. The
+server processes pictures one at a time, in arrival order, and one per person. While your last
+picture, or too many others, are still being processed it answers `503` with `Retry-After`, meaning
+try again shortly. Audited as `user.avatar.set_picture`, with the new picture's version. Returns
+`{"avatar": {...}}`.
+
+#### `DELETE /v1/api/users/{user_id}/avatar/picture`
+
+Removes your picture; your initial and colour show again. When there was one, audited as
+`user.avatar.remove_picture`, with its version. Returns `{"avatar": {...}}`.
+
+These three change only the caller's own account and need the `write` scope, so a viewer keeps
+the colour picked when their account was made. Another user's id returns `403`, as does a
+credential without `write`; a principal with no user account gets `404`.
+
+#### `DELETE /v1/api/admin/users/{user_id}/avatar/picture` (Console)
+
+Removes any user's picture. Requires `admin.users`. When there was one, audited as
+`user.avatar.remove_picture`, with its version.
 
 ---
 

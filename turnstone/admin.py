@@ -86,6 +86,9 @@ def _cmd_create_user(args: argparse.Namespace) -> None:
             "Error: failed to provision viewer access; check database migrations.", file=sys.stderr
         )
         sys.exit(1)
+    from turnstone.core.avatars import assign_avatar_color
+
+    assign_avatar_color(storage, user_id, args.name, args.username)
     print(f"Created user: {user_id}")
     print(f"  Username: {args.username}")
     print(f"  Name: {args.name}")
@@ -174,6 +177,9 @@ def _cmd_create_admin(args: argparse.Namespace) -> None:
     pw_hash = hash_password(password)
     storage.create_user(user_id, args.username, display_name, pw_hash)
     storage.assign_role(user_id, "builtin-admin", "")
+    from turnstone.core.avatars import assign_avatar_color
+
+    assign_avatar_color(storage, user_id, display_name, args.username)
     print(f"Created admin user: {user_id}")
     print(f"  Username: {args.username}")
     print(f"  Name: {display_name}")

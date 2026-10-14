@@ -252,6 +252,12 @@ sa.Index("idx_project_members_user", project_members.c.user_id)
 # User identity tables
 # ---------------------------------------------------------------------------
 
+# The avatar columns hold a person's avatar (turnstone.core.avatars):
+# ``avatar_color`` is a palette index (0-5), NULL until one is picked, and
+# readers fall back to the id hash; ``avatar_image`` is an uploaded picture,
+# already normalised to a 256px square PNG, and ``avatar_sha256`` its version.
+# On the users row, so they go when the user does.  Select columns by name:
+# the picture is too large to load with every read of a user.
 users = sa.Table(
     "users",
     metadata,
@@ -261,6 +267,9 @@ users = sa.Table(
     sa.Column("password_hash", sa.Text, nullable=False),
     sa.Column("org_id", sa.Text, nullable=False, server_default=""),
     sa.Column("created", sa.Text, nullable=False),
+    sa.Column("avatar_color", sa.Integer, nullable=True),
+    sa.Column("avatar_image", sa.LargeBinary, nullable=True),
+    sa.Column("avatar_sha256", sa.Text, nullable=True),
 )
 
 sa.Index("idx_users_username", users.c.username)

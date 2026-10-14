@@ -2217,6 +2217,70 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             ).fetchall()
             return {r[0] for r in rows}
 
+    # -- User avatars ------------------------------------------------------------
+
+    def get_user_avatar(self, user_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(users.c.avatar_color, users.c.avatar_sha256).where(
+                    users.c.user_id == user_id
+                )
+            ).fetchone()
+            if row is None or (row[0] is None and row[1] is None):
+                return None
+            return {"color": row[0], "image_sha256": row[1]}
+
+    def list_user_avatars(self) -> dict[str, dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(users.c.user_id, users.c.avatar_color, users.c.avatar_sha256).where(
+                    users.c.avatar_color.is_not(None) | users.c.avatar_sha256.is_not(None)
+                )
+            ).fetchall()
+            return {r[0]: {"color": r[1], "image_sha256": r[2]} for r in rows}
+
+    def get_user_avatar_image(self, user_id: str) -> tuple[bytes, str] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(users.c.avatar_image, users.c.avatar_sha256).where(
+                    users.c.user_id == user_id
+                )
+            ).fetchone()
+            if row is None or row[0] is None or not row[1]:
+                return None
+            return bytes(row[0]), str(row[1])
+
+    def set_user_avatar_color(self, user_id: str, color: int) -> bool:
+        return self._update_user_avatar(user_id, avatar_color=color)
+
+    def set_user_avatar_image(self, user_id: str, image: bytes, image_sha256: str) -> bool:
+        return self._update_user_avatar(user_id, avatar_image=image, avatar_sha256=image_sha256)
+
+    def _update_user_avatar(self, user_id: str, **values: Any) -> bool:
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.update(users).where(users.c.user_id == user_id).values(**values)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def clear_user_avatar_image(self, user_id: str) -> str | None:
+        with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            removed = conn.execute(
+                sa.select(users.c.avatar_sha256).where(users.c.user_id == user_id)
+            ).scalar()
+            if removed is None:
+                conn.rollback()
+                return None
+            conn.execute(
+                sa.update(users)
+                .where(users.c.user_id == user_id)
+                .values(avatar_image=None, avatar_sha256=None)
+            )
+            conn.commit()
+            return str(removed)
+
     def delete_user(self, user_id: str) -> bool:
         with self._conn() as conn:
             conn.execute(sa.text("BEGIN IMMEDIATE"))

@@ -733,3 +733,25 @@ assert.equal(cards.children[0].dataset.wsId, 'a');
 """,
         ui_loader=True,
     )
+
+
+def test_the_user_chip_shows_the_display_name():
+    # Login, setup and refresh carry the login name in `username`, and whoami
+    # the display name; every one of them carries `display_name`.
+    # The avatar rides with the name and is cleared with it.
+    _run(r"""
+const avatar = {color:3, initial:'J', picture:'0123456789abcdef'};
+_storePermissions({...operator, username:'jin', display_name:'Jin Park', avatar});
+assert.equal(sessionStorage.getItem('ts.username'), 'Jin Park');
+assert.deepEqual(JSON.parse(sessionStorage.getItem('ts.avatar')), avatar);
+_storePermissions({...operator, username:'jin'});
+assert.equal(sessionStorage.getItem('ts.username'), 'jin');
+assert.equal(sessionStorage.getItem('ts.avatar'), null);
+_storePermissions({...operator, avatar});
+_storePermissions(operator);
+assert.equal(sessionStorage.getItem('ts.username'), null);
+assert.equal(sessionStorage.getItem('ts.avatar'), null);
+_storePermissions({...operator, avatar});
+_storePermissions(null);
+assert.equal(sessionStorage.getItem('ts.avatar'), null);
+""")

@@ -65,6 +65,12 @@ from turnstone.core.auth import (
     jwt_version_slot,
     require_permission,
 )
+from turnstone.core.avatar_routes import (
+    delete_own_avatar_picture,
+    get_user_avatar_picture,
+    set_own_avatar_color,
+    upload_own_avatar_picture,
+)
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
 from turnstone.core.http_headers import HEADER_VALUE_RE, HeaderValueError
 from turnstone.core.mcp_oauth import is_user_scoped_auth
@@ -1732,7 +1738,7 @@ async def create_workstream(request: Request) -> JSONResponse:
     - ``node_id`` omitted or ``"auto"`` → console picks the node with most headroom
     - ``node_id`` set to ``"pool"`` → console picks any available node
     """
-    from turnstone.core.attachments import IMAGE_SIZE_CAP
+    from turnstone.core.attachments import IMAGE_SIZE_CAP, classify_uploaded_files
     from turnstone.core.auth import require_any_permission
     from turnstone.core.web_helpers import read_json_or_400, read_multipart_create_or_400
 
@@ -1751,7 +1757,10 @@ async def create_workstream(request: Request) -> JSONResponse:
     # accepts that shape (create_supports_attachments on interactive_endpoint_config
     # in turnstone/server.py); the proxy just picks the node as usual and forwards
     # the files instead of re-serialising JSON.  Caps mirror the node-side parse so
-    # an oversized upload is rejected here, before the cluster hop.
+    # an oversized upload is rejected here, before the cluster hop.  So are the
+    # files the node would refuse: its 400 would reach the launcher only as the
+    # opaque 502 below, so the console checks them with the node's own rules and
+    # names the refused one.
     content_type = (request.headers.get("content-type") or "").lower()
     uploaded_files: list[tuple[str, str, bytes]] = []
     body: dict[str, Any]
@@ -1765,6 +1774,9 @@ async def create_workstream(request: Request) -> JSONResponse:
         if isinstance(parsed, JSONResponse):
             return parsed
         body, uploaded_files = parsed
+        _classified, refusal = await asyncio.to_thread(classify_uploaded_files, uploaded_files)
+        if refusal is not None:
+            return refusal
     else:
         json_body = await read_json_or_400(request)
         if isinstance(json_body, JSONResponse):
@@ -6415,7 +6427,18 @@ async def admin_list_users(request: Request) -> JSONResponse:
     err = require_permission(request, "admin.users")
     if err:
         return err
-    return JSONResponse({"users": storage.list_users()})
+    from turnstone.core.avatars import descriptor
+
+    users = storage.list_users()
+    avatars = storage.list_user_avatars()
+    for user in users:
+        user["avatar"] = descriptor(
+            user["user_id"],
+            user.get("display_name") or "",
+            user.get("username") or "",
+            avatars.get(user["user_id"]),
+        )
+    return JSONResponse({"users": users})
 
 
 async def admin_create_user(request: Request) -> JSONResponse:
@@ -6462,6 +6485,11 @@ async def admin_create_user(request: Request) -> JSONResponse:
     pw_hash = hash_password(password)
     storage.create_user(user_id, username, display_name, pw_hash)
 
+    from turnstone.core.avatars import assign_avatar_color
+
+    # Reads every account to pick the colour, so off the event loop.
+    await asyncio.to_thread(assign_avatar_color, storage, user_id, display_name, username)
+
     from turnstone.core.audit import record_audit
 
     audit_uid, ip = _audit_context(request)
@@ -6477,12 +6505,15 @@ async def admin_create_user(request: Request) -> JSONResponse:
 
     # Read back to get the storage-canonical created timestamp
     user = storage.get_user(user_id)
+    from turnstone.core.avatars import descriptor_for_user
+
     return JSONResponse(
         {
             "user_id": user["user_id"],
             "username": user["username"],
             "display_name": user["display_name"],
             "created": user["created"],
+            "avatar": descriptor_for_user(storage, user),
         }
     )
 
@@ -6520,6 +6551,41 @@ async def admin_delete_user(request: Request) -> JSONResponse:
         )
         return JSONResponse({"status": "ok"})
     return JSONResponse({"error": "User not found"}, status_code=404)
+
+
+async def admin_delete_user_avatar_picture(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/users/{user_id}/avatar/picture — remove a user's picture.
+
+    The user's colour stays; their avatar falls back to their initial.
+    """
+    from turnstone.core.avatars import descriptor_for_user, picture_version
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.users")
+    if err:
+        return err
+    user_id = request.path_params["user_id"]
+    user = storage.get_user(user_id)
+    if user is None:
+        return JSONResponse({"error": "User not found"}, status_code=404)
+    # The version comes from the clear itself, so it names the picture removed
+    # even when the user uploads a new one at the same moment.
+    removed = storage.clear_user_avatar_image(user_id)
+    if removed:
+        audit_uid, ip = _audit_context(request)
+        record_audit(
+            storage,
+            audit_uid,
+            "user.avatar.remove_picture",
+            "user",
+            user_id,
+            {"username": user.get("username", ""), "picture": picture_version(removed)},
+            ip,
+        )
+    return JSONResponse({"avatar": descriptor_for_user(storage, user)})
 
 
 async def admin_list_tokens(request: Request) -> JSONResponse:
@@ -7644,26 +7710,10 @@ async def admin_cancel_watch(request: Request) -> Response:
 
 
 def _audit_context(request: Request) -> tuple[str, str]:
-    """Extract (user_id, ip_address) from request for audit logging.
+    """Extract (user_id, ip_address) from request for audit logging."""
+    from turnstone.core.web_helpers import audit_context
 
-    Honors ``X-Forwarded-For`` only when the request appears to come
-    through a trusted proxy (``X-Forwarded-Proto`` is set), matching the
-    existing ``is_secure_request()`` trust model.  Falls back to
-    ``request.client.host`` otherwise.
-    """
-    from turnstone.core.auth import is_secure_request
-
-    auth_result = getattr(request.state, "auth_result", None)
-    user_id = auth_result.user_id if auth_result else ""
-    ip = ""
-    # Only trust X-Forwarded-For when behind a proxy that sets X-Forwarded-Proto
-    if is_secure_request(dict(request.headers), request.url.scheme):
-        forwarded = request.headers.get("x-forwarded-for", "")
-        if forwarded:
-            ip = forwarded.split(",")[0].strip()
-    if not ip:
-        ip = request.client.host if request.client else ""
-    return user_id, ip
+    return audit_context(request)
 
 
 _VALID_PERMISSIONS = frozenset(
@@ -17747,6 +17797,18 @@ def create_app(
                     Route("/api/auth/setup", auth_setup, methods=["POST"]),
                     Route("/api/auth/whoami", auth_whoami),
                     Route("/api/auth/refresh", auth_refresh, methods=["POST"]),
+                    Route("/api/users/{user_id}/avatar", get_user_avatar_picture),
+                    Route("/api/users/{user_id}/avatar", set_own_avatar_color, methods=["PUT"]),
+                    Route(
+                        "/api/users/{user_id}/avatar/picture",
+                        upload_own_avatar_picture,
+                        methods=["PUT"],
+                    ),
+                    Route(
+                        "/api/users/{user_id}/avatar/picture",
+                        delete_own_avatar_picture,
+                        methods=["DELETE"],
+                    ),
                     Route("/api/auth/oidc/authorize", oidc_authorize),
                     Route("/api/auth/oidc/callback", oidc_callback),
                     Route("/api/mcp/oauth/start", mcp_oauth_authorize),
@@ -17771,6 +17833,11 @@ def create_app(
                     Route("/api/admin/users", admin_list_users),
                     Route("/api/admin/users", admin_create_user, methods=["POST"]),
                     Route("/api/admin/users/{user_id}", admin_delete_user, methods=["DELETE"]),
+                    Route(
+                        "/api/admin/users/{user_id}/avatar/picture",
+                        admin_delete_user_avatar_picture,
+                        methods=["DELETE"],
+                    ),
                     Route("/api/admin/users/{user_id}/tokens", admin_list_tokens),
                     Route(
                         "/api/admin/users/{user_id}/tokens", admin_create_token, methods=["POST"]

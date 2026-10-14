@@ -64,7 +64,8 @@ class TestMakeThumbnail:
         thumb = pil.open(BytesIO(out))
         assert thumb.height > thumb.width, "thumbnail must reflect the applied EXIF rotation"
 
-    def test_exif_after_the_pixels_counts(self) -> None:
+    def test_exif_after_the_pixels_is_ignored(self) -> None:
+        # As in a browser, which shows the picture this way too.
         pil = pytest.importorskip("PIL.Image")
         from tests._exif_helpers import exif_block, orientation_entry, png_with_exif
 
@@ -72,7 +73,7 @@ class TestMakeThumbnail:
             png_with_exif(exif_block([orientation_entry(6)]), after_pixels=True), "image"
         )
         assert out is not None
-        assert pil.open(BytesIO(out)).size == (20, 40)
+        assert pil.open(BytesIO(out)).size == (40, 20)
 
     def test_a_rotated_photo_with_oddly_typed_tags_still_has_a_thumbnail(self) -> None:
         # Pillow's own transpose rewrote the remaining EXIF, and failed on a tag

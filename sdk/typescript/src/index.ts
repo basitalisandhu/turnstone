@@ -112,6 +112,7 @@ export type {
   AuthLoginResponse,
   AuthStatusResponse,
   AuthSetupResponse,
+  UserAvatar,
   DeleteSettingResponse,
   StatusResponse,
   ErrorResponse,

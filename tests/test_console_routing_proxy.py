@@ -806,6 +806,31 @@ class TestClusterCreate:
         assert payload[0] == "a.txt" and payload[1] == b"hello world"
         client.close()
 
+    def test_cluster_create_names_a_refused_file_before_dispatch(self) -> None:
+        # The node would refuse it too, but its 400 would reach the launcher
+        # only as the opaque 502, so the console checks the files first.
+        from io import BytesIO
+
+        from PIL import Image
+
+        gif = BytesIO()
+        Image.new("RGB", (4, 4)).save(gif, format="GIF")
+        mock_post = _make_proxy_post(json_data={"ws_id": "never"})
+        client = TestClient(self._app_with_node(mock_post), raise_server_exceptions=False)
+        resp = client.post(
+            "/v1/api/cluster/workstreams/new",
+            data={"meta": json.dumps({"node_id": "node-a", "name": "i"})},
+            files=[
+                ("file", ("a.txt", b"hello world", "text/plain")),
+                ("file", ("party.gif", gif.getvalue(), "image/gif")),
+            ],
+            headers=_TEST_AUTH_HEADERS,
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"].startswith("party.gif: GIF images are not supported")
+        mock_post.assert_not_called()
+        client.close()
+
     def test_cluster_create_forwards_project_id(self) -> None:
         # Phase 6: the launcher's project picker sends project_id; the proxy
         # selectively REBUILDS the forwarded body (it doesn't pass it through),

@@ -11,18 +11,15 @@ attachment sees the same upright pixels.
 from __future__ import annotations
 
 import hashlib
-import re
 import struct
 import threading
 from collections import OrderedDict
 from io import BytesIO
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from turnstone.core.log import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
     from PIL import Image
 
 log = get_logger(__name__)
@@ -35,12 +32,9 @@ _TURNED_ORIENTATIONS = frozenset(range(2, 9))
 # accepts them, and the byte order each declares.
 _TIFF_BYTE_ORDER = {b"II*\x00": "<", b"II\x00*": "<", b"MM\x00*": ">", b"MM*\x00": ">"}
 
-# struct formats of the EXIF value types that fit inside a tag entry: BYTE,
-# SHORT, LONG, SBYTE, SSHORT and SLONG.
-_INLINE_VALUE_FORMATS = {1: "B", 3: "H", 4: "L", 6: "b", 8: "h", 9: "l"}
-
-# Where XMP states the orientation, as Pillow reads it.
-_XMP_ORIENTATION = r'tiff:Orientation(="|>)([0-9])'
+# struct formats of the integer types an orientation tag may be stored in, one
+# value inside the entry: SHORT (the standard's), LONG, SSHORT and SLONG.
+_INLINE_VALUE_FORMATS = {3: "H", 4: "L", 8: "h", 9: "l"}
 
 # Mirror turnstone.core.thumbnails: bound decoded pixels so a small compressed
 # file that expands to an enormous bitmap can't OOM the node during re-encode.
@@ -54,7 +48,7 @@ _MAX_IMAGE_PIXELS = 40_000_000
 # leaves room for metadata that happens to contain it.
 MAX_JPEG_SCANS = 100
 
-# How much normalize_image_orientation keeps of the answers that took a decode.
+# How much normalize_image_orientation keeps of the turned images it re-encoded.
 _NORMALIZED_BYTES = 64 * 1024 * 1024
 _NORMALIZED_ENTRIES = 4096
 
@@ -70,33 +64,20 @@ def too_many_jpeg_scans(data: bytes) -> bool:
 def exif_orientation(img: Image.Image) -> int:
     """The EXIF orientation an opened image declares: 1 is upright, 2-8 turn or flip.
 
-    1 when the image declares none.  Reads only this tag, straight from the
-    bytes, and callers turn the picture with :func:`turn_upright`, in place of
-    ``getexif()`` and ``ImageOps.exif_transpose``: that transpose also rewrites
-    the rest of the EXIF, and fails on a tag stored in a type other than the
-    one Pillow expects.  A test keeps both calls out of turnstone/.  Looks where
-    Pillow does: the EXIF block, else a PNG's "Raw profile type exif" text,
-    else a TIFF's own tags, then XMP when none of those has the tag.  A PNG may
-    store these after its pixels, so a caller that decodes the picture reads
-    after decoding.
+    1 when it declares none.  Reads the EXIF block the image carries ahead of
+    its pixels: a JPEG's APP1 segment, a PNG's eXIf chunk before IDAT, or a
+    WebP's EXIF chunk.  Browsers read a JPEG's and a PNG's the same way, so the
+    preview, the thumbnail and the model's copy agree.  Call it right after
+    ``Image.open``, before anything decodes.  The tag counts when it holds one
+    integer: a SHORT, as the standard writes it, or a LONG, SSHORT or SLONG.
+    Reads only this tag, straight from the bytes, and callers turn the picture
+    with :func:`turn_upright`, in place of ``getexif()`` and
+    ``ImageOps.exif_transpose``: that transpose also rewrites the rest of the
+    EXIF, and fails on a tag stored in a type other than the one Pillow
+    expects.  A test keeps both calls out of turnstone/.
     """
-    info = img.info
-    exif = info.get("exif")
-    raw_profile = info.get("Raw profile type exif")
-    if exif is None and isinstance(raw_profile, str):
-        try:
-            exif = bytes.fromhex("".join(raw_profile.split("\n")[3:]))
-        except ValueError:
-            exif = None
-    found: int | None = None
-    if isinstance(exif, bytes):
-        found = _tiff_orientation(exif)
-    elif (tags := getattr(img, "tag_v2", None)) is not None:
-        # A TIFF's tags were read when it was opened.
-        value = tags.get(_EXIF_ORIENTATION_TAG)
-        found = value if isinstance(value, int) else None
-    if found is None:
-        found = _xmp_orientation(info)
+    exif = img.info.get("exif")
+    found = _tiff_orientation(exif) if isinstance(exif, bytes) else None
     return 1 if found is None else found
 
 
@@ -125,18 +106,6 @@ def _tiff_orientation(data: bytes) -> int | None:
     return found
 
 
-def _xmp_orientation(info: Mapping[Any, Any]) -> int | None:
-    xmp = info.get("XML:com.adobe.xmp")
-    if isinstance(xmp, str) and xmp:
-        found = re.search(_XMP_ORIENTATION, xmp)
-        return int(found[2]) if found else None
-    raw = info.get("xmp")
-    if isinstance(raw, bytes) and raw:
-        found_raw = re.search(_XMP_ORIENTATION.encode(), raw)
-        return int(found_raw[2]) if found_raw else None
-    return None
-
-
 def turn_upright(img: Image.Image, orientation: int) -> Image.Image:
     """``img`` turned or flipped as EXIF ``orientation`` says to show it.
 
@@ -158,40 +127,37 @@ def turn_upright(img: Image.Image, orientation: int) -> Image.Image:
 
 
 class _NormalizedCache:
-    """Answers of :func:`normalize_image_orientation` that took a decode.
+    """The turned images :func:`normalize_image_orientation` re-encoded.
 
-    Keyed by the image's SHA-256.  A value is the upright bytes, or ``None``
-    for an image that turned out upright.  Bounded by the bytes it holds and by
+    Keyed by the original image's SHA-256.  Bounded by the bytes it holds and by
     entries; the least recently used go first.
     """
 
     def __init__(self, max_bytes: int, max_entries: int) -> None:
         self._max_bytes = max_bytes
         self._max_entries = max_entries
-        self._entries: OrderedDict[bytes, bytes | None] = OrderedDict()
+        self._entries: OrderedDict[bytes, bytes] = OrderedDict()
         self._held = 0
         self._lock = threading.Lock()
 
-    def get(self, key: bytes) -> tuple[bool, bytes | None]:
-        """``(True, value)`` for a stored key, else ``(False, None)``."""
+    def get(self, key: bytes) -> bytes | None:
         with self._lock:
-            if key not in self._entries:
-                return False, None
-            self._entries.move_to_end(key)
-            return True, self._entries[key]
+            value = self._entries.get(key)
+            if value is not None:
+                self._entries.move_to_end(key)
+            return value
 
-    def put(self, key: bytes, value: bytes | None) -> None:
-        size = len(value or b"")
-        if size > self._max_bytes:
+    def put(self, key: bytes, value: bytes) -> None:
+        if len(value) > self._max_bytes:
             return
         with self._lock:
             if key in self._entries:
-                self._held -= len(self._entries.pop(key) or b"")
+                self._held -= len(self._entries.pop(key))
             self._entries[key] = value
-            self._held += size
+            self._held += len(value)
             while self._held > self._max_bytes or len(self._entries) > self._max_entries:
                 _key, dropped = self._entries.popitem(last=False)
-                self._held -= len(dropped or b"")
+                self._held -= len(dropped)
 
     def clear(self) -> None:
         with self._lock:
@@ -206,12 +172,11 @@ def normalize_image_orientation(data: bytes) -> bytes:
     """Bake an image's EXIF orientation into its pixels; return re-encoded bytes.
 
     Images with no orientation tag (or an identity orientation) are returned
-    UNCHANGED — no re-encode, so the pristine original is preserved.  Every
-    send rebuilds the request from the stored originals, so an answer that took
-    a decode (a rotation, or a PNG decoded to look for EXIF stored after its
-    pixels) is kept by the image's SHA-256 rather than worked out again.  Never
-    raises: any failure (Pillow missing, decode error, oversized) returns the
-    original bytes.
+    UNCHANGED — no decode or re-encode, so the pristine original is preserved.
+    Every send rebuilds the request from the stored originals, so a turned
+    image's re-encoded bytes are kept by the original's SHA-256 rather than
+    worked out again.  Never raises: any failure (Pillow missing, decode error,
+    oversized) returns the original bytes.
 
     Why this exists: a phone photo stores landscape pixels plus an orientation
     tag.  Browsers honour the tag for ``<img>``, but Pillow (our thumbnails) and
@@ -225,32 +190,23 @@ def normalize_image_orientation(data: bytes) -> bytes:
         return data
     try:
         img = Image.open(BytesIO(data))
-        turned = exif_orientation(img) in _TURNED_ORIENTATIONS
-        # A PNG may store its EXIF after the pixels, where only a decode finds it.
-        exif_may_follow = img.format == "PNG" and "exif" not in img.info
-        if not turned and not exif_may_follow:
+        orientation = exif_orientation(img)
+        if orientation not in _TURNED_ORIENTATIONS:
             return data  # upright already — keep the original bytes verbatim
         if img.size[0] * img.size[1] > _MAX_IMAGE_PIXELS:
-            if turned:
-                log.warning("orientation normalize skipped: image exceeds pixel cap")
+            log.warning("orientation normalize skipped: image exceeds pixel cap")
             return data
+        key = hashlib.sha256(data).digest()
+        kept = _normalized.get(key)
+        if kept is not None:
+            return kept  # the scan check passed when it was kept
         if too_many_jpeg_scans(data):
             log.warning(
                 "orientation normalize skipped: JPEG has more than %d scans", MAX_JPEG_SCANS
             )
             return data
-        key = hashlib.sha256(data).digest()
-        known, kept = _normalized.get(key)
-        if known:
-            return data if kept is None else kept
         fmt = img.format or "PNG"
-        img.load()
-        # Read again: a PNG's EXIF may follow its pixels, and Pillow turns a
-        # TIFF itself as it loads and drops the tag, which leaves it upright.
-        upright = turn_upright(img, exif_orientation(img))
-        if upright is img and not turned:
-            _normalized.put(key, None)
-            return data
+        upright = turn_upright(img, orientation)
         buf = BytesIO()
         save_kwargs: dict[str, object] = {}
         if fmt in ("JPEG", "WEBP"):

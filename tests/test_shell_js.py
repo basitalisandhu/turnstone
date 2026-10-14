@@ -22,6 +22,7 @@ from urllib.parse import urljoin, urlsplit
 import pytest
 
 from tests._js_harness_helpers import (
+    extract_braced,
     node_skip,
     run_node_source,
     slice_braced_block,
@@ -65,6 +66,7 @@ _ESM_BUNDLES = [
     _SHARED / "mcp_error.js",
     _SHARED / "copy_actions.js",
     _SHARED / "tool_projection.js",
+    _SHARED / "avatar.js",
 ]
 
 # Sink scan: everything except renderer.js — the one sanctioned HTML-string
@@ -91,6 +93,7 @@ _ESM_NO_VAR_BUNDLES = [
     _SHARED / "mcp_error.js",
     _SHARED / "copy_actions.js",
     _SHARED / "tool_projection.js",
+    _SHARED / "avatar.js",
 ]
 
 # The same unsafe DOM-write / dynamic-code sink set that ``test_app_js.py``
@@ -1656,3 +1659,79 @@ def test_schedule_shelf_reads_completed_from_the_scheduled_instant() -> None:
     assert "ran >= due" in admin
     assert "!enabled && _schCompleted(s)" in admin, "the status badge must use the comparison"
     assert "!enabled && s.last_run" not in admin, "a bare last_run no longer means completed"
+
+
+@node_skip
+def test_change_avatar_needs_the_write_scope() -> None:
+    """Read means no writes: a viewer's user menu offers no "Change avatar"."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    menu_body = slice_braced_block(shell, shell.index("function toggleUserMenu("))
+    assert menu_body is not None
+    result = run_node_source(
+        """
+import assert from 'node:assert/strict';
+let _userMenu = null;
+const stored = new Map([["ts.user_id", "u1"], ["ts.avatar", '{"color":1}']]);
+const storedItem = (key) => stored.get(key) ?? null;
+let scopes = [];
+const hasScope = (scope) => scopes.includes(scope);
+let shown = null;
+const openPopupMenu = (chip, items) => {
+  shown = items.map((item) => item.label);
+  return { close() {} };
+};
+const openAvatarDialog = () => {};
+function toggleUserMenu(chip, onAvatarChange) """
+        + menu_body
+        + """
+scopes = ["read"];
+toggleUserMenu({}, null);
+assert.deepEqual(shown, ["Log out"]);
+_userMenu = null;
+scopes = ["read", "write"];
+toggleUserMenu({}, null);
+assert.deepEqual(shown, ["Change avatar", "Log out"]);
+// whoami sends no avatar for a service principal's token.
+_userMenu = null;
+stored.delete("ts.avatar");
+toggleUserMenu({}, null);
+assert.deepEqual(shown, ["Log out"]);
+"""
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@node_skip
+def test_the_chip_repaints_only_when_the_stored_avatar_changes() -> None:
+    """auth.js and the avatar dialog store the descriptor, and every Tier-1
+    render asks the chip to repaint from it."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    result = run_node_source(
+        """
+import assert from 'node:assert/strict';
+const stored = new Map([["ts.user_id", "u1"]]);
+const storedItem = (key) => stored.get(key) || "";
+const readStoredAvatar = () => JSON.parse(stored.get("ts.avatar") || "null");
+const paints = [];
+const paintAvatar = (el, avatar, userId) => paints.push([el, avatar, userId]);
+"""
+        + extract_braced(shell, "function repaintChipAvatar(avatarEl, painted) {")
+        + """
+const chip = {};
+let painted = null;
+painted = repaintChipAvatar(chip, painted);
+assert.deepEqual(paints, [[chip, null, "u1"]], "before whoami: the empty circle");
+stored.set("ts.avatar", '{"color":1,"initial":"J"}');
+painted = repaintChipAvatar(chip, painted);
+assert.deepEqual(paints[1], [chip, {color: 1, initial: "J"}, "u1"]);
+painted = repaintChipAvatar(chip, painted);
+assert.equal(paints.length, 2, "an unchanged descriptor is left alone");
+stored.set("ts.avatar", '{"color":1,"initial":"J","picture":"0123456789abcdef"}');
+painted = repaintChipAvatar(chip, painted);
+assert.equal(paints[2][1].picture, "0123456789abcdef");
+stored.delete("ts.avatar");
+painted = repaintChipAvatar(chip, painted);
+assert.deepEqual(paints[3], [chip, null, "u1"], "a cleared descriptor repaints too");
+"""
+    )
+    assert result.returncode == 0, result.stderr

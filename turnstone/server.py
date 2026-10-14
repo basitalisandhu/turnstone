@@ -59,6 +59,12 @@ from turnstone.core.auth import (
     _DenyFilter,
     jwt_version_slot,
 )
+from turnstone.core.avatar_routes import (
+    delete_own_avatar_picture,
+    get_user_avatar_picture,
+    set_own_avatar_color,
+    upload_own_avatar_picture,
+)
 from turnstone.core.idle_nudge_watcher import wake_workstream_if_pending
 from turnstone.core.log import get_logger
 from turnstone.core.mcp_utils import (
@@ -676,18 +682,9 @@ def _get_ws(mgr: SessionManager, ws_id: str | None) -> tuple[Workstream, WebUI] 
 
 def _audit_context(request: Request) -> tuple[str, str]:
     """Extract (user_id, ip_address) from request for audit logging."""
-    auth = getattr(getattr(request, "state", None), "auth_result", None)
-    uid: str = auth.user_id if auth else ""
-    ip = ""
-    if request.client:
-        ip = request.client.host
-    forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded:
-        from turnstone.core.auth import is_secure_request
+    from turnstone.core.web_helpers import audit_context
 
-        if is_secure_request(dict(request.headers), request.url.scheme):
-            ip = forwarded.split(",")[0].strip()
-    return uid, ip
+    return audit_context(request)
 
 
 # ---------------------------------------------------------------------------
@@ -5966,6 +5963,18 @@ def create_app(
                     Route("/api/auth/setup", auth_setup, methods=["POST"]),
                     Route("/api/auth/whoami", auth_whoami),
                     Route("/api/auth/refresh", auth_refresh, methods=["POST"]),
+                    Route("/api/users/{user_id}/avatar", get_user_avatar_picture),
+                    Route("/api/users/{user_id}/avatar", set_own_avatar_color, methods=["PUT"]),
+                    Route(
+                        "/api/users/{user_id}/avatar/picture",
+                        upload_own_avatar_picture,
+                        methods=["PUT"],
+                    ),
+                    Route(
+                        "/api/users/{user_id}/avatar/picture",
+                        delete_own_avatar_picture,
+                        methods=["DELETE"],
+                    ),
                     Route("/api/auth/oidc/authorize", oidc_authorize),
                     Route("/api/auth/oidc/callback", oidc_callback),
                     Route("/api/mcp/oauth/start", mcp_oauth_authorize),

@@ -123,6 +123,9 @@ def provision_oidc_user(
     except StorageConflictError as exc:
         raise oauth_oidc.OIDCError(f"OIDC provisioning failed: {exc}") from exc
 
+    from turnstone.core.avatars import assign_avatar_color
+
+    assign_avatar_color(storage, user_id, display_name, username)
     desired_role_ids = apply_role_mapping(storage, user_id, claims, config)
     _ensure_default_role(storage, user_id, desired_role_ids)
 

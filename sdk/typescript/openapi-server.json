@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "1.9.0",
+    "version": "1.9.0a2",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {
@@ -2144,6 +2144,252 @@
         }
       }
     },
+    "/v1/api/users/{user_id}/avatar": {
+      "get": {
+        "summary": "Return a user's uploaded avatar picture as a 256px PNG",
+        "operationId": "v1_api_users_{user_id}_avatar_get",
+        "tags": [
+          "Users"
+        ],
+        "description": "Any signed-in caller may fetch any user's picture.  With ``v`` equal to the picture version from the user's avatar descriptor the response is cacheable for a year; otherwise it revalidates against the ETag.",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "v",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Picture version from the avatar descriptor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Set your avatar's colour",
+        "operationId": "v1_api_users_{user_id}_avatar_put",
+        "tags": [
+          "Users"
+        ],
+        "description": "Your own account only, with write scope.",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetUserAvatarColorRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserAvatarResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/users/{user_id}/avatar/picture": {
+      "put": {
+        "summary": "Upload your avatar picture",
+        "operationId": "v1_api_users_{user_id}_avatar_picture_put",
+        "tags": [
+          "Users"
+        ],
+        "description": "Multipart form with a ``file`` field: PNG, JPEG or WebP, up to 4 MB, and up to 4096 by 4096 pixels for JPEG or 2048 by 2048 for PNG and WebP.  A JPEG saved in more than 100 progressive passes is refused.  Pictures are processed one at a time per server, in arrival order, and one per person; a 503 with Retry-After means your last picture or too many others are still being processed, so try again.  Stored as a 256px square PNG (centre-cropped, EXIF orientation applied, no metadata kept, a wide-gamut colour profile read as sRGB).  Your own account only, with write scope.",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserAvatarResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error 413",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Remove your avatar picture; your initial and colour show again",
+        "operationId": "v1_api_users_{user_id}_avatar_picture_delete",
+        "tags": [
+          "Users"
+        ],
+        "description": "Your own account only, with write scope.",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserAvatarResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/memories": {
       "get": {
         "summary": "List structured memories. Without a scope, returns global plus the authenticated user's memories; workstream scope is owner-bound.",
@@ -2794,6 +3040,30 @@
             "title": "User Id",
             "type": "string"
           },
+          "username": {
+            "default": "",
+            "description": "Login username (user accounts)",
+            "title": "Username",
+            "type": "string"
+          },
+          "display_name": {
+            "default": "",
+            "description": "Display name, else username (user accounts)",
+            "title": "Display Name",
+            "type": "string"
+          },
+          "avatar": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UserAvatar"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Avatar (user accounts)"
+          },
           "role": {
             "description": "Legacy role",
             "examples": [
@@ -2831,6 +3101,42 @@
         "title": "AuthLoginResponse",
         "type": "object"
       },
+      "UserAvatar": {
+        "description": "How a page draws a person: one initial on a palette colour, or an uploaded picture.",
+        "properties": {
+          "color": {
+            "description": "Palette index of the generated avatar's colour",
+            "maximum": 5,
+            "minimum": 0,
+            "title": "Color",
+            "type": "integer"
+          },
+          "initial": {
+            "description": "The letter drawn on the colour; empty when the name has no letter or digit",
+            "title": "Initial",
+            "type": "string"
+          },
+          "picture": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Version of the uploaded picture, or null for none; the PNG is served at /v1/api/users/{user_id}/avatar?v={picture}",
+            "title": "Picture"
+          }
+        },
+        "required": [
+          "color",
+          "initial"
+        ],
+        "title": "UserAvatar",
+        "type": "object"
+      },
       "AuthRefreshResponse": {
         "description": "POST /v1/api/auth/refresh success response.",
         "properties": {
@@ -2844,6 +3150,30 @@
             "description": "Authenticated user ID",
             "title": "User Id",
             "type": "string"
+          },
+          "username": {
+            "default": "",
+            "description": "Login username (user accounts)",
+            "title": "Username",
+            "type": "string"
+          },
+          "display_name": {
+            "default": "",
+            "description": "Display name, else username (user accounts)",
+            "title": "Display Name",
+            "type": "string"
+          },
+          "avatar": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UserAvatar"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Avatar (user accounts)"
           },
           "role": {
             "description": "Legacy role",
@@ -2937,6 +3267,23 @@
           "username": {
             "title": "Username",
             "type": "string"
+          },
+          "display_name": {
+            "default": "",
+            "description": "Display name, else username",
+            "title": "Display Name",
+            "type": "string"
+          },
+          "avatar": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UserAvatar"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "role": {
             "default": "full",
@@ -5052,6 +5399,30 @@
             "title": "User Id",
             "type": "string"
           },
+          "username": {
+            "default": "",
+            "description": "Display name, else username (user accounts); unlike login, setup and refresh, where username is the login name",
+            "title": "Username",
+            "type": "string"
+          },
+          "display_name": {
+            "default": "",
+            "description": "Display name, else username (user accounts)",
+            "title": "Display Name",
+            "type": "string"
+          },
+          "avatar": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UserAvatar"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Avatar (user accounts)"
+          },
           "permissions": {
             "default": "",
             "title": "Permissions",
@@ -5068,12 +5439,55 @@
             "description": "Eligible for human-session renewal",
             "title": "Can Refresh",
             "type": "boolean"
+          },
+          "exp": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Session cookie expiry in epoch seconds",
+            "title": "Exp"
           }
         },
         "required": [
           "user_id"
         ],
         "title": "AuthWhoamiResponse",
+        "type": "object"
+      },
+      "SetUserAvatarColorRequest": {
+        "description": "PUT /v1/api/users/{user_id}/avatar request body.",
+        "properties": {
+          "color": {
+            "description": "Palette index of the avatar's colour",
+            "maximum": 5,
+            "minimum": 0,
+            "title": "Color",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "color"
+        ],
+        "title": "SetUserAvatarColorRequest",
+        "type": "object"
+      },
+      "UserAvatarResponse": {
+        "description": "The caller's avatar after a change.",
+        "properties": {
+          "avatar": {
+            "$ref": "#/components/schemas/UserAvatar"
+          }
+        },
+        "required": [
+          "avatar"
+        ],
+        "title": "UserAvatarResponse",
         "type": "object"
       }
     }

@@ -1741,6 +1741,7 @@ class TestProvisionOIDCUser:
         assert call_args[0][4] == "https://idp.example.com"
         assert call_args[0][5] == "sub-456"
         assert call_args[0][6] == "bob@example.com"
+        storage.set_user_avatar_color.assert_called_once()
 
     def test_provision_oidc_user_username_dedup(self):
         """First username taken -> appends suffix."""

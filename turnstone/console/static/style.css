@@ -582,10 +582,11 @@
   white-space: nowrap;
 }
 
-/* Users grid: USERNAME | NAME | CREATED | ACTIONS */
+/* Users grid: USERNAME | NAME | CREATED | ACTIONS.  The username column also
+   holds the expand arrow and the avatar (42px before the text). */
 #admin-users .admin-colheaders,
 #admin-users .admin-row {
-  grid-template-columns: 140px 1fr 100px 80px;
+  grid-template-columns: 168px 1fr 100px 80px;
 }
 
 /* Tokens grid: PREFIX | NAME | SCOPES | CREATED | EXPIRES | ACTIONS */
@@ -1577,7 +1578,7 @@ h3.skill-spec-heading {
 @media (max-width: 700px) {
   #admin-users .admin-colheaders,
   #admin-users .admin-row {
-    grid-template-columns: 100px 1fr 80px;
+    grid-template-columns: 128px 1fr 80px;
   }
   .admin-col-created {
     display: none;
@@ -3434,6 +3435,12 @@ h3.skill-spec-heading {
 }
 .admin-expand-indicator.expanded {
   transform: rotate(90deg);
+}
+/* The user's avatar (avatar.js) beside the username in the Users table. */
+.admin-col-username .avatar {
+  --avatar-size: 20px;
+  margin-right: 8px;
+  vertical-align: middle;
 }
 
 @media (max-width: 700px) {

@@ -110,9 +110,35 @@ frozen.
 > named `default` under `[models.*]`, while the database holds model definitions, follows the stored
 > setting from now on, because the setting outranks config.toml; clear `model.default_alias` in the
 > Settings tab to go back to the config.toml default.
+>
+> **Before upgrading:** migration 083 adds avatar columns to `users` and gives every existing user
+> an avatar colour, oldest account first, so that people who share an initial get different colours
+> where the six allow. Custom storage backends must implement `get_user_avatar`,
+> `list_user_avatars`, `get_user_avatar_image`, `set_user_avatar_color`, `set_user_avatar_image` and
+> `clear_user_avatar_image`; the two setters return `False` for a user that doesn't exist, and
+> `clear_user_avatar_image` returns the SHA-256 of the picture it removed, or `None`.
 
 ### Added
 
+- **User avatars (#997).** Each person shows as the first letter of their name on one of six
+  colours, or as a picture they upload, in the rail's user chip and the console's Users table.
+  **Change avatar** in the user menu offers the six colours, a picture upload (PNG, JPEG or WebP;
+  the browser crops it to a square and shrinks it before sending) and removing the picture. Changing
+  an avatar needs the `write` scope, so a viewer keeps the colour their account was given. A new
+  account gets the colour that sets it furthest apart from people who share its initial, taking
+  colour-blind viewers into account. Admins can remove anyone's picture
+  (`DELETE /v1/api/admin/users/{user_id}/avatar/picture`, `admin.users`). Setting and removing a
+  picture are audited as `user.avatar.set_picture` and `user.avatar.remove_picture`, with the
+  picture's version. Login, setup, refresh and whoami return the signed-in person's `display_name`
+  and `avatar` (`color`, `initial`, `picture`), login and refresh also return the login name as
+  `username`, and the admin user list returns each user's `avatar`. Any signed-in caller can fetch a
+  picture at `GET /v1/api/users/{user_id}/avatar`. Pictures are stored as a 256px PNG with no
+  metadata from the upload. The server takes at most 4 MB, 4096 by 4096 pixels for JPEG and 2048 by
+  2048 for PNG and WebP, refuses JPEGs saved in more than 100 progressive passes, and decodes one
+  picture at a time. Each person has one upload in progress at a time, up to four more wait their
+  turn, and the rest are asked to retry. A picture uploaded through the API with a wide-gamut colour
+  profile such as Display P3 is read as sRGB, so it looks a little duller; the upload dialog
+  converts to sRGB before it sends.
 - **Test an MCP server's connection before saving it (#1328).** The MCP Servers add and edit forms
   have a **Test connection** button for Streamable HTTP servers with no authorization or static
   headers. The console connects once with the form's values, the way a save would, and shows the
@@ -535,22 +561,32 @@ frozen.
   decodes in passes (scans), each costing a pass over the whole picture, and a small file can
   hold thousands. Chat attachment uploads now refuse a JPEG with more than 100 scans, and
   thumbnails and the orientation fix applied to images sent to the model skip one already
-  stored; real encoders write about 10.
+  stored; real encoders write about 10. Avatar uploads apply the same limit.
 - **A rotated photo with unusual EXIF gets an upright thumbnail and reaches the model upright.**
   Turning a picture by its EXIF orientation also rewrote the rest of its EXIF, which failed when
   another entry was stored in an unexpected type: the photo got no thumbnail and was sent to the
-  model sideways. Thumbnails and images sent to the model now read the orientation tag directly.
+  model sideways. Thumbnails, images sent to the model and avatar uploads now read the orientation
+  tag directly, from the EXIF a JPEG, PNG or WebP carries ahead of its pixels, as browsers do for
+  JPEG and PNG. An orientation stored only in XMP, in a PNG's text or after its pixels, or as
+  anything but one whole number, no longer turns the picture, so the thumbnail and the model's copy
+  match what the browser shows.
 - **Pictures in a conversation are no longer decoded again on every turn.** Each send rebuilds the
   request from the stored pictures: every PNG without EXIF before its pixels was decoded to look for
   an orientation tag after them, and every rotated photo was decoded, turned and re-encoded, tens of
-  milliseconds per picture on every turn. The server now keeps each picture's result.
+  milliseconds per picture on every turn. An upright picture is now sent without a decode, and the
+  server keeps each rotated photo's turned copy.
 - **Creating a session with several attachments says which file it refused.** The create stops at
   the first file it can't take, and the error didn't say which one; it now starts with that file's
-  name.
+  name. The console's session launcher, which showed any refusal as a generic error, now checks the
+  files itself and shows the same message.
 - **Thumbnails of large photos take a fraction of the time and memory.** A JPEG now decodes at the
   smallest scale that still covers its thumbnail, so a 12-megapixel photo takes about 30 ms and
   1.5 MB instead of 60 ms and 95 MB, which adds up when a new session's ten photos all ask for
   theirs at once.
+- **The rail's user chip keeps your name after a session refresh (#997).** The refresh response
+  carried no name, so the chip fell back to "account" until the page reloaded. Login and refresh now
+  return the display name and avatar as whoami does. The chip's old two-letter initials also broke
+  on names starting with an emoji, punctuation or ß; the one-letter avatar replaces them.
 - **A host that can't run the PDF worker says so.** On macOS, which refuses a finite address-space
   limit, on any host whose sandbox blocks `setrlimit`, and on a host where the worker's temporary
   directory can't be created or the worker can't start, every PDF that needed local processing was
@@ -1123,10 +1159,10 @@ frozen.
   (`shared_static/inter-4.001/`, `shared_static/jetbrains-mono-2.211/`) and are cached like the
   other version-named vendor assets. Pages look the same where the service was reachable; where
   it was blocked, they now get the intended typefaces instead of system fonts.
-- **Uploads without a Content-Length stop at their size limit.** Attachment and speech-to-text
-  uploads compared the Content-Length header with their limit before reading the body, but a chunked
-  upload carries none and was read in full, spooled to disk, before the limit applied. The body is
-  now counted as it arrives and refused once it passes the limit.
+- **Uploads without a Content-Length stop at their size limit.** Attachment, speech-to-text and
+  avatar uploads compared the Content-Length header with their limit before reading the body, but a
+  chunked upload carries none and was read in full, spooled to disk, before the limit applied. The
+  body is now counted as it arrives and refused once it passes the limit.
 
 ## [1.8.3]
 

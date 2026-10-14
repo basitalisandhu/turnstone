@@ -320,6 +320,37 @@ def classify_upload(
     return "text", mime, None
 
 
+def classify_uploaded_files(
+    files: list[tuple[str, str, bytes]],
+) -> tuple[list[tuple[str, str, str, bytes]], JSONResponse | None]:
+    """Classify a create's ``(filename, claimed_mime, data)`` files, stopping at a refusal.
+
+    Returns ``([(filename, kind, mime, data), ...], None)``, or the files
+    classified so far and a ``JSONResponse`` (400/413) whose error starts with
+    the refused file's name.  The node's create and the console's launcher
+    proxy share it, so both refuse the same files in the same words.
+    """
+    from starlette.responses import JSONResponse as _JSONResponse
+
+    from turnstone.core.web_helpers import with_filename
+
+    classified: list[tuple[str, str, str, bytes]] = []
+    for filename, claimed_mime, data in files:
+        if not data:
+            return classified, _JSONResponse(
+                {"error": with_filename(filename, "Empty file")}, status_code=400
+            )
+        kind, mime, rejection = classify_upload(filename, claimed_mime, data)
+        if rejection is not None:
+            return classified, _JSONResponse(
+                {"error": with_filename(filename, rejection.message), "code": rejection.code},
+                status_code=rejection.status,
+            )
+        assert kind is not None and mime is not None  # success ⟹ both set
+        classified.append((filename, kind, mime, data))
+    return classified, None
+
+
 def validate_and_save_uploaded_files(
     files: list[tuple[str, str, bytes]],
     ws_id: str,
@@ -338,32 +369,20 @@ def validate_and_save_uploaded_files(
     paths call into this helper from the lifted ``make_create_handler``
     factory.
 
-    Returns ``(attachment_ids, None)`` on success or ``(ids_staged_so_far,
-    JSONResponse)`` on the first failure so the caller can roll back any
-    partial state.
+    Returns ``(attachment_ids, None)`` on success, or ``([], JSONResponse)`` when
+    a file is refused: every file is checked before any is staged.
     """
-    from starlette.responses import JSONResponse as _JSONResponse
-
     from turnstone.core.attachment_buffer import get_attachment_buffer
-    from turnstone.core.web_helpers import with_filename
 
+    classified, refusal = classify_uploaded_files(files)
+    if refusal is not None:
+        return [], refusal
     saved_ids: list[str] = []
-    if not files:
+    if not classified:
         return saved_ids, None
 
     buffer = get_attachment_buffer()
-    for filename, claimed_mime, data in files:
-        if not data:
-            return saved_ids, _JSONResponse(
-                {"error": with_filename(filename, "Empty file")}, status_code=400
-            )
-        kind, mime, rejection = classify_upload(filename, claimed_mime, data)
-        if rejection is not None:
-            return saved_ids, _JSONResponse(
-                {"error": with_filename(filename, rejection.message), "code": rejection.code},
-                status_code=rejection.status,
-            )
-        assert kind is not None and mime is not None  # success ⟹ both set
+    for filename, kind, mime, data in classified:
         staged = buffer.stage(
             ws_id=ws_id,
             user_id=user_id,

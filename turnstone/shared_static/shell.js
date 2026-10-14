@@ -25,7 +25,8 @@
 
 import { PaneManager, ShellPane, openPopupMenu } from "./pane.js";
 import { mountRail, mountManage, glyph, setRowBadge } from "./rail.js";
-import { authFetch } from "./auth.js";
+import { authFetch, hasScope } from "./auth.js";
+import { openAvatarDialog, paintAvatar, readStoredAvatar } from "./avatar.js";
 import { readRefusal } from "./utils.js";
 // The interactive pane is a real ES module beside us in /shared (step 5a) — the
 // shell imports it directly, and it exists in every deployment.  The coordinator
@@ -549,22 +550,26 @@ async function mountShell() {
   userChip.type = "button";
   userChip.setAttribute("aria-haspopup", "menu");
   userChip.setAttribute("aria-expanded", "false");
-  const avatarEl = make("span", "avatar", initialsFor(caps));
+  const avatarEl = make("span", "avatar");
+  avatarEl.setAttribute("aria-hidden", "true");
   const userNameEl = make("span", "user-name", displayNameFor(caps));
   userChip.append(avatarEl, userNameEl);
   userChip.addEventListener("click", (e) => {
     e.stopPropagation();
-    toggleUserMenu(userChip);
+    toggleUserMenu(userChip, () => refreshUser());
   });
   shell.foot.append(userChip);
   if (headerEl) headerEl.style.display = "none";
+  // Runs on every Tier-1 render, so the avatar repaints only when auth.js (or
+  // the avatar dialog) stored a different descriptor.
+  let paintedAvatar = null;
   const refreshUser = () => {
     const nm = displayNameFor(caps);
-    if (userNameEl.textContent !== nm) {
-      userNameEl.textContent = nm;
-      avatarEl.textContent = initialsFor(caps);
-    }
+    if (userNameEl.textContent !== nm) userNameEl.textContent = nm;
+    userChip.title = nm; // the collapsed rail shows names on hover
+    paintedAvatar = repaintChipAvatar(avatarEl, paintedAvatar);
   };
+  refreshUser();
 
   // ----- PaneManager: one new spine -----
   // It owns the tabstrip; the burger and [+] stay in the surrounding tab bar.
@@ -1178,35 +1183,53 @@ async function mountShell() {
 // stays the single owner of logout (incl. its in-flight-refresh race guards).
 let _userMenu = null;
 
-function toggleUserMenu(chip) {
+function toggleUserMenu(chip, onAvatarChange) {
   if (_userMenu) {
     _userMenu.close();
     return;
   }
-  _userMenu = openPopupMenu(
-    chip,
-    [
-      {
-        label: "Log out",
-        cls: "destructive",
-        action: () => {
-          const lb = document.getElementById("logout-btn");
-          if (lb) lb.click();
-        },
-      },
-    ],
-    {
-      cls: "user-menu",
-      label: "Account",
-      prefer: "up", // the footer chip sits at the viewport bottom
-      align: "start",
-      expandEl: chip,
-      returnFocusEl: chip,
-      onClose: () => {
-        _userMenu = null;
-      },
+  const items = [];
+  // whoami sends an avatar only for user accounts, so tokens for service
+  // principals get no avatar item, and changing one needs the write scope
+  // (read means no writes), so viewers get none either.
+  const userId = storedItem("ts.user_id");
+  if (userId && storedItem("ts.avatar") && hasScope("write")) {
+    items.push({
+      label: "Change avatar",
+      action: () =>
+        openAvatarDialog({ userId, onChange: onAvatarChange, opener: chip }),
+    });
+  }
+  items.push({
+    label: "Log out",
+    cls: "destructive",
+    action: () => {
+      const lb = document.getElementById("logout-btn");
+      if (lb) lb.click();
     },
-  );
+  });
+  _userMenu = openPopupMenu(chip, items, {
+    cls: "user-menu",
+    label: "Account",
+    prefer: "up", // the footer chip sits at the viewport bottom
+    align: "start",
+    expandEl: chip,
+    returnFocusEl: chip,
+    onClose: () => {
+      _userMenu = null;
+    },
+  });
+}
+
+// Paints the user chip's avatar from the stored descriptor when it differs
+// from `painted`, the stored value the chip last showed; returns the stored
+// value it shows now.
+function repaintChipAvatar(avatarEl, painted) {
+  const raw = storedItem("ts.avatar");
+  if (raw !== painted) {
+    paintAvatar(avatarEl, readStoredAvatar(), storedItem("ts.user_id"));
+  }
+  return raw;
 }
 
 function displayNameFor(caps) {
@@ -1223,15 +1246,12 @@ function displayNameFor(caps) {
   }
 }
 
-function initialsFor(caps) {
-  const name = displayNameFor(caps);
-  const parts = String(name)
-    .trim()
-    .split(/[\s._-]+/)
-    .filter(Boolean);
-  if (!parts.length) return "·";
-  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
-  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+function storedItem(key) {
+  try {
+    return sessionStorage.getItem(key) || "";
+  } catch (e) {
+    return "";
+  }
 }
 
 mountShell();

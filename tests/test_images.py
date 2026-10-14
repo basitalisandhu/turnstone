@@ -94,12 +94,6 @@ def _webp(exif: bytes) -> bytes:
     return buf.getvalue()
 
 
-def _tiff(orientation: int) -> bytes:
-    buf = BytesIO()
-    halves().save(buf, format="TIFF", tiffinfo={_ORIENTATION_TAG: orientation})
-    return buf.getvalue()
-
-
 def _png_with_text(key: str, text: str) -> bytes:
     from PIL import PngImagePlugin
 
@@ -127,18 +121,28 @@ def _raw_profile(exif: bytes) -> str:
             3,
         ),
         ("png", lambda: png_with_exif(exif_block([orientation_entry(8)])), 8),
+        ("webp", lambda: _webp(exif_block([orientation_entry(2)])), 2),
+        ("none", lambda: png_with_exif(b""), 1),
+    ],
+)
+def test_orientation_is_read_where_browsers_read_it(source: str, data: Any, expected: int) -> None:
+    img = Image.open(BytesIO(data()))
+    assert exif_orientation(img) == expected, "read at open, before any decode"
+    assert img.getexif().get(_ORIENTATION_TAG, 1) == expected, "Pillow reads the same"
+
+
+@pytest.mark.parametrize(
+    ("source", "data"),
+    [
         (
             "png, after its pixels",
             lambda: png_with_exif(exif_block([orientation_entry(5)]), after_pixels=True),
-            5,
         ),
-        ("webp", lambda: _webp(exif_block([orientation_entry(2)])), 2),
         (
             "png text",
             lambda: _png_with_text(
                 "Raw profile type exif", _raw_profile(exif_block([orientation_entry(4)]))
             ),
-            4,
         ),
         (
             "xmp",
@@ -146,33 +150,51 @@ def _raw_profile(exif: bytes) -> str:
                 "XML:com.adobe.xmp",
                 '<x:xmpmeta><rdf:Description tiff:Orientation="6"/></x:xmpmeta>',
             ),
-            6,
         ),
-        ("none", lambda: png_with_exif(b""), 1),
     ],
 )
-def test_orientation_is_read_where_pillow_reads_it(source: str, data: Any, expected: int) -> None:
-    img = Image.open(BytesIO(data()))
-    img.load()
+def test_orientation_stored_elsewhere_is_ignored(source: str, data: Any) -> None:
+    # Browsers don't turn these, so neither do the thumbnail and the model's copy.
+    picture = data()
+    assert exif_orientation(Image.open(BytesIO(picture))) == 1
+    assert normalize_image_orientation(picture) is picture
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        ((0x0112, 3, 1, struct.pack("<HH", 6, 0)), 6),  # SHORT, as the standard says
+        ((0x0112, 4, 1, struct.pack("<L", 6)), 6),  # LONG
+        ((0x0112, 8, 1, struct.pack("<hh", 6, 0)), 6),  # SSHORT
+        ((0x0112, 9, 1, struct.pack("<l", 6)), 6),  # SLONG
+        ((0x0112, 1, 1, b"\x06\x00\x00\x00"), 1),  # BYTE: ignored
+        ((0x0112, 3, 2, struct.pack("<HH", 6, 6)), 1),  # more than one value: ignored
+    ],
+)
+def test_orientation_entry_types(entry: tuple[int, int, int, bytes], expected: int) -> None:
+    img = Image.open(BytesIO(jpeg_with_exif(exif_block([entry]))))
     assert exif_orientation(img) == expected
-    assert img.getexif().get(_ORIENTATION_TAG, 1) == expected, "Pillow reads the same"
 
 
-def test_exif_after_a_pngs_pixels_counts() -> None:
-    data = png_with_exif(exif_block([orientation_entry(6)]), after_pixels=True)
-    assert Image.open(BytesIO(normalize_image_orientation(data))).size == (20, 40)
+@pytest.mark.parametrize(
+    "exif",
+    [
+        b"II*\x00",  # stops after the byte order
+        b"II*\x00" + struct.pack("<L", 4000) + bytes(8),  # directory past the end
+    ],
+)
+@pytest.mark.parametrize("container", [jpeg_with_exif, png_with_exif])
+@pytest.mark.filterwarnings("ignore:Corrupt EXIF data")
+def test_malformed_exif_reads_as_upright(exif: bytes, container: Any) -> None:
+    # A photo whose EXIF stops short is still sent, thumbnailed and accepted.
+    from turnstone.core.avatars import normalize_picture
+    from turnstone.core.thumbnails import make_thumbnail
 
-
-def test_a_turned_tiff_is_sent_upright() -> None:
-    # Pillow turns a TIFF itself as it loads and drops the tag, so after the
-    # decode there is no turn left to make, yet the turned pixels are what go.
-    data = _tiff(6)
-    assert exif_orientation(Image.open(BytesIO(data))) == 6
-    sent = Image.open(BytesIO(normalize_image_orientation(data)))
-    # Pillow reports a turned TIFF's size upright before it loads, so check
-    # what is stored: 20 wide and 40 tall, with no turn left in the tags.
-    assert (sent.tag_v2[256], sent.tag_v2[257]) == (20, 40)
-    assert sent.tag_v2.get(_ORIENTATION_TAG) is None
+    picture = container(exif)
+    assert exif_orientation(Image.open(BytesIO(picture))) == 1
+    assert normalize_image_orientation(picture) is picture
+    assert make_thumbnail(picture, "image") is not None
+    assert normalize_picture(picture)[0]
 
 
 def test_a_rotated_photo_with_oddly_typed_tags_is_still_turned() -> None:
@@ -199,37 +221,37 @@ def test_a_rotated_photo_is_turned_once(monkeypatch: pytest.MonkeyPatch) -> None
     assert turns == [6]
 
 
-def test_an_upright_png_is_decoded_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Finding no EXIF after a PNG's pixels takes a decode.
-    turns: list[int] = []
-    real = images.turn_upright
+def test_an_upright_png_is_never_decoded(monkeypatch: pytest.MonkeyPatch) -> None:
+    from PIL import PngImagePlugin
 
-    def counting(img: Any, orientation: int) -> Any:
-        turns.append(orientation)
-        return real(img, orientation)
+    loads: list[int] = []
+    real = PngImagePlugin.PngImageFile.load
 
-    monkeypatch.setattr(images, "turn_upright", counting)
+    def counting(self: Any) -> Any:
+        loads.append(1)
+        return real(self)
+
+    monkeypatch.setattr(PngImagePlugin.PngImageFile, "load", counting)
     buf = BytesIO()
     Image.new("RGB", (3, 3), "blue").save(buf, format="PNG")
     data = buf.getvalue()
     assert normalize_image_orientation(data) is data
-    assert normalize_image_orientation(data) is data
-    assert turns == [1]
+    assert loads == []
 
 
-def test_kept_answers_are_bounded() -> None:
+def test_kept_images_are_bounded() -> None:
     cache = images._NormalizedCache(max_bytes=10, max_entries=3)
     cache.put(b"a", b"x" * 6)
-    cache.put(b"b", None)
-    cache.put(b"c", b"x" * 6)  # 12 bytes: the least recently used goes
-    assert cache.get(b"a") == (False, None)
-    assert cache.get(b"b") == (True, None)
-    cache.put(b"d", None)
-    cache.put(b"e", None)  # four entries: c goes, since b was just used
-    assert cache.get(b"c") == (False, None)
-    assert cache.get(b"b") == (True, None)
+    cache.put(b"b", b"y")
+    cache.put(b"c", b"x" * 6)  # 13 bytes: the least recently used goes
+    assert cache.get(b"a") is None
+    assert cache.get(b"b") == b"y"
+    cache.put(b"d", b"z")
+    cache.put(b"e", b"w")  # four entries: c goes, since b was just used
+    assert cache.get(b"c") is None
+    assert cache.get(b"b") == b"y"
     cache.put(b"f", b"x" * 11)  # more than the whole budget: not kept
-    assert cache.get(b"f") == (False, None)
+    assert cache.get(b"f") is None
 
 
 def test_every_image_decoder_checks_scans_and_reads_exif_itself() -> None:

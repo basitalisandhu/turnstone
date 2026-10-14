@@ -1590,6 +1590,46 @@ class StorageBackend(Protocol):
         """
         ...
 
+    # -- User avatars (turnstone.core.avatars) -----------------------------------
+
+    # The avatar lives in the user's own row, so it goes with the user.
+
+    def get_user_avatar(self, user_id: str) -> dict[str, Any] | None:
+        """Return ``{"color", "image_sha256"}`` for the user's avatar, or None.
+
+        None when the user has neither a colour nor a picture stored, or does
+        not exist.  Either value may be None: no colour picked yet, or no
+        picture.
+        """
+        ...
+
+    def list_user_avatars(self) -> dict[str, dict[str, Any]]:
+        """Return ``{user_id: {"color", "image_sha256"}}`` for users with either stored.
+
+        Never includes the picture bytes.
+        """
+        ...
+
+    def get_user_avatar_image(self, user_id: str) -> tuple[bytes, str] | None:
+        """Return ``(png_bytes, image_sha256)`` for the user's picture, or None."""
+        ...
+
+    def set_user_avatar_color(self, user_id: str, color: int) -> bool:
+        """Store the user's colour.  Return False when the user does not exist."""
+        ...
+
+    def set_user_avatar_image(self, user_id: str, image: bytes, image_sha256: str) -> bool:
+        """Store the user's picture.  Return False when the user does not exist."""
+        ...
+
+    def clear_user_avatar_image(self, user_id: str) -> str | None:
+        """Remove the user's picture, keeping the colour.
+
+        Return the removed picture's ``image_sha256``, read and cleared in one
+        transaction, or None when there was none.
+        """
+        ...
+
     def delete_user(self, user_id: str) -> bool:
         """Delete a user and their dependent rows. Return whether the user existed.
 

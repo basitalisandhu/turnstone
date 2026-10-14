@@ -27,6 +27,16 @@ export interface AuthLoginRequest {
   token: string;
 }
 
+/** How a page draws a person: one initial on a palette colour, or a picture. */
+export interface UserAvatar {
+  /** Palette index, 0-5. */
+  color: number;
+  /** The letter to draw; empty when the name has no letter or digit. */
+  initial: string;
+  /** Version of the uploaded picture, or null for none. */
+  picture: string | null;
+}
+
 export interface AuthLoginResponse {
   can_refresh?: boolean;
   status: string;
@@ -34,6 +44,11 @@ export interface AuthLoginResponse {
   scopes?: string;
   jwt?: string;
   user_id?: string;
+  /** Login name (user accounts). */
+  username?: string;
+  /** Display name, else the login name (user accounts). */
+  display_name?: string;
+  avatar?: UserAvatar;
 }
 
 export interface AuthStatusResponse {
@@ -47,6 +62,8 @@ export interface AuthSetupResponse {
   status: string;
   user_id: string;
   username: string;
+  display_name?: string;
+  avatar?: UserAvatar;
   role: string;
   scopes: string;
   jwt?: string;

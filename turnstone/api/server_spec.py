@@ -17,7 +17,9 @@ from turnstone.api.schemas import (
     AuthStatusResponse,
     AuthWhoamiResponse,
     ErrorResponse,
+    SetUserAvatarColorRequest,
     StatusResponse,
+    UserAvatarResponse,
     WorkstreamDeleteResponse,
 )
 from turnstone.api.server_schemas import (
@@ -91,6 +93,61 @@ SAVED_WORKSTREAMS_QUERY_PARAMS: list[QueryParam] = [
         enum=sorted(SAVED_WORKSTREAM_SORT_KEYS),
     ),
     QueryParam("order", "Sort direction.", default="desc", enum=["asc", "desc"]),
+]
+
+#: User avatar endpoints.  Both processes mount the same handlers
+#: (``turnstone.core.avatar_routes``), so the console spec shares this list.
+USER_AVATAR_ENDPOINTS: list[EndpointSpec] = [
+    EndpointSpec(
+        "/v1/api/users/{user_id}/avatar",
+        "GET",
+        "Return a user's uploaded avatar picture as a 256px PNG",
+        description=(
+            "Any signed-in caller may fetch any user's picture.  With ``v`` equal to the "
+            "picture version from the user's avatar descriptor the response is cacheable for "
+            "a year; otherwise it revalidates against the ETag."
+        ),
+        query_params=[QueryParam("v", "Picture version from the avatar descriptor")],
+        error_codes=[404],
+        tags=["Users"],
+    ),
+    EndpointSpec(
+        "/v1/api/users/{user_id}/avatar",
+        "PUT",
+        "Set your avatar's colour",
+        description="Your own account only, with write scope.",
+        request_model=SetUserAvatarColorRequest,
+        response_model=UserAvatarResponse,
+        error_codes=[400, 403, 404],
+        tags=["Users"],
+    ),
+    EndpointSpec(
+        "/v1/api/users/{user_id}/avatar/picture",
+        "PUT",
+        "Upload your avatar picture",
+        description=(
+            "Multipart form with a ``file`` field: PNG, JPEG or WebP, up to 4 MB, and up to "
+            "4096 by 4096 pixels for JPEG or 2048 by 2048 for PNG and WebP.  A JPEG saved in "
+            "more than 100 progressive passes is refused.  Pictures are processed one at a "
+            "time per server, in arrival order, and one per person; a 503 with Retry-After "
+            "means your last picture or too many others are still being processed, so try "
+            "again.  Stored as a 256px square PNG (centre-cropped, EXIF orientation applied, "
+            "no metadata kept, a wide-gamut colour profile read as sRGB).  Your own account "
+            "only, with write scope."
+        ),
+        response_model=UserAvatarResponse,
+        error_codes=[400, 403, 404, 413, 503],
+        tags=["Users"],
+    ),
+    EndpointSpec(
+        "/v1/api/users/{user_id}/avatar/picture",
+        "DELETE",
+        "Remove your avatar picture; your initial and colour show again",
+        description="Your own account only, with write scope.",
+        response_model=UserAvatarResponse,
+        error_codes=[403, 404],
+        tags=["Users"],
+    ),
 ]
 
 SERVER_ENDPOINTS: list[EndpointSpec] = [
@@ -558,6 +615,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         error_codes=[401],
         tags=["Auth"],
     ),
+    *USER_AVATAR_ENDPOINTS,
     # --- Memories ---
     EndpointSpec(
         "/v1/api/memories",

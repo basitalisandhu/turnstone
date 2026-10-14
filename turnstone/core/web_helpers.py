@@ -436,6 +436,27 @@ def auth_user_id(request: Request) -> str:
     return str(getattr(auth, "user_id", "") or "")
 
 
+def audit_context(request: Request) -> tuple[str, str]:
+    """Extract (user_id, ip_address) from request for audit logging.
+
+    Honors ``X-Forwarded-For`` only when the request appears to come
+    through a trusted proxy (``X-Forwarded-Proto`` is set), matching the
+    existing ``is_secure_request()`` trust model.  Falls back to
+    ``request.client.host`` otherwise.
+    """
+    from turnstone.core.auth import is_secure_request
+
+    ip = ""
+    # Only trust X-Forwarded-For when behind a proxy that sets X-Forwarded-Proto
+    if is_secure_request(dict(request.headers), request.url.scheme):
+        forwarded = request.headers.get("x-forwarded-for", "")
+        if forwarded:
+            ip = forwarded.split(",")[0].strip()
+    if not ip:
+        ip = request.client.host if request.client else ""
+    return auth_user_id(request), ip
+
+
 def resolve_workstream_owner(
     request: Request,
     ws_id: str,

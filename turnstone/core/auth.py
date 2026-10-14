@@ -831,6 +831,10 @@ ADMIN_PREFIX = "/api/admin/"
 # with exactly one path segment for each parameter.
 _ATTACHMENT_DELETE_RE = re.compile(r"^/api/workstreams/[^/]+/attachments/[^/]+$")
 
+# Matches the avatar writes: PUT /api/users/{user_id}/avatar (colour) and
+# PUT or DELETE /api/users/{user_id}/avatar/picture.
+_AVATAR_WRITE_RE = re.compile(r"^/api/users/[^/]+/avatar(?:/picture)?$")
+
 
 def _strip_version_prefix(path: str) -> str:
     """Strip ``/v1`` prefix for path classification."""
@@ -1255,6 +1259,9 @@ def required_scope(method: str, path: str) -> str:
     # Memory delete: /api/memories/{name}
     if method == "DELETE" and normalized.startswith("/api/memories/"):
         return "write"
+    # Avatar changes, the caller's own included: read means no writes.
+    if method in ("PUT", "DELETE") and _AVATAR_WRITE_RE.match(normalized):
+        return "write"
 
     # Console proxy routes: /node/{node_id}/api/{tail} or /node/{node_id}/v1/api/{tail}
     if method == "POST" and normalized.startswith("/node/"):
@@ -1297,6 +1304,12 @@ def required_scope(method: str, path: str) -> str:
             and proxied.startswith("/api/workstreams/")
             and proxied.rsplit("/", 1)[-1] == "send"
         ):
+            return "write"
+
+    # Proxied avatar changes: /node/.../api/users/{user_id}/avatar[/picture].
+    if method in ("PUT", "DELETE") and normalized.startswith("/node/"):
+        proxied = _extract_proxied_path(normalized)
+        if proxied and _AVATAR_WRITE_RE.match(proxied):
             return "write"
 
     return "read"
@@ -1745,6 +1758,7 @@ async def handle_auth_login(request: Request, audience: str, cookie_name: str) -
                 )
 
     result: AuthResult | None = None
+    user: dict[str, Any] | None = None
     password = body.get("password", "")
 
     if username and password and storage is not None:
@@ -1808,6 +1822,7 @@ async def handle_auth_login(request: Request, audience: str, cookie_name: str) -
         resp_body["jwt"] = jwt_token
     if result.user_id:
         resp_body["user_id"] = result.user_id
+        resp_body.update(_identity_fields(storage, result.user_id, user))
 
     secure = is_secure_request(dict(request.headers), request.url.scheme)
     response = JSONResponse(resp_body)
@@ -1930,6 +1945,9 @@ async def handle_auth_setup(request: Request, audience: str, cookie_name: str) -
             status_code=503,
         )
     scopes = _permissions_to_scopes(perms)
+    from turnstone.core.avatars import assign_avatar_color
+
+    assign_avatar_color(storage, user_id, display_name, username)
     jwt_token = ""
     if jwt_secret:
         jwt_token = create_jwt(
@@ -1946,6 +1964,7 @@ async def handle_auth_setup(request: Request, audience: str, cookie_name: str) -
         "status": "ok",
         "user_id": user_id,
         "username": username,
+        **_identity_fields(storage, user_id),
         "role": "full",
         "scopes": ",".join(sorted(scopes)),
         "can_refresh": _can_refresh_session("password", scopes),
@@ -1960,6 +1979,45 @@ async def handle_auth_setup(request: Request, audience: str, cookie_name: str) -
     if jwt_token:
         response.headers["Set-Cookie"] = make_set_cookie(jwt_token, cookie_name, secure=secure)
     return response
+
+
+def _identity_fields(
+    storage: Any, user_id: str, user: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """The signed-in person's ``username``, ``display_name`` and ``avatar``.
+
+    ``username`` is the login name, and ``display_name`` falls back to it when
+    the account has none.  The UI's user chip reads ``display_name`` and
+    ``avatar`` from every response that sets the session (login, setup,
+    refresh) and from whoami, so none of them leaves the chip without a name.
+    ``user_id`` is an opaque uuid, never shown.  ``user`` is the account's
+    users row when the caller already holds it.  Best-effort: a storage miss,
+    or a principal with no users row, returns ``{}`` and the client keeps its
+    generic placeholder.
+    """
+    if user is None:
+        if storage is None or not user_id:
+            return {}
+        try:
+            user = storage.get_user(user_id)
+        except Exception:
+            return {}
+    if not isinstance(user, dict):
+        return {}
+    fields: dict[str, Any] = {}
+    username = user.get("username")
+    if username:
+        fields["username"] = username
+    display = user.get("display_name") or username
+    if display:
+        fields["display_name"] = display
+    try:
+        from turnstone.core.avatars import descriptor_for_user
+
+        fields["avatar"] = descriptor_for_user(storage, user)
+    except Exception:
+        log.debug("avatar descriptor unavailable for %s", user_id, exc_info=True)
+    return fields
 
 
 async def handle_auth_whoami(request: Request, cookie_name: str) -> Response:
@@ -1981,20 +2039,14 @@ async def handle_auth_whoami(request: Request, cookie_name: str) -> Response:
         "scopes": ",".join(sorted(auth_result.scopes)),
         "can_refresh": _can_refresh_session(auth_result.token_source, auth_result.scopes),
     }
-    # Surface the human username / display name for the UI — ``user_id`` is an
-    # opaque uuid, not something to show in the footer.  Best-effort: a storage
-    # miss just omits it, and the client then keeps its generic placeholder
-    # rather than ever rendering the raw uuid.
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage is not None and auth_result.user_id:
-        try:
-            user = storage.get_user(auth_result.user_id)
-        except Exception:
-            user = None
-        if isinstance(user, dict):
-            display = user.get("display_name") or user.get("username")
-            if display:
-                resp["username"] = display
+    identity = _identity_fields(
+        getattr(request.app.state, "auth_storage", None), auth_result.user_id
+    )
+    # whoami's ``username`` has always carried the display name, unlike the
+    # login name it holds on login, setup and refresh; it keeps that meaning.
+    if "display_name" in identity:
+        identity["username"] = identity["display_name"]
+    resp.update(identity)
     if auth_result.permissions:
         resp["permissions"] = ",".join(sorted(auth_result.permissions))
     # Surface the cookie/JWT expiry so the client can schedule refresh.
@@ -2073,6 +2125,9 @@ async def handle_auth_refresh(request: Request, audience: str, cookie_name: str)
         "jwt": new_token,
         "can_refresh": _can_refresh_session(auth_result.token_source, scopes),
     }
+    # The client stores this body the way it stores whoami's; without the
+    # identity fields it would drop the chip's name on every refresh.
+    resp_body.update(_identity_fields(storage, user_id))
     if perms:
         resp_body["permissions"] = ",".join(sorted(perms))
     # Surface the new cookie's exp (epoch seconds) so the frontend can

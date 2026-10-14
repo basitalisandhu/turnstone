@@ -909,16 +909,25 @@ function _storePermissions(data) {
     _cancelRefreshTimer();
     _refreshExpiry = 0;
   }
-  // Surface the authenticated identity for the rail footer's user chip.  whoami
-  // returns the human `username` (display name) alongside the opaque user_id;
-  // the shell reads ts.username via displayNameFor and repaints once it lands.
-  // Cleared in lockstep with permissions so the chip never shows a stale user
-  // after logout / revocation.  NO fallback to user_id for DISPLAY — that's a
-  // uuid, worse than the generic placeholder.
-  if (data && data.username) {
-    sessionStorage.setItem("ts.username", data.username);
+  // Surface the authenticated identity for the rail footer's user chip.  Every
+  // response that lands here carries `display_name` (whoami also repeats it in
+  // `username`; login, setup and refresh put the login name there); the shell
+  // reads ts.username via displayNameFor and repaints once it lands.  Cleared
+  // in lockstep with permissions so the chip never shows a stale user after
+  // logout / revocation.  NO fallback to user_id for DISPLAY — that's a uuid,
+  // worse than the generic placeholder.
+  const shownName = data && (data.display_name || data.username);
+  if (shownName) {
+    sessionStorage.setItem("ts.username", shownName);
   } else {
     sessionStorage.removeItem("ts.username");
+  }
+  // The avatar descriptor ({color, initial, picture}) rides with the name and
+  // is cleared with it; avatar.js reads it back for the chip.
+  if (data && data.avatar) {
+    sessionStorage.setItem("ts.avatar", JSON.stringify(data.avatar));
+  } else {
+    sessionStorage.removeItem("ts.avatar");
   }
   // Retain the opaque user_id (uuid) separately — not for display, but so the
   // chat pane can compare it against a shared workstream's acting-user id and

@@ -77,17 +77,17 @@ def make_thumbnail(data: bytes, kind: str, *, max_px: int = _THUMB_MAX_PX) -> by
                 _MAX_IMAGE_PIXELS,
             )
             return None
+        # Honour EXIF orientation so a phone photo's thumbnail isn't rotated:
+        # Pillow doesn't auto-apply the tag and PNG can't carry it.  Read where
+        # a browser does, before any decode.  No-op for the rasterized-PDF
+        # branch (its pages carry no EXIF).
+        orientation = exif_orientation(img)
         # A JPEG (multi-picture ones included) decodes at the smallest scale
         # that still covers twice the thumbnail: a phone photo decodes at an
         # eighth of its size, in a fraction of the time and memory.
         if isinstance(img, JpegImagePlugin.JpegImageFile):
             img.draft("RGB", (max_px * 2, max_px * 2))
-        # Honour EXIF orientation so a phone photo's thumbnail isn't rotated:
-        # Pillow doesn't auto-apply the tag and PNG can't carry it.  Read after
-        # decoding, since a PNG may store its EXIF after the pixels.  No-op for
-        # the rasterized-PDF branch (its pages carry no EXIF).
-        img.load()
-        oriented = turn_upright(img, exif_orientation(img))
+        oriented = turn_upright(img, orientation)
         rgb = oriented.convert("RGB")
         rgb.thumbnail((max_px, max_px))
         buf = BytesIO()

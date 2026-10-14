@@ -485,6 +485,53 @@ function loadAdminUsers() {
     });
 }
 
+// _kebabMenu escapes every label, title and attribute value, and drops the
+// falsy entry when the user has no picture to remove.
+function _userMenuItems(u) {
+  return [
+    {
+      label: "roles",
+      title: "Manage roles",
+      attrs: { "data-user-roles": u.user_id },
+    },
+    u.avatar && u.avatar.picture
+      ? {
+          label: "remove picture",
+          title: "Remove this user's avatar picture",
+          attrs: {
+            "data-remove-picture": u.user_id,
+            "data-username": u.username,
+          },
+        }
+      : null,
+    {
+      label: "delete",
+      kind: "danger",
+      title: "Delete user",
+      attrs: { "data-delete-user": u.user_id, "data-username": u.username },
+    },
+  ];
+}
+
+// Each user's avatar (avatar.js, through its window bridge) beside the
+// username, built as DOM nodes after the row HTML is parsed.
+function _paintUserAvatars(container, users) {
+  const avatars = window.TurnstoneAvatar;
+  if (!avatars) return;
+  const byId = new Map(users.map((u) => [u.user_id, u]));
+  for (const row of container.querySelectorAll(".admin-row[data-user-id]")) {
+    const userId = row.getAttribute("data-user-id");
+    const user = byId.get(userId);
+    const col = row.querySelector(".admin-col-username");
+    if (!user || !col) continue;
+    const indicator = col.querySelector(".admin-expand-indicator");
+    col.insertBefore(
+      avatars.makeAvatar(user.avatar || null, userId),
+      indicator ? indicator.nextSibling : col.firstChild,
+    );
+  }
+}
+
 function _renderUsers(users) {
   const container = document.getElementById("admin-users-table");
   if (!users.length) {
@@ -514,23 +561,12 @@ function _renderUsers(users) {
       escapeHtml(u.created || "").slice(0, 10) +
       "</span>" +
       '<span class="admin-col admin-col-actions">' +
-      _kebabMenu([
-        {
-          label: "roles",
-          title: "Manage roles",
-          attrs: { "data-user-roles": u.user_id },
-        },
-        {
-          label: "delete",
-          kind: "danger",
-          title: "Delete user",
-          attrs: { "data-delete-user": u.user_id, "data-username": u.username },
-        },
-      ]) +
+      _kebabMenu(_userMenuItems(u)) +
       "</span>" +
       "</div>";
   }
   setSafeHtml(container, html);
+  _paintUserAvatars(container, users);
   // Bind roles buttons
   const roleBtns = container.querySelectorAll("[data-user-roles]");
   for (let rj = 0; rj < roleBtns.length; rj++) {
@@ -545,6 +581,14 @@ function _renderUsers(users) {
       confirmDeleteUser(
         this.getAttribute("data-delete-user"),
         this.getAttribute("data-username"),
+      );
+    });
+  }
+  for (const btn of container.querySelectorAll("[data-remove-picture]")) {
+    btn.addEventListener("click", () => {
+      confirmRemoveUserPicture(
+        btn.getAttribute("data-remove-picture"),
+        btn.getAttribute("data-username"),
       );
     });
   }
@@ -576,6 +620,25 @@ function _renderUsers(users) {
       });
     })(rows[k]);
   }
+}
+
+// The confirm message and the toast both land in textContent.
+function confirmRemoveUserPicture(userId, username) {
+  showConfirmModal(
+    "Remove picture",
+    `Remove ${username}'s avatar picture? Their initial and colour show instead.`,
+    "Remove",
+    () => {
+      const url = `/v1/api/admin/users/${encodeURIComponent(userId)}/avatar/picture`;
+      authFetch(url, { method: "DELETE" })
+        .then((r) => {
+          if (!r.ok) throw new Error("Remove failed");
+          showToast(`Removed ${username}'s picture`);
+          loadAdminUsers();
+        })
+        .catch(() => showToast("Failed to remove the picture"));
+    },
+  );
 }
 
 function confirmDeleteUser(userId, username) {

@@ -95,6 +95,8 @@ Scopes are hierarchical — higher scopes imply all lower ones.
 | POST | `/api/workstreams/{ws_id}/delete` | `write` | Project tenancy; coordinator rows also require `admin.coordinator` |
 | POST | Other `/api/workstreams/{ws_id}/...` mutation endpoints | `write` | Project tenancy and endpoint-specific gates |
 | DELETE | `/api/workstreams/{ws_id}/send` (dequeue), `/api/workstreams/{ws_id}/attachments/{attachment_id}` | `write` | Project tenancy on the target workstream |
+| PUT | `/api/users/{user_id}/avatar`, `/api/users/{user_id}/avatar/picture` | `write` | The caller's own account only |
+| DELETE | `/api/users/{user_id}/avatar/picture` | `write` | The caller's own account only |
 | Any | `/api/admin/*` | `approve` | Matching `admin.*` permission |
 
 Public paths bypass authentication entirely: `/`, `/health`, `/metrics`,

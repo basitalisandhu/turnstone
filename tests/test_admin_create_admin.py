@@ -93,6 +93,7 @@ def test_create_admin_fresh_user_gets_approve_scope(tmp_path: Path, _migrated_st
     assert _has_admin_role(storage, user["user_id"])
     # The exact bug surface: a web login for this account must carry `approve`.
     assert "approve" in _login_scopes(storage, user["user_id"])
+    assert (storage.get_user_avatar(user["user_id"]) or {}).get("color") is not None
 
 
 def test_create_admin_defaults_display_name_to_username(tmp_path: Path, _migrated_storage) -> None:
@@ -185,6 +186,7 @@ def test_create_user_assigns_explicit_viewer(tmp_path: Path, _migrated_storage) 
     assert user is not None
     assert [r["role_id"] for r in storage.list_user_roles(user["user_id"])] == ["builtin-viewer"]
     assert storage.get_user_permissions(user["user_id"]) == {"read"}
+    assert (storage.get_user_avatar(user["user_id"]) or {}).get("color") is not None
 
 
 @pytest.mark.parametrize("failure", ["assignment", "empty_permissions"])

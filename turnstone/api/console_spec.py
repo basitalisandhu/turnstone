@@ -144,6 +144,7 @@ from turnstone.api.schemas import (
     ScheduleInfo,
     StatusResponse,
     UpdateScheduleRequest,
+    UserAvatarResponse,
     UserInfo,
     WorkstreamDeleteRequest,
     WorkstreamDeleteResponse,
@@ -168,7 +169,7 @@ from turnstone.api.server_schemas import (
     WorkstreamDetailResponse,
     WorkstreamHistoryResponse,
 )
-from turnstone.api.server_spec import SAVED_WORKSTREAMS_QUERY_PARAMS
+from turnstone.api.server_spec import SAVED_WORKSTREAMS_QUERY_PARAMS, USER_AVATAR_ENDPOINTS
 
 CONSOLE_ENDPOINTS: list[EndpointSpec] = [
     # --- Cluster ---
@@ -312,6 +313,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         error_codes=[401],
         tags=["Auth"],
     ),
+    *USER_AVATAR_ENDPOINTS,
     # --- Admin ---
     EndpointSpec(
         "/v1/api/admin/users",
@@ -333,6 +335,14 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "DELETE",
         "Delete a user and their tokens",
         response_model=StatusResponse,
+        error_codes=[404],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/users/{user_id}/avatar/picture",
+        "DELETE",
+        "Remove a user's avatar picture; their initial and colour show again",
+        response_model=UserAvatarResponse,
         error_codes=[404],
         tags=["Admin"],
     ),
