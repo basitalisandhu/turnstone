@@ -1123,6 +1123,10 @@ frozen.
   (`shared_static/inter-4.001/`, `shared_static/jetbrains-mono-2.211/`) and are cached like the
   other version-named vendor assets. Pages look the same where the service was reachable; where
   it was blocked, they now get the intended typefaces instead of system fonts.
+- **Uploads without a Content-Length stop at their size limit.** Attachment and speech-to-text
+  uploads compared the Content-Length header with their limit before reading the body, but a chunked
+  upload carries none and was read in full, spooled to disk, before the limit applied. The body is
+  now counted as it arrives and refused once it passes the limit.
 
 ## [1.8.3]
 

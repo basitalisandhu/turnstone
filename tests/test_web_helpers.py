@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING, Any
 
 import pytest
+
+if TYPE_CHECKING:
+    from starlette.requests import Request
 
 
 class TestVersionHtml:
@@ -341,3 +345,90 @@ class TestLatin1SafeFilename:
         # If even the fallback sanitizes to empty, a safe constant backs it —
         # never filename="".
         assert latin1_safe_filename("", fallback='"\x00') == "download"
+
+
+class TestMultipartBodyBudget:
+    """A body with no Content-Length (chunked) is still read only up to the cap."""
+
+    CAP = 64 * 1024
+    CHUNK = 4 * 1024
+
+    def _app(self) -> Any:
+        from starlette.applications import Starlette
+        from starlette.responses import JSONResponse
+        from starlette.routing import Route
+
+        from turnstone.core.web_helpers import (
+            read_multipart_create_or_400,
+            read_multipart_file_or_400,
+        )
+
+        async def one_file(request: Request) -> JSONResponse:
+            parsed = await read_multipart_file_or_400(request, field="file", max_bytes=self.CAP)
+            if isinstance(parsed, JSONResponse):
+                return parsed
+            return JSONResponse({"bytes": len(parsed[2])})
+
+        async def create(request: Request) -> JSONResponse:
+            parsed = await read_multipart_create_or_400(
+                request, max_per_file_bytes=self.CAP, max_total_bytes=self.CAP
+            )
+            if isinstance(parsed, JSONResponse):
+                return parsed
+            return JSONResponse({"bytes": sum(len(data) for _n, _m, data in parsed[1])})
+
+        return Starlette(
+            routes=[
+                Route("/file", one_file, methods=["POST"]),
+                Route("/create", create, methods=["POST"]),
+            ]
+        )
+
+    async def _send(self, path: str, size: int) -> tuple[int, int]:
+        """POST a ``size``-byte file in chunks; return the status and bytes pulled."""
+        import httpx
+
+        boundary = "budget-boundary"
+        parts = [
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="meta"\r\n\r\n'
+            "{}\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="file"; filename="big.bin"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n".encode(),
+            *(b"x" * self.CHUNK for _ in range(size // self.CHUNK)),
+            f"\r\n--{boundary}--\r\n".encode(),
+        ]
+        pulled = 0
+
+        async def body() -> Any:
+            nonlocal pulled
+            for part in parts:
+                pulled += len(part)
+                yield part
+
+        transport = httpx.ASGITransport(app=self._app())
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://app.example.com"
+        ) as http:
+            resp = await http.post(
+                path,
+                content=body(),
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            )
+        assert "content-length" not in resp.request.headers
+        return resp.status_code, pulled
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("path", ["/file", "/create"])
+    async def test_reading_stops_past_the_budget(self, path: str) -> None:
+        status, pulled = await self._send(path, 4 * self.CAP)
+        assert status == 413
+        budget = int(self.CAP * 1.1)
+        assert pulled <= budget + 2 * self.CHUNK, "the rest of the body is never read"
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("path", ["/file", "/create"])
+    async def test_a_chunked_body_under_the_cap_is_read(self, path: str) -> None:
+        status, _pulled = await self._send(path, self.CAP // 2)
+        assert status == 200

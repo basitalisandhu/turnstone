@@ -160,6 +160,35 @@ def with_filename(filename: str, message: str) -> str:
     return f"{name}: {message}" if name else message
 
 
+class _BodyOverBudgetError(Exception):
+    """A request body passed its byte budget while it was arriving."""
+
+
+async def _form_within(request: Request, budget: int | None) -> Any:
+    """``request.form()``, stopped once the body passes ``budget`` bytes.
+
+    The Content-Length check can't bound a chunked body, which carries none;
+    counting the body as it arrives does, before Starlette spools all of it.
+    Raises :class:`_BodyOverBudgetError`.
+    """
+    if budget is None:
+        return await request.form()
+    from starlette.requests import Request as _Request
+
+    received = 0
+
+    async def receive() -> Any:
+        nonlocal received
+        message = await request.receive()
+        if message.get("type") == "http.request":
+            received += len(message.get("body", b""))
+            if received > budget:
+                raise _BodyOverBudgetError
+        return message
+
+    return await _Request(request.scope, receive).form()
+
+
 async def read_multipart_create_or_400(
     request: Request,
     *,
@@ -177,21 +206,24 @@ async def read_multipart_create_or_400(
     ``JSONResponse`` (400/413) on failure.
 
     Enforces a cheap ``Content-Length`` pre-check against *max_total_bytes*
-    when the header is sensible, and (when ``max_per_file_bytes`` is set) a
+    when the header is sensible, stops reading a body (chunked ones included)
+    once it passes that budget, and (when ``max_per_file_bytes`` is set) a
     generic per-file cap as a defense-in-depth gate.  The caller still
     classifies each file and applies any kind-specific cap on top.
     """
     from starlette.datastructures import UploadFile
     from starlette.responses import JSONResponse as _JSONResponse
 
-    if max_total_bytes is not None:
+    # A 10% slack absorbs multipart framing overhead.
+    budget = int(max_total_bytes * 1.1) if max_total_bytes is not None else None
+    if budget is not None:
         cl_raw = request.headers.get("content-length")
         if cl_raw:
             try:
                 cl = int(cl_raw)
             except ValueError:
                 cl = -1
-            if cl > int(max_total_bytes * 1.1):
+            if cl > budget:
                 return _JSONResponse(
                     {
                         "error": (
@@ -204,7 +236,18 @@ async def read_multipart_create_or_400(
                 )
 
     try:
-        form = await request.form()
+        form = await _form_within(request, budget)
+    except _BodyOverBudgetError:
+        return _JSONResponse(
+            {
+                "error": (
+                    f"Request body too large (over {budget:,} bytes); "
+                    f"cap is {max_total_bytes:,} bytes."
+                ),
+                "code": "too_large",
+            },
+            status_code=413,
+        )
     except Exception:
         import structlog
 
@@ -288,25 +331,26 @@ async def read_multipart_file_or_400(
     ``JSONResponse`` (400/413) on failure.  When ``max_bytes`` is set
     and a sensible ``Content-Length`` header arrives, a 413 is returned
     before the body is parsed (cheap gate against grossly oversized
-    uploads).  Otherwise the body is fully buffered (Starlette spools
-    large uploads to disk beyond ~1 MiB) and re-checked against
-    ``max_bytes`` post-read.
+    uploads).  Otherwise the body is read only until it passes the same
+    budget (Starlette spools large uploads to disk beyond ~1 MiB) and
+    re-checked against ``max_bytes`` post-read.
     """
     from starlette.datastructures import UploadFile
     from starlette.responses import JSONResponse as _JSONResponse
 
     # Cheap pre-read gate: if Content-Length grossly exceeds max_bytes,
     # reject without parsing the body.  A 10% slack absorbs multipart
-    # framing overhead.  Missing / malformed Content-Length falls through
-    # to the post-read check.
-    if max_bytes is not None:
+    # framing overhead.  A missing or malformed Content-Length falls
+    # through to the same budget, counted as the body arrives.
+    budget = int(max_bytes * 1.1) if max_bytes is not None else None
+    if budget is not None:
         cl_raw = request.headers.get("content-length")
         if cl_raw:
             try:
                 cl = int(cl_raw)
             except ValueError:
                 cl = -1
-            if cl > int(max_bytes * 1.1):
+            if cl > budget:
                 return _JSONResponse(
                     {
                         "error": (
@@ -319,7 +363,15 @@ async def read_multipart_file_or_400(
                 )
 
     try:
-        form = await request.form()
+        form = await _form_within(request, budget)
+    except _BodyOverBudgetError:
+        return _JSONResponse(
+            {
+                "error": f"File too large (over {budget:,} bytes); cap is {max_bytes:,} bytes.",
+                "code": "too_large",
+            },
+            status_code=413,
+        )
     except Exception:
         import structlog
 
