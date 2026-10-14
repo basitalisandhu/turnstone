@@ -1341,7 +1341,9 @@ shown below plus zero-or-more `file` parts; each file is validated and
 reserved onto the new workstream's first turn before the dispatch worker
 runs, so queued multimodal turns cannot lose files to racing sends.  If
 validation fails the fresh workstream is rolled back so no published row or
-phantom create/close event leaks.
+phantom create/close event leaks.  Validation stops at the first file it
+refuses, and the error starts with that file's name (`party.gif: GIF images
+are not supported. Use PNG, JPEG or WebP.`).
 
 **Request body:**
 
@@ -1534,7 +1536,9 @@ turn on this workstream.
 
 - Images (png/jpeg/webp) are capped at **4 MiB** and validated via
   magic-byte sniff on upload. GIF is refused, since vision providers do not
-  all accept it.
+  all accept it, and so is a JPEG saved in more than 100 progressive passes
+  (`400`, code `unsupported`), since each pass costs a decode of the whole
+  picture.
 - Text documents (any `text/*` MIME, allow-listed application MIMEs, or
   known text extensions) are capped at **512 KiB** and must be UTF-8.
 - Per-(workstream, user) pending cap is **10** attachments.

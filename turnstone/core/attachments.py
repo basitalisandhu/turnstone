@@ -289,6 +289,19 @@ def classify_upload(
             )
         if len(data) > IMAGE_SIZE_CAP:
             return None, None, _too_large("Image", len(data), IMAGE_SIZE_CAP)
+        from turnstone.core.images import MAX_JPEG_SCANS, too_many_jpeg_scans
+
+        if too_many_jpeg_scans(data):
+            return (
+                None,
+                None,
+                UploadRejection(
+                    f"This JPEG is saved in more than {MAX_JPEG_SCANS} passes, which takes too "
+                    "long to read. Save it again as an ordinary JPEG or as a PNG.",
+                    "unsupported",
+                    400,
+                ),
+            )
         return "image", sniffed_image, None
     if sniff_pdf_mime(data) is not None:
         if len(data) > PDF_SIZE_CAP:
@@ -332,6 +345,7 @@ def validate_and_save_uploaded_files(
     from starlette.responses import JSONResponse as _JSONResponse
 
     from turnstone.core.attachment_buffer import get_attachment_buffer
+    from turnstone.core.web_helpers import with_filename
 
     saved_ids: list[str] = []
     if not files:
@@ -340,11 +354,13 @@ def validate_and_save_uploaded_files(
     buffer = get_attachment_buffer()
     for filename, claimed_mime, data in files:
         if not data:
-            return saved_ids, _JSONResponse({"error": "Empty file"}, status_code=400)
+            return saved_ids, _JSONResponse(
+                {"error": with_filename(filename, "Empty file")}, status_code=400
+            )
         kind, mime, rejection = classify_upload(filename, claimed_mime, data)
         if rejection is not None:
             return saved_ids, _JSONResponse(
-                {"error": rejection.message, "code": rejection.code},
+                {"error": with_filename(filename, rejection.message), "code": rejection.code},
                 status_code=rejection.status,
             )
         assert kind is not None and mime is not None  # success ⟹ both set

@@ -6033,7 +6033,9 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         if not data:
             return JSONResponse({"error": "Empty file"}, status_code=400)
 
-        kind, mime, rejection = classify(filename, claimed_mime, data)
+        # Off the event loop: classifying reads the whole file (the JPEG scan
+        # count, for one).
+        kind, mime, rejection = await asyncio.to_thread(classify, filename, claimed_mime, data)
         if rejection is not None:
             return JSONResponse(
                 {"error": rejection.message, "code": rejection.code},

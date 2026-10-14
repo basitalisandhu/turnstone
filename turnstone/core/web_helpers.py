@@ -131,6 +131,17 @@ async def read_json_or_400(request: Request) -> dict[str, Any] | JSONResponse:
         return _JSONResponse({"error": "Failed to read request body"}, status_code=500)
 
 
+def with_filename(filename: str, message: str) -> str:
+    """``message`` about one file of several, led by that file's name.
+
+    A create can carry several files and stops at the first refused one, so
+    the error says which.  The name is the uploader's own, shortened and on
+    one line.
+    """
+    name = " ".join((filename or "").split())[:100]
+    return f"{name}: {message}" if name else message
+
+
 async def read_multipart_create_or_400(
     request: Request,
     *,
@@ -213,13 +224,16 @@ async def read_multipart_create_or_400(
             try:
                 data = await upload.read()
             except Exception:
-                return _JSONResponse({"error": "Failed to read upload"}, status_code=400)
+                return _JSONResponse(
+                    {"error": with_filename(filename, "Failed to read upload")}, status_code=400
+                )
             if max_per_file_bytes is not None and len(data) > max_per_file_bytes:
                 return _JSONResponse(
                     {
-                        "error": (
+                        "error": with_filename(
+                            filename,
                             f"File too large ({len(data):,} bytes); "
-                            f"cap is {max_per_file_bytes:,} bytes."
+                            f"cap is {max_per_file_bytes:,} bytes.",
                         ),
                         "code": "too_large",
                     },

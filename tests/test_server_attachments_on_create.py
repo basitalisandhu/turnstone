@@ -117,6 +117,7 @@ class TestValidateAndSaveUploadedFiles:
             ids, err = _validate_and_save_uploaded_files(files, "ws-X", "userA")
             assert err is not None
             assert err.status_code == 400
+            assert json.loads(bytes(err.body))["error"].startswith("evil.bin: ")
             assert ids == []
         finally:
             reset_storage()
@@ -400,7 +401,37 @@ def app_client(tmp_path, monkeypatch):
         reset_storage()
 
 
+def test_a_file_error_names_the_file_short_and_on_one_line():
+    from turnstone.core.web_helpers import with_filename
+
+    assert with_filename("cat\nphoto.png", "Empty file") == "cat photo.png: Empty file"
+    assert with_filename("", "Empty file") == "Empty file"
+    assert with_filename("x" * 300, "Empty file") == "x" * 100 + ": Empty file"
+
+
 class TestCreateMultipart:
+    def test_a_refused_file_is_named(self, app_client):
+        # A create stops at the first refused file; with several attached, the
+        # error has to say which one.
+        from io import BytesIO
+
+        from PIL import Image
+
+        client, _, _gq = app_client
+        gif = BytesIO()
+        Image.new("RGB", (4, 4)).save(gif, format="GIF")
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            data={"meta": json.dumps({"name": "two files"})},
+            files=[
+                ("file", ("tiny.png", PNG_1x1, "image/png")),
+                ("file", ("party.gif", gif.getvalue(), "image/gif")),
+            ],
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"].startswith("party.gif: GIF images are not supported")
+
     def test_create_with_image_and_initial_message(self, app_client):
         import hashlib
 
@@ -596,6 +627,7 @@ class TestCreateMultipart:
             headers=_auth("userA"),
         )
         assert resp.status_code == 413
+        assert resp.json()["error"].startswith("big.png: File too large")
         # Regression: ws_created must NOT have been emitted for a request
         # that's about to be rejected.  Otherwise SSE consumers see a
         # phantom workstream flash on dashboards.
