@@ -1279,13 +1279,13 @@ or `{"status": "running"}` as above.
 
 ### `POST /v1/api/workstreams/{ws_id}/cancel`
 
-Cancels the workstream's current generation. Stop propagates to the primary or
-fallback model stream, model-backed attachment processing, parallel task-agent
-and foreground tool model calls, intent and output-guard judges, tracked bash
-subprocesses, and every approval cycle owned by that generation. Pending plan
-review is rejected as well. The worker preserves any assistant content already
-streamed and synthesizes honest cancelled tool results where needed so the
-saved conversation remains replayable.
+Cancels the workstream's current generation. Stop propagates to the model
+stream, model-backed attachment processing, parallel task-agent and foreground
+tool model calls, intent and output-guard judges, tracked bash subprocesses, and
+every approval cycle owned by that generation. Pending plan review is rejected
+as well. The worker preserves any assistant content already streamed and
+synthesizes honest cancelled tool results where needed so the saved conversation
+remains replayable.
 
 The cooperative response is immediate: `status: ok` acknowledges the request,
 not completion. A running workstream emits `cancelled`, then transitions to
@@ -1377,7 +1377,7 @@ An absent or malformed JSON body returns `400`.
 | Field             | Type          | Default | Description                                                    |
 |-------------------|---------------|---------|----------------------------------------------------------------|
 | `name`            | string        | auto    | Workstream display name                                        |
-| `model`           | string        | default | Model alias from the registry                                  |
+| `model`           | string        | default | Model alias from the registry. On a fork, used only when the source's model isn't loaded (see Fork behavior) |
 | `auto_approve`    | bool          | false   | Auto-approve all tool calls for this workstream                |
 | `auto_approve_tools` | string/array | `""` | Tool names to auto-approve even when `auto_approve` is false; accepts comma-separated text or an array |
 | `user_id`         | string        | `""`  | Owner override honored only for a trusted `console` service identity carrying the `service` scope; ordinary callers remain bound to their authenticated identity |
@@ -1408,6 +1408,18 @@ the source's checkpoint-bounded conversation, saved session configuration,
 persona, effective project, and attachment references. The source remains
 unchanged. Use `POST .../{ws_id}/open` when you want to rehydrate the original
 ID instead.
+
+The fork continues on the source's model when that model is loaded, and `model`
+is then ignored. When the source's model isn't loaded, a request that names
+`model` switches the fork to that model, as `/model <alias>` would, and records
+it, with that model's own temperature, reasoning effort and max tokens. Without
+`model`, or when the source's model is out only for now (its secret store didn't
+answer, so it may load again by itself), the fork is created held: it keeps the
+source's model and settings, and each message is recorded and then refused with
+an error naming the model, until that model loads again (the next message then
+runs on it) or the user switches with `/model <alias>`. No other model is used.
+The chat channels' recovery forks name no model, except a Slack DM when
+`channels.default_model_alias` is set (#1359).
 
 An explicit `required_node_id` applies to the new destination and can differ
 from the source requirement. Omission (including `null`) inherits it. A
@@ -1678,6 +1690,15 @@ Load a saved workstream into memory with its original `ws_id`. If the
 workstream is already loaded, returns immediately with `already_loaded: true`.
 An internal `creating` reservation is not openable and returns the ordinary
 not-found shape until publication completes.
+
+A workstream whose saved model isn't loaded opens held: it keeps and saves its
+own model, and each message is recorded and then refused with an error naming
+the model, until that model loads again (the next message then runs on it) or
+the user switches with `/model <alias>`. No other model is used; a workstream
+saved before model aliases were recorded opens held on the backend model id it
+names, until the user switches it with `/model <alias>`. When the default model
+isn't loaded either, the open fails with `503` and `code: "model_not_loaded"`
+(#1359).
 
 **Path parameters:**
 

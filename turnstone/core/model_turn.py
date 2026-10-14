@@ -150,9 +150,9 @@ class WirePreparationError(RuntimeError):
 
     ``prepare_wire`` is deterministic caller-supplied lowering over the
     caller's own history, so its failure says nothing about the backend.
-    Typing it here keeps retry/fallback ladders from recording backend
-    health or walking every alias over a bug that fails identically on
-    each.  The original exception rides ``__cause__``.
+    Typing it here keeps the retry ladder from recording backend health
+    over a bug that fails identically on every attempt.  The original
+    exception rides ``__cause__``.
     """
 
 
@@ -492,8 +492,8 @@ class ModelLane:
     capabilities, extra_params) and carries *registry* so ``model_turn``
     can re-resolve the live per-call operator flags.  Frozen: a lane is a
     binding, not a mutable session.  Build one per loop (a ``_run_agent``
-    invocation, a judge construction, a utility call site) — model
-    fallback/retry across lanes is just a different ``ModelLane``.
+    invocation, a judge construction, a utility call site) — a model
+    switch or a registry rebind is just a different ``ModelLane``.
 
     *alias* is the registry alias used for config resolution, ``""`` when
     the lane runs outside the registry (then every registry-backed pass
@@ -1212,6 +1212,25 @@ def _raise_if_aborted(cancel_ref: Any, lane: ModelLane) -> None:
     raise DeadlineCancelledError("cancel_ref aborted before dispatch")
 
 
+class RefusingModelClient:
+    """Base for a lane client no call may reach, such as a held session's (#1359).
+
+    :func:`model_turn` and :func:`lane_call_client` raise its :meth:`refusal`
+    before any lowering hook, attachment work, capacity lease or credential
+    mint, so a lane carrying one costs nothing before it refuses.
+    """
+
+    def refusal(self) -> Exception:
+        """The exception a call on this client raises."""
+        raise NotImplementedError
+
+
+def _raise_if_refusing(lane: ModelLane) -> None:
+    client = lane.client
+    if isinstance(client, RefusingModelClient):
+        raise client.refusal()
+
+
 def lane_call_client(
     lane: ModelLane,
     *,
@@ -1224,8 +1243,11 @@ def lane_call_client(
     installed with ``with_options``, which reuses the registry client's
     transport.  The returned clone is therefore not independently closed.
     Cancellation is checked on both sides of the potentially blocking mint.
+    A lane whose client refuses calls (:class:`RefusingModelClient`) raises
+    its refusal before the mint.
     """
     _raise_if_aborted(cancel_ref, lane)
+    _raise_if_refusing(lane)
     resolved_backend_auth = backend_auth_token
     if resolved_backend_auth is None and lane.backend_auth_resolver is not None:
         try:
@@ -1577,6 +1599,9 @@ def model_turn(
             "unrestorable on the wire without the recovery map"
         )
     _raise_if_aborted(cancel_ref, lane)
+    # A lane no call may reach refuses here, before the admission hook,
+    # attachment materialization, the capacity lease or a credential mint.
+    _raise_if_refusing(lane)
     # ONE config fetch per plant call feeds both live per-call flags — a
     # registry hot-reload cannot hand the replay gate and the attach gate
     # different config generations within a single request.

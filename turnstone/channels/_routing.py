@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from turnstone.channels._config import CREATE_LOCK_CAP
 from turnstone.core.log import get_logger
+from turnstone.core.model_remedies import CHAT_MODEL_REMEDY
 from turnstone.sdk._types import TurnstoneAPIError
 from turnstone.sdk.console import AsyncTurnstoneConsole
 from turnstone.sdk.server import AsyncTurnstoneServer
@@ -59,10 +60,11 @@ _CHANNEL_DEFAULT_TTL = _MODELS_CACHE_TTL
 
 #: What a channel adapter replies when a conversation can't start because its
 #: model isn't loaded. Nothing substitutes another model (#1359); the chat user
-#: usually can't fix it, so the reply points at whoever can.
+#: usually can't fix it, so the reply points at whoever can, as a conversation
+#: held on its model says too.
 MODEL_UNAVAILABLE_REPLY = (
-    "The model for this conversation isn't available right now. "
-    "Ask a Turnstone admin to check it in the Models tab, then try again."
+    f"The model for this conversation isn't available right now. {CHAT_MODEL_REMEDY}, "
+    "then try again."
 )
 
 

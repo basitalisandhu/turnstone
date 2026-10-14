@@ -118,37 +118,6 @@ def _session(replies, *, surface="chat", native=False, sdk_retries=0):
         yield session, ui, requests
 
 
-@contextmanager
-def _fallbacks(session, aliases, *, degraded=()):
-    binding = session._model_binding
-    primary_alias = session._model_alias
-    trackers = {alias: MagicMock() for alias in [primary_alias, *aliases]}
-    for alias, tracker in trackers.items():
-        tracker.is_degraded = alias in degraded
-    registry = MagicMock(fallback=aliases)
-    health = MagicMock()
-    health.get_tracker_for_alias.side_effect = lambda registry, alias: trackers[alias]
-
-    def resolve(registry, alias, **kwargs):
-        lane = replace(
-            binding.lane,
-            alias=alias,
-            model=alias,
-            capabilities=replace(binding.lane.capabilities, context_window=200_000),
-            extra_params=None,
-        )
-        return replace(binding, lane=lane)
-
-    with (
-        patch.object(session, "_registry", registry),
-        patch.object(session, "_health_registry", health),
-        patch.object(session, "_get_health_tracker", return_value=trackers[primary_alias]),
-        patch.object(session, "_refresh_model_from_registry"),
-        patch("turnstone.core.session.resolve_model_binding", side_effect=resolve),
-    ):
-        yield trackers[primary_alias], trackers
-
-
 def _invoke(session, caller):
     if caller == "main":
         session.send("Complete the work.")
@@ -226,37 +195,19 @@ def test_json_rejection_reissues_regardless_of_native_posture(tmp_db, caller, su
 @pytest.mark.parametrize("native", [True, None, False])
 def test_main_json_rejection_is_a_creation_failure(tmp_db, native):
     """The streaming owner keeps its creation ladder for a JSON error body at
-    any tool posture: the primary lane is retried, its health failure is
-    recorded once, and the fallback walk runs before the error surfaces."""
+    any tool posture: the primary lane is retried, and its health failure is
+    recorded once before the error surfaces."""
     replies = ["overloaded"] * (ChatSession._MAX_RETRIES + 1)
     with _session(replies, native=native) as (session, ui, requests):
         tracker = MagicMock()
-        session._registry = MagicMock(fallback=["spare"])
         with (
             patch.object(session, "_get_health_tracker", return_value=tracker),
-            patch.object(session, "_try_fallback_lane", return_value=None) as fallback,
             pytest.raises(UpstreamTransientError),
         ):
             _invoke(session, "main")
         assert len(requests) == ChatSession._MAX_RETRIES + 1
         tracker.record_failure.assert_called_once()
-        fallback.assert_called_once()
         assert ui.aux_usage == []
-
-
-def test_main_json_rejection_walks_fallbacks_after_the_ladder(tmp_db):
-    replies = [*(["overloaded"] * (ChatSession._MAX_RETRIES + 1)), "answer"]
-    with _session(replies) as (session, ui, requests):
-        with _fallbacks(session, ["spare"]) as (primary, trackers):
-            assert _invoke(session, "main") == _ANSWER
-        assert [request["model"] for request in requests] == [
-            *(["served-model"] * (ChatSession._MAX_RETRIES + 1)),
-            "spare",
-        ]
-        primary.record_failure.assert_called_once()
-        primary.record_success.assert_not_called()
-        trackers["spare"].record_success.assert_called_once()
-        trackers["spare"].record_failure.assert_not_called()
 
 
 def test_main_json_overflow_rejection_compacts(tmp_db):
@@ -272,12 +223,15 @@ def test_main_json_overflow_rejection_compacts(tmp_db):
 def test_main_json_rejection_health_fault_is_local(tmp_db):
     replies = ["overloaded"] * (ChatSession._MAX_RETRIES + 1)
     with _session(replies) as (session, ui, requests):
-        with _fallbacks(session, ["spare"]) as (primary, trackers):
-            primary.record_failure.side_effect = ValueError("private health state")
-            with pytest.raises(ModelTurnLocalError):
-                _invoke(session, "main")
-        trackers["spare"].record_failure.assert_not_called()
-        trackers["spare"].record_success.assert_not_called()
+        tracker = MagicMock()
+        tracker.record_failure.side_effect = ValueError("private health state")
+        with (
+            patch.object(session, "_get_health_tracker", return_value=tracker),
+            pytest.raises(ModelTurnLocalError),
+        ):
+            _invoke(session, "main")
+        tracker.record_failure.assert_called_once()
+        tracker.record_success.assert_not_called()
 
 
 @pytest.mark.parametrize("surface", ["chat", "responses"])
@@ -354,23 +308,3 @@ def test_cancelling_json_body_read_closes_response_without_reissue(tmp_db):
         finally:
             cancel_ref.abort()
             worker.join(2)
-
-
-def test_main_fallback_walk_dials_healthy_lanes_before_degraded_ones(tmp_db):
-    ladder = ChatSession._MAX_RETRIES + 1
-    replies = [*(["overloaded"] * ladder), *(["connect"] * ladder), "answer"]
-    with _session(replies) as (session, ui, requests):
-        notices: list[str] = []
-        with (
-            _fallbacks(session, ["degraded", "healthy"], degraded={"degraded"}),
-            patch.object(ui, "on_info", side_effect=notices.append),
-        ):
-            assert _invoke(session, "main") == _ANSWER
-        assert [request["model"] for request in requests] == [
-            *(["served-model"] * ladder),
-            *(["healthy"] * ladder),
-            "degraded",
-        ]
-        healthy_notice = notices.index("[Primary model failed, falling back to healthy]")
-        degraded_notice = notices.index("[Fallback degraded is degraded, trying anyway]")
-        assert healthy_notice < degraded_notice

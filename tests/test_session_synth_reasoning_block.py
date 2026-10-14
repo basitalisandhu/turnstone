@@ -311,7 +311,8 @@ class TestStreamResponseSynthBlockIntegration:
                 server_compat={"server_type": "vllm"},
             )
         )
-        session._registry = registry
+        # The lane carries the stub registry; the session keeps none, since
+        # each model round refreshes from the session's registry (#1359).
         provider = scripted_provider(
             self._make_chunks(content="answer", reasoning="reasoning text")
         )

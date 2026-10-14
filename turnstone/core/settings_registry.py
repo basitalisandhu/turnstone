@@ -89,8 +89,7 @@ def _build_registry() -> dict[str, SettingDef]:
             "Refuse dynamic-auth model calls when token minting fails",
             "model",
             help="When enabled, an entra_obo or entra_app model call is refused if its "
-            "runtime credential cannot be minted. This also prevents routing that "
-            "failure into the model fallback chain. A delegated call without a user, "
+            "runtime credential cannot be minted. A delegated call without a user, "
             "or any dynamic alias without a real static key, always refuses regardless "
             "of this setting. Leave disabled only to permit fallback to an explicitly "
             "configured static key after a mint failure.",
@@ -582,9 +581,9 @@ def _build_registry() -> dict[str, SettingDef]:
             "Consecutive failures before backend is marked degraded",
             "health",
             min_value=1,
-            help="If the AI backend fails this many times in a row, it is marked as degraded. "
-            "Degraded backends are deprioritised in the fallback chain but requests are never "
-            "blocked. The backend recovers automatically when a request succeeds.",
+            help="If the AI backend fails this many times in a row, it is marked as degraded, "
+            "and a node whose default model it serves reports degraded health. Requests are "
+            "never blocked. The backend recovers automatically when a request succeeds.",
         ),
         # -- perception role -----------------------------------------------
         SettingDef(

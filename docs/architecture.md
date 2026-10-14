@@ -63,7 +63,7 @@ turnstone/
     tool_search.py    Dynamic tool search — BM25 index, session-scoped tool visibility
     watch.py          WatchRunner daemon — periodic command polling, condition DSL, result dispatch
     judge.py          Intent validation — heuristic rules + LLM judge, advisory verdicts
-    model_registry.py ModelRegistry — immutable configs, atomic binding snapshots, fallback routing
+    model_registry.py ModelRegistry — immutable configs, atomic binding snapshots, routing aliases
     memory.py         Persistence facade + structured memory API (delegates to storage backend)
     config.py         Config file loader (config.toml), apply_config(), warn_migrated_settings()
     config_store.py   ConfigStore — database-backed settings with in-memory cache, thread-safe get/set
@@ -153,7 +153,7 @@ A user message flows through the system as follows:
      |
      v
  _stream_response()  ------------->  model_turn(ModelLane, turns, on_chunk=...)
-     |                                  primary/fallback lane walk; per-lane retry ladder
+     |                                  the session's own lane; creation retry ladder
      v
  the on_chunk consumer  ----------->  generation-fenced display projection:
      |                                  on_reasoning_token() / on_content_token()
@@ -1128,11 +1128,11 @@ ChatSession
 | `ModelCapabilities` | `context_window`, `max_output_tokens`, `supports_temperature`, `token_param`, `thinking_mode`, `supports_effort`, `supports_web_search`, `supports_tool_search`, `supports_vision`, `supports_reasoning_replay`, `supports_verbosity`, `verbosity`, `supports_pro_mode`, `reasoning_mode` |
 | `UsageInfo` | `prompt_tokens`, `completion_tokens`, `total_tokens`, `cache_creation_tokens`, `cache_read_tokens` |
 
-`ModelLane` is frozen: a fallback, model switch, or registry reload produces a
-replacement lane rather than mutating one in place. A holder of an old lane
-(for example, an in-flight compaction or sub-agent) therefore completes against
-one coherent backend binding or is cancelled; it never observes a mixture of
-old endpoint/client state and new capabilities/configuration. Per-call operator
+`ModelLane` is frozen: a model switch or registry reload produces a replacement
+lane rather than mutating one in place. A holder of an old lane (for example, an
+in-flight compaction or sub-agent) therefore completes against one coherent
+backend binding or is cancelled; it never observes a mixture of old
+endpoint/client state and new capabilities/configuration. Per-call operator
 toggles that are intentionally live, such as reasoning replay, are re-read by
 `model_turn()` through the lane's registry reference.
 
@@ -1265,7 +1265,6 @@ model = "gemini-2.5-pro"
 
 [model]
 default = "local"
-fallback = ["claude", "openai"]
 agent_model = "claude"
 ```
 
@@ -1305,7 +1304,7 @@ state.
 
 Primary loops, recursive compaction, judges, title generation, audio, and task
 agents all consume `ModelLane` rather than inspecting provider/client handles.
-Fallback is a lane change, so retry classification and result provenance come
+A rebind is a lane change, so retry classification and result provenance come
 from the lane that actually served the call. A recursive compaction pins one
 lane for all leaf summaries and the merge; a hot reload never splices two model
 definitions into one summary transaction.
@@ -1314,7 +1313,7 @@ Every accepted model turn carries an immutable provenance envelope captured
 from that successful serving attempt: model alias, backend model ID, registry
 generation, and the generation-pinned acting principal. It is stamped before
 the result leaves `model_turn()` and persisted in the assistant row's existing
-`meta` JSON, so a later fallback, hot reload, user rebind, or ambiguous storage
+`meta` JSON, so a later hot reload, user rebind, or ambiguous storage
 acknowledgement cannot relabel the output at commit time. The principal-bearing
 envelope is internal audit metadata: ordinary history/SSE, coordinator
 inspection, exports, and provider lowering do not expose it.
@@ -1590,8 +1589,9 @@ rows are never modified).
 5. `/model` command shows available models; `/model <alias>` switches the
    active workstream's client, model, context window, and per-model sampling
    parameters
-6. `_model_turn_with_fallback()` tries the primary lane, then each fallback
-   alias's lane in order if the primary is unreachable
+6. `_primary_model_turn()` runs each turn on the session's own lane; a model
+   that fails is never retried on another (`[model].fallback` was removed in
+   #1359)
 7. `_run_agent()` resolves the task model (the `model.task_alias` setting,
    else `[model].task_model`, else `[model].agent_model`) for task sub-agents,
    allowing a cheaper model for autonomous loops
@@ -2019,6 +2019,43 @@ snapshot — see `docs/personas.md`) are persisted to the
 commands. `rehydrate()` restores these values, with or without stored turns, so
 reopened workstreams behave identically to the original.
 
+**A model that isn't loaded holds the session (#1359):** a reopened workstream
+whose saved model isn't loaded is built on the default as a stand-in, and its
+binding's client is swapped for one that refuses every call, so the session is
+held exactly while its binding carries that client. It reports and saves its own
+model, and each turn records the message and then raises `ModelNotLoadedError`
+(a `ModelTurnLocalError`) before anything is dialed; `model_turn()` itself
+refuses a lane carrying that client before its admission slot or credential, so
+a call no check stopped never reaches the stand-in. The message names the model
+and a remedy for whoever reads it: `/model <alias>` on the web and in the CLI,
+which reads its models from config.toml once; an admin for a coordinator, a
+coordinator's child (whose errors the coordinator's model reads, so they never
+name another model) and a scheduled run; and the channels' own advice in a chat
+conversation (`turnstone/core/model_remedies.py`), which says the message is
+kept, since chat has no `/retry`. `/model` prints the same message. The next
+send after the registry lists the model again rebinds it, and `/retry` re-sends
+a refused text message. A live session whose model a reload removes is held the
+same way: the binding is refreshed at the start of every send, every model round
+and every creation retry, so a model removed mid-send holds at its next round
+and a model rebuilt mid-send continues on its new client. A live session whose
+reloaded model's client can't be built is held too, naming the cause, and the
+build is retried once per registry change: a fix outside the registry (a
+restored CA bundle) waits for a model edit or a restart, since a Sync of
+unchanged definitions reloads nothing. A row saved before model aliases were
+recorded, which names only a backend model id, is held on that id with no alias:
+nothing is matched to it, not even an alias named like the id, so only a
+`/model` switch ends that hold, and saves keep the row's shape. A fork restores
+as a reopen does, then, when it is held and its request names a model
+(`switch_to`), switches to that model as `/model` would, with that model's own
+sampling settings, recorded in the create's reservation-checked write; a source
+model that is out only for now (its secret store didn't answer) keeps the fork
+held instead. The chat channels' recovery forks name no model (a Slack DM names
+the channel model when `channels.default_model_alias` is set), so a chat
+conversation whose model was removed waits for it. When the default isn't loaded
+either, the reopen fails with a 503 `model_not_loaded`; a saved model that is
+loaded but whose client can't be built fails it too, unless a reload breaks it
+while the reopen runs, which holds the session as well.
+
 **`/clear` vs `/new`:** `/clear` wipes in-memory context but preserves
 messages in the database for future resume. `/new` starts a fresh workstream
 (new `_ws_id`), leaving the old workstream resumable.
@@ -2075,23 +2112,23 @@ Every model call streams (#831). Product callers opt into one completion recover
   different, smaller one. One overflow classifier serves every shrink site. Empty summary
   exhaustion fails compaction while preserving the existing context.
 - **Retry ownership** — SDK creation retries remain unchanged. The main conversation retains
-  its creation retry/fallback walk, which also owns an HTTP-200 JSON error body: it is a
-  rejected request, retried on the primary lane's ladder, recorded as a health failure, and
-  walked to the fallbacks like any other creation failure. Armed failures remain with the
-  visible-stream owner, which finalizes display and applies the shared controller. Other
-  product callers recover within `model_turn`, with 0.5-second exponential backoff and ±50%
-  jitter; task and summary wrappers add no retry ladder.
-  Raw callers, including direct eval/optimizer sampling, retain their existing empty-result
-  behavior and drain retries. Product tools invoked from eval inherit product behavior.
+  its creation retry ladder, which also owns an HTTP-200 JSON error body: it is a rejected
+  request, retried on the primary lane's ladder and recorded as a health failure like any
+  other creation failure. Armed failures remain with the visible-stream owner, which
+  finalizes display and applies the shared controller. Other product callers recover within
+  `model_turn`, with 0.5-second exponential backoff and ±50% jitter; task and summary
+  wrappers add no retry ladder. Raw callers, including direct eval/optimizer sampling, retain
+  their existing empty-result behavior and drain retries. Product tools invoked from eval
+  inherit product behavior.
 - **Accounting and lifecycle** — completed attempts reach their existing usage owner before
   rejection, including empty attempts. Main recovery respects generation ownership; discarded
-  reasoning never enters saved history. Judges retain their original deadline and fallback policy,
-  and each output-judge reissue charges its captured rate limiter. Local publication, ingestion, and
-  accounting failures do not drive provider retries, fallback, or compaction; diagnostics identify
-  the stage and exception type without exposing local exception text. A failed task reports failure,
-  with any earlier partial work guarded and explicitly labelled incomplete. Empty title exhaustion
-  preserves the existing title and scheduling latch, so later sends do not repeatedly relaunch
-  automatic titling.
+  reasoning never enters saved history. Judges retain their original deadline and fallback
+  policy, and each output-judge reissue charges its captured rate limiter. Local publication,
+  ingestion, and accounting failures do not drive provider retries or compaction; diagnostics
+  identify the stage and exception type without exposing local exception text. A failed task
+  reports failure, with any earlier partial work guarded and explicitly labelled incomplete.
+  Empty title exhaustion preserves the existing title and scheduling latch, so later sends do
+  not repeatedly relaunch automatic titling.
 - **Optional perception** — a failed child description uses the existing parent placeholder.
   Useful results are cached by principal, model binding, and content. A model that produces no
   description after recovery memoizes that empty result for the same binding generation, so
@@ -2191,15 +2228,12 @@ degraded ──(any success)─────────────────�
 - `record_success()` fires at stream admission: the streaming consumer's
   `on_stream_armed` hook, driven by the eager `cancel_ref` append after the adapter accepts
   a streaming response.
-- `record_failure()` fires on a lane's exhausted creation ladder, in
-  `ChatSession._model_turn_with_fallback` / `_try_fallback_lane`; an HTTP-200 JSON error body
-  is one of those creation failures. A mid-stream death records neither: the stream already
-  armed, and its visible owner controls recovery. `BackendAuthUnavailableError`,
-  `WirePreparationError`, and local consumer faults record nothing because they say nothing
-  about backend health.
-- `is_degraded` is advisory ordering, not admission: the fallback walk tries
-  non-degraded aliases first and degraded ones as a last resort, and the
-  primary lane is always dialed.
+- `record_failure()` fires on the lane's exhausted creation ladder, in
+  `ChatSession._primary_model_turn`; an HTTP-200 JSON error body is one of those creation
+  failures. A mid-stream death records neither: the stream already armed, and its visible
+  owner controls recovery. `BackendAuthUnavailableError`, `WirePreparationError`, and local
+  consumer faults record nothing because they say nothing about backend health.
+- The degraded state is advisory, not admission: the primary lane is always dialed.
 - `HealthTrackerRegistry` keys trackers by `(provider, base_url)` so aliases
   sharing a backend share one tracker. The `/health` endpoint projects the
   default model's tracker: `"status": "ok"` when that backend is healthy and

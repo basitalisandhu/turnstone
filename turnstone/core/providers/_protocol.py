@@ -176,7 +176,7 @@ class ProviderResponseError(RuntimeError):
     callers spend their shared recovery allowance on a transient one (a class
     in the provider's ``retryable_error_names``; an unclassified body is
     terminal on its first attempt), and the streaming owner handles it with
-    its ordinary creation ladder and fallback walk.
+    its ordinary creation ladder.
     """
 
 

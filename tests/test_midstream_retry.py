@@ -287,11 +287,10 @@ class TestMidStreamRetry:
             session.send("test")
 
         assert create.call_count == 3
-        # Once at the top of send() (the per-send driver) plus once per
-        # re-issue — a regression that drops the mid-retry refresh would
-        # show 1 here and stream a reload-closed client (#937 recreate
-        # hardening).
-        assert refresh.call_count == 3
+        # Once at the top of send() (the per-send driver), once at the top of
+        # every model round (#1359), and once per re-issue in its backoff (#937
+        # recreate hardening), which the next round's own refresh backs up.
+        assert refresh.call_count == 6
 
     def test_retry_window_restarts_spinner(self, tmp_db):
         ui = RecordingUI()
@@ -409,8 +408,7 @@ class TestMidStreamRetry:
         # The retry gate reads the SERVING lane's provider.  FlakyError is
         # retryable only per THIS provider's set, so the re-issue proves
         # the gate consulted the lane that armed the stream, not a global
-        # default.  (The distinct-fallback-lane variant rides the real
-        # walk in test_model_registry's TestSessionFallback.)
+        # default.
         provider = arm_session(
             session,
             _dying_stream("x", exc=FlakyError("in-band transient")),
@@ -737,7 +735,7 @@ class TestRecreateWindowClassification:
     there is NO live attempt — ``end_attempt`` disarms the dead one
     after its partial is captured and stream_end is emitted. These pins
     hold the two failure modes of reading the dead attempt's armed state in that
-    window (a Stop re-finalizing discarded display state; a walk-preamble
+    window (a Stop re-finalizing discarded display state; a round-preamble
     error replacing the stream death), the two error classes the
     re-issue mask must forward verbatim, and the saw-chunk classifier
     fallback for adapters that never arm."""
@@ -753,7 +751,8 @@ class TestRecreateWindowClassification:
         # The Stop lands AFTER backoff+discard, BEFORE the next attempt
         # arms: _refresh_model_from_registry is the last step of the
         # re-create sequence, so a cancel fired there raises at the next
-        # walk's loop-top _check_cancelled — the exact window.
+        # round's ladder-top _check_cancelled (after that round's own refresh)
+        # — the exact window.
         real_refresh = session._refresh_model_from_registry
         refresh_calls = 0
 
@@ -761,15 +760,18 @@ class TestRecreateWindowClassification:
             nonlocal refresh_calls
             refresh_calls += 1
             real_refresh()
-            # send() performs one preflight refresh before the first attempt;
-            # the second refresh is the retry re-create seam this test owns.
-            if refresh_calls == 2:
+            # send() performs one preflight refresh and the first model round
+            # another at its top (#1359); the third refresh is the retry
+            # re-create seam this test owns.
+            if refresh_calls == 3:
                 session._cancel_event.set()
 
         with patch.object(session, "_refresh_model_from_registry", side_effect=cancel_in_window):
             session.send("test")
 
-        assert refresh_calls == 2
+        # The next round's own refresh runs before its ladder's loop-top
+        # _check_cancelled raises.
+        assert refresh_calls == 4
         # The dead attempt streamed only its safe-flush prefix ("Ha");
         # the splitter carry ("lf an answer") must NEVER surface as a late
         # content token behind a duplicate stream_end.
@@ -793,7 +795,7 @@ class TestRecreateWindowClassification:
             _dying_stream("text", exc=httpx.ReadError("wire died")),
             _good_stream("never reached"),
         )
-        # The re-issue walk's PREAMBLE (before any begin_attempt) raises:
+        # The re-issue round's PREAMBLE (before any begin_attempt) raises:
         # with the dead attempt's ref retired this is a creation-phase
         # failure, so the ORIGINAL stream death is the error the operator
         # sees — not the preamble's.
@@ -869,20 +871,14 @@ class TestRecreateWindowClassification:
 
     def test_wire_preparation_failure_never_touches_backend_health(self, tmp_db):
         """A lowering failure is a session-data fault: no dispatch and no
-        health record on ANY lane — but it DOES walk the fallbacks, since
-        prepare is lane-variant and another lane's posture may serve the
-        turn.  When none does, the typed ``WirePreparationError`` rides to
-        the fatal formatter's dedicated branch."""
+        health record.  The typed ``WirePreparationError`` rides to the
+        fatal formatter's dedicated branch."""
         ui = RecordingUI()
         session = _make_session(ui)
         provider = arm_session(session, _good_stream("unreached"))
         tracker = MagicMock()
-        registry = MagicMock()
-        registry.fallback = ["fb1"]
-        session._registry = registry
         with (
             patch.object(session, "_get_health_tracker", return_value=tracker),
-            patch.object(session, "_try_fallback_lane", return_value=None) as fb_spy,
             patch.object(
                 session,
                 "_prepare_lowered_wire_messages",
@@ -901,7 +897,6 @@ class TestRecreateWindowClassification:
         assert "malformed turn 7" not in str(excinfo.value)
 
         tracker.record_failure.assert_not_called()
-        fb_spy.assert_called_once()
         provider.create_streaming.assert_not_called()
         errors = ui.of("error")
         assert errors and "stored history" in errors[-1]
@@ -911,61 +906,6 @@ class TestRecreateWindowClassification:
         # is persisted (see TestWirePrepFaultRedaction).
         assert "ValueError" in errors[-1]
         assert "malformed turn 7" not in errors[-1]
-
-    def test_fallback_prep_fault_continues_walk(self, tmp_db):
-        """A prep fault on one lane must not abort the walk: the next
-        alias may still serve the turn (prepare is lane-variant)."""
-        from tests._session_helpers import make_result
-
-        session = _make_session(RecordingUI())
-        registry = MagicMock()
-        registry.fallback = ["a", "b"]
-        session._registry = registry
-        served = make_result(content="ok")
-        tracker = MagicMock()
-        with (
-            patch.object(session, "_get_health_tracker", return_value=tracker),
-            patch.object(
-                session,
-                "_model_turn_with_retry",
-                side_effect=WirePreparationError("primary prep fault"),
-            ),
-            patch.object(session, "_try_fallback_lane", side_effect=[None, served]) as fb,
-        ):
-            from turnstone.core.session import _StreamTurnConsumer
-
-            consumer = _StreamTurnConsumer(session, 0)
-            result = session._model_turn_with_fallback(consumer, lambda w, lane: w, 0)
-
-        assert result is served
-        assert fb.call_count == 2
-        tracker.record_failure.assert_not_called()
-
-    def test_fallback_prep_fault_records_no_health(self, tmp_db):
-        ui = RecordingUI()
-        session = _make_session(ui)
-        registry = MagicMock()
-        registry.resolve_binding.return_value = (MagicMock(), "m", None, MagicMock(), None)
-        fb_tracker = MagicMock()
-        session._registry = registry
-        session._health_registry = MagicMock()
-        session._health_registry.get_tracker_for_alias.return_value = fb_tracker
-        with (
-            patch.object(session, "_build_main_lane", return_value=MagicMock()),
-            patch.object(
-                session,
-                "_model_turn_with_retry",
-                side_effect=WirePreparationError("fold blew up"),
-            ),
-        ):
-            from turnstone.core.session import _StreamTurnConsumer
-
-            consumer = _StreamTurnConsumer(session, 0)
-            out = session._try_fallback_lane("fb", consumer, lambda w, lane: w, 0)
-
-        assert out is None
-        fb_tracker.record_failure.assert_not_called()
-        assert any("Fallback fb also failed: WirePreparationError" in i for i in ui.of("info"))
 
 
 class TestAcceptedResponseWindow:
@@ -1074,7 +1014,7 @@ class TestAcceptedResponseWindow:
 
 
 class TestGenerationFencedCreationNotices:
-    """Retry/fallback theater belongs only to the generation that earned it."""
+    """Retry theater belongs only to the generation that earned it."""
 
     def test_force_successor_before_retry_notice_suppresses_notice_and_redispatch(self, tmp_db):
         ui = RecordingUI()
@@ -1106,107 +1046,13 @@ class TestGenerationFencedCreationNotices:
         dispatch.assert_called_once()
         assert not any("Retrying in" in info for info in ui.of("info"))
 
-    def test_stop_before_primary_fallback_notice_suppresses_notice_and_dispatch(self, tmp_db):
-        ui = RecordingUI()
-        session = _make_session(ui)
-        session._generation = 8
-        session._registry = MagicMock()
-
-        def stop_during_resolution(*args, **kwargs):
-            session._cancel_event.set()
-            return MagicMock()
-
-        from turnstone.core.session import _StreamTurnConsumer
-
-        consumer = _StreamTurnConsumer(session, 8)
-        with (
-            patch(
-                "turnstone.core.session.resolve_model_binding",
-                side_effect=stop_during_resolution,
-            ),
-            patch.object(session, "_build_main_lane", return_value=MagicMock()),
-            patch.object(session, "_model_turn_with_retry") as dispatch,
-            pytest.raises(GenerationCancelled),
-        ):
-            session._try_fallback_lane("fb", consumer, lambda wire, lane: wire, 8)
-
-        dispatch.assert_not_called()
-        assert not any("falling back to fb" in info for info in ui.of("info"))
-
-    def test_stop_before_degraded_fallback_notice_suppresses_notice_and_dispatch(self, tmp_db):
-        ui = RecordingUI()
-        session = _make_session(ui)
-        session._generation = 9
-        registry = MagicMock()
-        registry.fallback = ["fb"]
-        session._registry = registry
-
-        class _StopOnDegradedRead:
-            @property
-            def is_degraded(self):
-                session._cancel_event.set()
-                return True
-
-        health_registry = MagicMock()
-        health_registry.get_tracker_for_alias.return_value = _StopOnDegradedRead()
-        session._health_registry = health_registry
-
-        from turnstone.core.session import _StreamTurnConsumer
-
-        consumer = _StreamTurnConsumer(session, 9)
-        with (
-            patch.object(session, "_get_health_tracker", return_value=None),
-            patch.object(
-                session,
-                "_model_turn_with_retry",
-                side_effect=RuntimeError("primary failed"),
-            ),
-            patch.object(session, "_try_fallback_lane") as dispatch,
-            pytest.raises(GenerationCancelled),
-        ):
-            session._model_turn_with_fallback(consumer, lambda wire, lane: wire, 9)
-
-        dispatch.assert_not_called()
-        assert not any("degraded, trying anyway" in info for info in ui.of("info"))
-
-    def test_force_successor_before_fallback_failed_notice_suppresses_stale_notice(self, tmp_db):
-        ui = RecordingUI()
-        session = _make_session(ui)
-        session._generation = 10
-        session._registry = MagicMock()
-
-        def fail_after_successor_claim(*args, **kwargs):
-            session._generation += 1
-            raise httpx.ConnectError("fallback failed")
-
-        from turnstone.core.session import _StreamTurnConsumer
-
-        consumer = _StreamTurnConsumer(session, 10)
-        with (
-            patch("turnstone.core.session.resolve_model_binding", return_value=MagicMock()),
-            patch.object(session, "_build_main_lane", return_value=MagicMock()),
-            patch.object(
-                session,
-                "_model_turn_with_retry",
-                side_effect=fail_after_successor_claim,
-            ) as dispatch,
-            pytest.raises(GenerationCancelled),
-        ):
-            session._try_fallback_lane("fb", consumer, lambda wire, lane: wire, 10)
-
-        dispatch.assert_called_once()
-        infos = ui.of("info")
-        assert any("falling back to fb" in info for info in infos)
-        assert not any("Fallback fb also failed" in info for info in infos)
-
 
 class TestDebugDumpLatch:
     """The debug request dump prints once per ``_stream_response``
     invocation.  RULED (#832): send()'s overflow-recovery re-invocation
     prints the RE-PREPARED wire — the dump that diagnoses the recovery —
     where the pre-fold behavior printed only the first.  Within one
-    invocation, re-issues and fallback lanes re-run the passes but never
-    re-dump."""
+    invocation, re-issues re-run the passes but never re-dump."""
 
     def test_reissue_never_redumps(self, tmp_db):
         session = _make_session(RecordingUI())
@@ -1230,30 +1076,6 @@ class TestDebugDumpLatch:
             session._stream_response(0)
             session._stream_response(0)
         assert dump.call_count == 2
-
-
-class TestFallbackFailureRedaction:
-    def test_fallback_ui_line_carries_class_name_only(self, tmp_db):
-        """The fallback-failure info line lands in the browser transcript
-        and persisted event stream — it carries the exception CLASS, never
-        its text (a ConnectError's str can embed a credential-bearing
-        base_url)."""
-        ui = RecordingUI()
-        session = _make_session(ui)
-        registry = MagicMock()
-        registry.resolve_binding.side_effect = httpx.ConnectError(
-            "dial http://user:SECRETKEY@gw.example/v1 failed"
-        )
-        session._registry = registry
-        from turnstone.core.session import _StreamTurnConsumer
-
-        consumer = _StreamTurnConsumer(session, 0)
-        result = session._try_fallback_lane("fb", consumer, lambda w, lane: w, 0)
-
-        assert result is None
-        infos = ui.of("info")
-        assert any("Fallback fb also failed: ConnectError" in i for i in infos)
-        assert not any("SECRETKEY" in i for i in infos)
 
 
 class TestWirePrepFaultRedaction:
@@ -1289,9 +1111,8 @@ class TestWirePrepFaultRedaction:
 
 class TestPrepareWireLaneCaps:
     """The per-attempt wire prep folds with the SERVING lane's
-    capabilities — a fallback whose template rejects mid-conversation
-    system roles gets the folded shape even when the primary keeps them
-    inline."""
+    capabilities — a lane whose template rejects mid-conversation system
+    roles gets the folded shape even when the primary keeps them inline."""
 
     def test_caps_override_controls_fold_posture(self, tmp_db):
         from turnstone.core.providers import ModelCapabilities

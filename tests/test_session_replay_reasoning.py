@@ -10,9 +10,9 @@ transport post-#831).  These tests pin:
    default matching the migration server_default) when the lookup fails.
 2. The streaming wire-build call site actually passes the resolved flag
    down — post-#832 that call site is ``model_turn``, reached through
-   ``session._stream_response`` and its lane-swap fallback walk.  Without
-   this the Phase 2 work is dead code (the strip-when-False predicate
-   never fires).
+   ``session._stream_response`` and ``_primary_model_turn``.  Without this
+   the Phase 2 work is dead code (the strip-when-False predicate never
+   fires).
 3. The non-streaming call site at ``session.py:_utility_completion``
    does the same, through the same ``model_turn`` seam.
 
@@ -91,8 +91,12 @@ def _bind_session_lane(
     client: Any | None = None,
     capabilities: ModelCapabilities | None = None,
 ) -> None:
-    """Install a complete provider/client/model/capability lane for a test."""
-    session._registry = registry
+    """Install a complete provider/client/model/capability lane for a test.
+
+    The lane carries the stub *registry* its flags are read from. The session
+    keeps none: each model round refreshes the binding from the session's
+    registry (#1359), which needs a whole one, and would replace this lane.
+    """
     current_lane = session._model_binding.lane
     lane = resolve_lane(
         provider,
@@ -147,8 +151,8 @@ class TestResolveReplayReasoningToModel:
 
     def test_alias_selects_its_own_config(self) -> None:
         # The flag tracks the alias the LANE resolved, not any session
-        # default — the property the fallback walk depends on (pinned
-        # end-to-end by test_fallback_alias_uses_its_own_flag below).
+        # default: a lane on another alias (a task agent on its own model)
+        # reads that alias's flag.
         def per_alias(alias: str) -> Any:
             return SimpleNamespace(
                 replay_reasoning_to_model=(alias == "needs-replay"),
@@ -204,8 +208,8 @@ class TestStreamingCallSitePassesFlag:
     dead code at the call site.
 
     The call site is ``model_turn`` now, driven through the real
-    ``_stream_response`` wrapper (creation walk → drain → finalize), so
-    the flag rides the lane the walk actually served the turn on.
+    ``_stream_response`` wrapper (creation ladder → drain → finalize), so
+    the flag rides the lane that actually served the turn.
     """
 
     def test_replay_true_propagates_to_provider(self, tmp_db: str) -> None:
@@ -231,35 +235,6 @@ class TestStreamingCallSitePassesFlag:
             alias="claude-opus-4-7",
         )
         assert kwargs["replay_reasoning_to_model"] is False
-
-    def test_fallback_alias_uses_its_own_flag(self, tmp_db: str) -> None:
-        # When the primary fails and we fall back to an alias with a
-        # different flag, the flag MUST track the resolved alias —
-        # not the session's primary alias.
-        session = _make_registered_session()
-
-        def per_alias(alias: str) -> Any:
-            return SimpleNamespace(
-                replay_reasoning_to_model=(alias == "fallback-with-replay"),
-                capabilities={},
-            )
-
-        fb_provider = _flag_capture_provider(supports_replay=True)
-        registry = SimpleNamespace(
-            get_config=per_alias,
-            fallback=["fallback-with-replay"],
-            resolve_binding=lambda alias: (MagicMock(), "fallback-model", None, fb_provider, None),
-        )
-        # The primary lane dies at CREATION (raises without arming its
-        # cancel_ref), which is what sends the walk to the next alias; a
-        # non-retryable class keeps the ladder from burning backoff.
-        primary = _flag_capture_provider(supports_replay=True)
-        primary.create_streaming = MagicMock(side_effect=RuntimeError("primary is down"))
-        _drive_stream(session, primary, registry=registry, alias="primary")
-        # Resolved against the FALLBACK alias, not the session's primary.
-        assert fb_provider.create_streaming.call_args.kwargs["replay_reasoning_to_model"] is True
-        # ...and the primary's own attempt resolved its own alias' flag.
-        assert primary.create_streaming.call_args.kwargs["replay_reasoning_to_model"] is False
 
 
 class TestSessionToWireBoundaryIntegration:

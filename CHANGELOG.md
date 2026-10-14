@@ -247,6 +247,34 @@ frozen.
   before, a node kept the previous value until the next Sync or restart. The model pickers name a
   default their list doesn't hold instead of showing a bare "Default model", and the node's picker
   marks one the node didn't load as not available.
+- **A workstream whose model isn't loaded waits for it (#1359)** *(BREAKING)* — reopening a
+  workstream whose saved model isn't loaded (deleted, disabled, renamed, or left out of a reload
+  because its secret reference couldn't be read) no longer runs it on the default model, which the
+  next save then made permanent, including on unattended watch restores. The workstream opens, keeps
+  and saves its own model, and each message is recorded and then refused before any model call,
+  naming the model and a remedy its reader can use: `/model <alias>` on the web and in the CLI; an
+  admin for coordinators, a coordinator's workstreams (whose errors the coordinator's model reads)
+  and scheduled runs; and in Slack and Discord, which can't run `/model`, the channels' own "Ask a
+  Turnstone admin" advice, saying the message is kept. Once the model loads again, the next message
+  continues on it, and `/retry` re-sends a refused text message (one with attachments has to be sent
+  again). A live workstream whose model a reload removes, or whose reloaded model's client can't be
+  built, waits the same way from its next model round, instead of sending to the client the reload
+  retired (a build that failed is retried at the next registry change); each round and each creation
+  retry first catches up with the registry, so a model rebuilt mid-send continues on its new client.
+  A fork whose source model isn't loaded waits too, unless its request names a model: the fork then
+  switches to that model as `/model` would, with that model's own sampling settings, and records it
+  as its model, so the source model's reasoning effort no longer reaches another model (part of
+  #1272). A source model that is out only for now (its secret store didn't answer) keeps the fork
+  waiting instead, so it doesn't move for good. The chat channels' recovery forks name no model (a
+  Slack DM names `channels.default_model_alias` when it is set), so a chat conversation whose model
+  was removed waits until an admin restores it. Coordinators wait the same way. A workstream saved
+  before model aliases were recorded names only a backend model id, which no loaded model is matched
+  to, so it waits until it is switched with `/model`. When the default isn't loaded either, a reopen
+  still fails with the 503 `model_not_loaded`. `/model` prints the same message as a refused turn;
+  the model chip doesn't show the state yet (#1382). Custom code that forks with `fork_from_storage`
+  or `adopt_fork_snapshot` passes `switch_to=<alias>` to run the fork on a model it names. The
+  `session_mgr.stale_alias_dropped` and `session.model_refresh_alias_removed` warnings become
+  `session_mgr.saved_alias_not_loaded` and `session.model_held`.
 - **Slack uses the channel adapter model (#1359).** New Slack conversations run on
   `channels.default_model_alias`, as the Roles tab says, instead of always the server default;
   before, only Discord used it. Both bots now re-read the setting every 30 seconds instead of every
@@ -494,6 +522,15 @@ frozen.
 
 ### Removed
 
+- **The `[model] fallback` failover chain is gone (#1359)** *(BREAKING)* — a turn whose model failed
+  to answer after its retries was tried again on each alias in config.toml's `[model].fallback`
+  list, healthy backends first, possibly on another provider; the turn now fails on its own model
+  and says why. A config.toml that still sets `fallback` loads, the list is ignored, and each node,
+  console and CLI process logs one `model_registry.fallback_ignored` warning. `/model` no longer
+  prints a "Fallback:" line, the `health.failure_threshold` and `model.auth_fail_closed` help no
+  longer mention the chain, and a backend marked degraded is now only reported (in `/health`, the
+  console and the metrics). Custom code that builds a `ModelRegistry` or calls its `reload()` must
+  drop the `fallback` argument, and passes `agent_model` and the other routing aliases by keyword.
 - **The identical-repeat warning and its nudge are gone (#1339).** A tool called three times in a
   row with the same arguments no longer has "⚠ Warning: this is an identical repeat of a previous
   tool call" appended to its output, and the model no longer gets the "stop and reconsider your

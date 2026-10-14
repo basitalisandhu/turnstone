@@ -5767,7 +5767,7 @@ class TestOrphanGuardsBelowTheLadder:
         with (
             patch.object(
                 session,
-                "_model_turn_with_fallback",
+                "_primary_model_turn",
                 side_effect=self._armed_death(session, IncompleteStreamError("wire died")),
             ),
             pytest.raises(IncompleteStreamError),
@@ -5787,7 +5787,7 @@ class TestOrphanGuardsBelowTheLadder:
         with (
             patch.object(
                 session,
-                "_model_turn_with_fallback",
+                "_primary_model_turn",
                 side_effect=self._armed_death(session, KeyboardInterrupt()),
             ),
             pytest.raises(KeyboardInterrupt),
@@ -5809,7 +5809,7 @@ class TestOrphanGuardsBelowTheLadder:
             raise KeyboardInterrupt
 
         with (
-            patch.object(session, "_model_turn_with_fallback", side_effect=_seam),
+            patch.object(session, "_primary_model_turn", side_effect=_seam),
             pytest.raises(KeyboardInterrupt),
         ):
             session._stream_response(1)

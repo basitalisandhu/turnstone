@@ -147,7 +147,7 @@ note bottom of ProviderCall
   If minting fails, a configured fail-closed deployment or a keyless alias
   raises BackendAuthUnavailableError. A dynamic alias with an explicit static
   key may fall back only when policy allows. Authentication refusal is not a
-  backend-health failure and does not walk to a static fallback model.
+  backend-health failure.
 end note
 
 @enduml

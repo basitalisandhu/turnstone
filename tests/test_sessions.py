@@ -623,14 +623,14 @@ class TestWorkstreamConfig:
             build(None).rehydrate()
 
     def test_rehydrate_keeps_defaults_when_alias_unresolvable(self, tmp_db):
-        """When the saved alias is empty or no longer in the registry,
-        ``rehydrate()`` must NOT copy ``saved_model`` onto the constructor's
-        default provider.  Pairing a removed model name with a default
-        provider that doesn't know about it produces a broken session
-        whose next API call fails — the exact regression Copilot flagged
-        on PR #465.  The constructor already resolved a coherent default
-        (provider + model + capabilities); rehydrate should leave it intact
-        and just log the unreachable saved values."""
+        """A saved config with no alias (a legacy row naming only a backend model id) and no
+        registry: ``rehydrate()`` must NOT copy ``saved_model`` onto the constructor's default
+        provider. Pairing a model name with a provider that doesn't know it produces a broken
+        session whose next API call fails, the regression a review flagged on PR #465. The
+        constructor already resolved a coherent default (provider + model + capabilities);
+        rehydrate leaves it intact and logs the unreachable saved values. With a registry, such a
+        row holds the session on its model id instead, as a saved alias the registry doesn't
+        list does (#1359)."""
         client = MagicMock()
         client.models.list.return_value.data = [MagicMock(id="test-model")]
         ui = MagicMock()
@@ -642,9 +642,7 @@ class TestWorkstreamConfig:
         register_workstream("model_ws")
         save_message("model_ws", "user", "hello")
         save_message("model_ws", "assistant", "hi")
-        # Empty alias + an orphan model name — same shape rehydrate sees
-        # when an operator removes an alias from the registry that the
-        # workstream was originally pinned to.
+        # Empty alias + a model name: a legacy row from before aliases.
         save_workstream_config("model_ws", {"model": "gpt-5", "model_alias": ""})
 
         session = ChatSession(
@@ -741,16 +739,25 @@ class TestWorkstreamConfig:
         with patch.object(reg, "resolve_binding", side_effect=ValueError("Unknown model alias: a")):
             assert session.rehydrate() is True  # must not raise
 
-        assert session._model_binding is old_binding
+        # The alias missed, so the session is held on its saved model (#1359)
+        # over its old binding's facets, whose client now refuses every call.
+        assert session.model_held
+        assert session.model_alias == "a"
         assert session.model == "m-a"
+        assert session._model_binding.config is old_binding.config
+        assert session._model_binding.lane.provider is old_binding.lane.provider
+        assert session._model_binding.lane.client is not old_binding.lane.client
 
-    def test_rehydrate_construction_failure_logs_true_cause_keeps_binding(
+    def test_rehydrate_construction_failure_holds_and_names_the_cause(
         self, tmp_db, monkeypatch, caplog
     ):
-        """Logs the construction cause, not the unreachable-alias one."""
+        """A saved model whose client can't be built holds the session, as a
+        missing one does: nothing runs on the default (#1359). The log and the
+        refusal name the construction cause, not the unreachable-alias one."""
         import logging
 
         from turnstone.core.model_registry import ModelConfig, ModelRegistry
+        from turnstone.core.session import ModelNotLoadedError
 
         reg = ModelRegistry(
             models={
@@ -785,11 +792,18 @@ class TestWorkstreamConfig:
         with caplog.at_level(logging.WARNING):
             assert session.rehydrate() is True  # must not raise
 
-        assert session._model_binding is old_binding
+        assert session.model_held
+        assert session.model_alias == "a"
+        assert session.bound_model_alias == "default"  # the stand-in's facets
+        assert session._model_binding.lane.model == old_binding.lane.model
+        assert session._config_for_save()["model_alias"] == "a"
+        assert session._rebind_failed_key == ("a", reg.generation)
         blob = " ".join(r.getMessage() for r in caplog.records)
-        assert "could not be constructed" in blob
+        assert "session.resume_client_construction_failed" in blob
         assert "details in server log" in blob
         assert "unreachable" not in blob
+        with pytest.raises(ModelNotLoadedError, match="couldn't be built"):
+            session._raise_if_held()
 
     def test_init_does_not_clobber_existing_config(self, tmp_db):
         """ChatSession.__init__ must NOT overwrite existing

@@ -24,7 +24,6 @@ from tests._session_helpers import (
 from turnstone.console.coordinator_client import _serialize_messages
 from turnstone.core.export import export_workstream
 from turnstone.core.history_decoration import project_history_messages
-from turnstone.core.model_registry import ModelConfig, ModelRegistry
 from turnstone.core.model_turn import ModelLane, model_turn
 from turnstone.core.providers import ModelCapabilities, StreamChunk, UsageInfo
 from turnstone.core.session import ConversationPersistenceError, GenerationCancelled
@@ -135,47 +134,6 @@ def test_model_turn_drain_retry_logs_kernel_axes_without_principal(
     assert "acting_principal_id" not in retry.getMessage()
 
 
-def test_creation_fallback_stamps_fallback_binding_and_principal(tmp_db: str) -> None:
-    registry = ModelRegistry(
-        models={
-            "primary": ModelConfig(
-                "primary", "http://primary/v1", "key", "primary-id", provider="openai-compatible"
-            ),
-            "fallback": ModelConfig(
-                "fallback",
-                "http://fallback/v1",
-                "key",
-                "fallback-id",
-                provider="openai-compatible",
-            ),
-        },
-        default="primary",
-        fallback=["fallback"],
-    )
-    session = make_registered_session(
-        registry=registry,
-        model_alias="primary",
-        user_id="owner",
-        ui=RecordingUI(),  # type: ignore[no-untyped-call]
-    )
-    session._title_generated = True
-    session._primary_lane().client.chat.completions.create = MagicMock(
-        side_effect=ConnectionError("primary unavailable")
-    )
-    registry.get_client("fallback").chat.completions.create = scripted_chat_client(
-        {"content": "served by fallback"}
-    )
-
-    session.send("hello", acting_user_id="user-alice")
-
-    assert _provenance(session.messages[-1]) == {
-        "model_alias": "fallback",
-        "backend_model_id": "fallback-id",
-        "registry_generation": registry.generation,
-        "acting_principal_id": "user-alice",
-    }
-
-
 def test_midstream_rebind_stamps_only_the_successful_replacement(
     tmp_db: str,
     caplog: pytest.LogCaptureFixture,
@@ -194,9 +152,11 @@ def test_midstream_rebind_stamps_only_the_successful_replacement(
     refresh_count = 0
 
     def _refresh() -> None:
+        # send()'s refresh, the first round's, then the re-issue's (#1359):
+        # the reload lands between the dead attempt and its replacement.
         nonlocal refresh_count
         refresh_count += 1
-        if refresh_count != 2:
+        if refresh_count != 3:
             return
         replace_session_lane(session, model="replacement-id")
         session._model_binding = dataclasses.replace(
@@ -340,14 +300,14 @@ def test_utility_completion_stamps_snapshotted_acting_principal(tmp_db: str) -> 
     )
 
 
-def test_token_calibration_isolated_across_primary_fallback_primary() -> None:
+def test_token_calibration_isolated_across_a_switch_and_back() -> None:
     """A -> B -> A restores A's ratio and A's own prompt-count anchor."""
     session = make_session(model_alias="primary", registry_generation=7)
     primary = session._primary_lane()
-    fallback = dataclasses.replace(
+    other = dataclasses.replace(
         primary,
-        alias="fallback",
-        model="fallback-kernel",
+        alias="other",
+        model="other-kernel",
         registry_generation=11,
     )
     session.messages = [Turn.user("first")]
@@ -374,7 +334,7 @@ def test_token_calibration_isolated_across_primary_fallback_primary() -> None:
 
     session.messages.extend([Turn.assistant("primary answer"), Turn.user("second")])
     session._msg_tokens.extend([5, 2])
-    session._activate_token_calibration(fallback)
+    session._activate_token_calibration(other)
     session._last_usage = {
         "prompt_tokens": 25,
         "completion_tokens": 7,
@@ -385,14 +345,14 @@ def test_token_calibration_isolated_across_primary_fallback_primary() -> None:
         tool_def_chars=0,
         native_tokens=0,
         provenance=TurnProvenance(
-            model_alias=fallback.alias,
-            backend_model_id=fallback.model,
-            registry_generation=fallback.registry_generation,
+            model_alias=other.alias,
+            backend_model_id=other.model,
+            registry_generation=other.registry_generation,
         ),
     )
     assert session._chars_per_token == 2.0
 
-    session.messages.append(Turn.assistant("fallback answer"))
+    session.messages.append(Turn.assistant("other answer"))
     session._msg_tokens.append(7)
     session._activate_token_calibration(primary)
 
@@ -402,28 +362,30 @@ def test_token_calibration_isolated_across_primary_fallback_primary() -> None:
     assert session._estimated_prompt_tokens() != 25 + sum(session._msg_tokens[3:])
 
 
-def test_cancelled_partial_stamps_the_armed_fallback_lane_and_principal(
+def test_cancelled_partial_stamps_the_armed_lane_and_principal(
     tmp_db: str,
 ) -> None:
-    """A partial accepted on Stop is an assistant turn, not unattributed UI."""
+    """A partial accepted on Stop is an assistant turn, not unattributed UI,
+    stamped with the lane that armed, which a rebind can make differ from the
+    session's binding."""
     session = make_registered_session(
         model_alias="primary",
         registry_generation=3,
         user_id="owner",
         ui=RecordingUI(),  # type: ignore[no-untyped-call]
     )
-    fallback_provider = seam_provider("unused", provider_name="fallback-provider")
-    fallback_lane = ModelLane(
-        provider=fallback_provider,
+    armed_provider = seam_provider("unused", provider_name="armed-provider")
+    armed_lane = ModelLane(
+        provider=armed_provider,
         client=MagicMock(),
-        model="fallback-kernel",
-        alias="fallback-alias",
+        model="armed-kernel",
+        alias="armed-alias",
         registry_generation=13,
         capabilities=ModelCapabilities(),
     )
 
-    def _cancel_from_fallback(consumer, *_args, **_kwargs):
-        consumer.begin_attempt(MagicMock(armed=True), None, fallback_lane)
+    def _cancel_from_armed_lane(consumer, *_args, **_kwargs):
+        consumer.begin_attempt(MagicMock(armed=True), None, armed_lane)
         consumer(StreamChunk(content_delta="partial answer"))
         session.cancel()
         raise GenerationCancelled()
@@ -431,14 +393,14 @@ def test_cancelled_partial_stamps_the_armed_fallback_lane_and_principal(
     session._title_generated = True
     with patch.object(
         session,
-        "_model_turn_with_fallback",
-        side_effect=_cancel_from_fallback,
+        "_primary_model_turn",
+        side_effect=_cancel_from_armed_lane,
     ):
         session.send("hello", acting_user_id="user-alice")
 
     assert _provenance(session.messages[-1]) == {
-        "model_alias": "fallback-alias",
-        "backend_model_id": "fallback-kernel",
+        "model_alias": "armed-alias",
+        "backend_model_id": "armed-kernel",
         "registry_generation": 13,
         "acting_principal_id": "user-alice",
     }

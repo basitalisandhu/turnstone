@@ -3438,8 +3438,7 @@ class TestAgentModelOverride:
         reg.reload(
             new_models,
             reg.default,
-            reg.fallback,
-            reg.agent_model,
+            agent_model=reg.agent_model,
             app_state=keyed_app_state(),
         )
 
@@ -8353,7 +8352,7 @@ class TestProviderExtraParams:
     @staticmethod
     def _extra(session: ChatSession, alias: str | None = None):
         """The session binding's extra_params, as ``resolve_lane`` resolves
-        them (*alias* overrides the primary — the fallback-lane case)."""
+        them (*alias* overrides the primary — another alias's lane)."""
         lane = session._primary_lane()
         return provider_extra_params(
             lane.provider,
@@ -8425,7 +8424,7 @@ class TestProviderExtraParams:
 
     def test_model_alias_resolves_target_compat(self, tmp_db):
         """The alias argument selects compat from the target, not the primary
-        — the fallback lane's own extra_params, resolved per lane swap."""
+        — another alias's lane gets its own extra_params."""
         from turnstone.core.model_registry import ModelConfig, ModelRegistry
 
         session = self._session_with_provider("openai-compatible", tmp_db)
@@ -8436,24 +8435,23 @@ class TestProviderExtraParams:
             model="google/gemma-4-31B-it",
             server_compat={"extra_body": {"skip_special_tokens": False}},
         )
-        fallback = ModelConfig(
-            alias="fallback",
+        other = ModelConfig(
+            alias="other",
             base_url="http://localhost:9000/v1",
             api_key="none",
             model="meta-llama/Llama-3-70B",
         )
         reg = ModelRegistry(
-            models={"primary": primary, "fallback": fallback},
+            models={"primary": primary, "other": other},
             default="primary",
-            fallback=["fallback"],
         )
         session._registry = reg
         replace_session_lane(session, alias="primary")
 
         # Primary alias → gets Gemma workaround
         assert self._extra(session) == {"skip_special_tokens": False}
-        # Fallback alias → no compat at all
-        assert self._extra(session, "fallback") is None
+        # Another alias → no compat at all
+        assert self._extra(session, "other") is None
 
 
 class TestSafePrepareTool:
@@ -10211,14 +10209,14 @@ class TestMemoryIndexSnapshotLifecycle:
         assert storage.get_memory_index_snapshot(winner.ws_id) == durable
         assert build.call_count == 1
 
-    def test_first_capture_uses_fallback_lane_context_window(self, tmp_db):
+    def test_first_capture_uses_the_serving_lanes_context_window(self, tmp_db):
         import dataclasses
 
         from turnstone.core.model_registry import ModelConfig
         from turnstone.core.storage import get_storage
 
         session = _make_registered_session(
-            ws_id="fallback-context-index",
+            ws_id="serving-lane-context-index",
             user_id="owner",
             context_window=32_768,
         )
@@ -10226,16 +10224,16 @@ class TestMemoryIndexSnapshotLifecycle:
         registry.get_config.return_value = SimpleNamespace(context_window=32_768)
         session._registry = registry
         frozen_config = ModelConfig(
-            alias="small-fallback",
+            alias="small",
             base_url="https://frozen.invalid/v1",
             api_key="test",
-            model="small-fallback-model",
+            model="small-model",
             context_window=2048,
         )
-        fallback = dataclasses.replace(
+        serving = dataclasses.replace(
             session._primary_lane(),
-            alias="small-fallback",
-            model="small-fallback-model",
+            alias="small",
+            model="small-model",
             registry=registry,
             backend_auth_config=frozen_config,
         )
@@ -10244,7 +10242,7 @@ class TestMemoryIndexSnapshotLifecycle:
 
         with pytest.raises(RuntimeError, match="2,048-token context"):
             session._admit_memory_index_request(
-                fallback,
+                serving,
                 my_generation=generation,
                 principal_id="owner",
             )
@@ -14024,36 +14022,6 @@ def test_final_wire_validator_does_not_charge_consumed_pdf_metadata() -> None:
         max_tokens=2_048,
         budget=session._utility_budget_snapshot(lane),
     )
-
-
-def test_fallback_lane_pins_the_initiating_principal_during_resolution():
-    session = _make_session()
-    generation = session._claim_generation()
-    session._acting_user_id = "user-b"
-    session._registry = MagicMock()
-    session._health_registry = None
-    pinned = MagicMock(return_value="token-for-user-a")
-    session._model_backend_auth_token_for_principal = pinned
-    binding = SimpleNamespace(lane=session._primary_lane())
-    result = MagicMock()
-
-    with (
-        patch("turnstone.core.session.resolve_model_binding", return_value=binding) as resolve,
-        patch.object(session, "_model_turn_with_retry", return_value=result),
-    ):
-        actual = session._try_fallback_lane(
-            "fallback",
-            MagicMock(),
-            lambda wire, _lane: wire,
-            generation,
-            principal_id="user-a",
-        )
-
-    assert actual is result
-    resolver = resolve.call_args.kwargs["backend_auth_resolver"]
-    config = MagicMock()
-    assert resolver("fallback", config) == "token-for-user-a"
-    pinned.assert_called_once_with("fallback", config, principal_id="user-a")
 
 
 def test_task_agent_static_auth_fallback_never_reresolves_as_successor():

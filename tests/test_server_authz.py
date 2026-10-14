@@ -308,6 +308,7 @@ class _FakeSession:
         source_reservation_token: str,
         source_required_node_id: str | None = None,
         trusted_internal: bool = False,
+        switch_to: str | None = None,
     ) -> Any:
         from turnstone.core.storage import get_storage
 
@@ -3080,6 +3081,7 @@ class TestCreateForkRollback:
             source_reservation_token: str,
             source_required_node_id: str | None = None,
             trusted_internal: bool = False,
+            switch_to: str | None = None,
         ) -> Any:
             assert fork_source_id == source_id
             assert storage.delete_workstream(source_id) is True
@@ -3140,6 +3142,7 @@ class TestCreateForkRollback:
             source_reservation_token: str,
             source_required_node_id: str | None = None,
             trusted_internal: bool = False,
+            switch_to: str | None = None,
         ) -> Any:
             assert fork_source_id == source_id
             assert source_reservation_token
@@ -3221,6 +3224,7 @@ class TestCreateForkRollback:
             source_reservation_token: str,
             source_required_node_id: str | None = None,
             trusted_internal: bool = False,
+            switch_to: str | None = None,
         ) -> Any:
             fork_calls.append((fork_source_id, principal_id, trusted_internal))
             raise ForkDestinationConflictError("destination raced")
@@ -3420,6 +3424,7 @@ class TestCreateForkRollback:
             source_reservation_token: str,
             source_required_node_id: str | None = None,
             trusted_internal: bool = False,
+            switch_to: str | None = None,
         ) -> Any:
             entered_clone.set()
             assert release_clone.wait(timeout=10), "test did not release clone"
@@ -3548,6 +3553,7 @@ class TestCreateForkRollback:
             source_reservation_token: str,
             source_required_node_id: str | None = None,
             trusted_internal: bool = False,
+            switch_to: str | None = None,
         ) -> Any:
             entered_clone.set()
             assert release_clone.wait(timeout=10), "test did not release clone"
@@ -3633,6 +3639,7 @@ class TestCreateForkRollback:
             source_reservation_token: str,
             source_required_node_id: str | None = None,
             trusted_internal: bool = False,
+            switch_to: str | None = None,
         ) -> Any:
             assert storage.delete_project("fork-project") is True
             return original_fork(

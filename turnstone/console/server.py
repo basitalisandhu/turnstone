@@ -5674,9 +5674,9 @@ def _bootstrap_coord_subsystem(
         # every lifecycle transition fans out to the cluster collector's
         # pseudo-node so the dashboard tree mirrors child state.
         event_emitter=coord_adapter,
-        # Filter out persisted aliases that no longer resolve so a
-        # coordinator pinned to a since-removed alias still rehydrates
-        # (on the registry default) instead of 500-ing on every reopen.
+        # Filter out persisted aliases that aren't loaded, so a coordinator on
+        # one still opens instead of 500-ing on every reopen: it is built on
+        # the registry default as a stand-in and held on its own alias (#1359).
         model_validator=coord_registry.has_alias,
         default_alias_reader=lambda: resolve_coordinator_alias(
             explicit="", config_store=config_store, registry=coord_registry
@@ -13844,11 +13844,9 @@ def _refresh_coord_registry_locked(
             keep_refused=existing.models if from_timer else None,
         )
     except ValueError as exc:
-        # ModelRegistry.__init__ raises ValueError for several distinct
-        # config issues — empty models, default/fallback/agent/task
-        # alias not present in the loaded set.  Log the actual reason so
-        # operators can tell "no enabled rows" from "default alias typo
-        # in config.toml".  Existing registry stays in place either way.
+        # The loader reports a configuration problem as a ValueError: log the
+        # actual reason so operators can fix it. Existing registry stays in
+        # place either way.
         log.warning("console.coord_registry_refresh_skipped reason=%s", exc)
         return
     except Exception:
@@ -13867,7 +13865,6 @@ def _refresh_coord_registry_locked(
             and {a: c.max_concurrency for a, c in new_registry.models.items()}
             == {a: c.max_concurrency for a, c in existing.models.items()}
             and new_registry.default == existing.default
-            and new_registry.fallback == existing.fallback
             and new_registry.agent_model == existing.agent_model
             and new_registry.task_model == existing.task_model
             and new_registry.task_effort == existing.task_effort
@@ -13883,8 +13880,7 @@ def _refresh_coord_registry_locked(
         existing.reload(
             new_registry.models,
             new_registry.default,
-            new_registry.fallback,
-            new_registry.agent_model,
+            agent_model=new_registry.agent_model,
             app_state=app_state,
             task_model=new_registry.task_model,
             task_effort=new_registry.task_effort,

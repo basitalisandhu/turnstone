@@ -218,7 +218,7 @@ class "ChatSession" as ChatSession {
     + adopt_fork_snapshot(source_ws_id, snapshot)
     - _save_config()
     - _stream_response(my_generation) → ModelTurnResult
-    - _model_turn_with_fallback(consumer, prepare_wire) → ModelTurnResult
+    - _primary_model_turn(consumer, prepare_wire) → ModelTurnResult
     - _model_turn_with_retry(lane, tracker, ...) → ModelTurnResult
     - _execute_tools(tool_calls) → (results, feedback)
     - _prepare_tool(tc) → item dict
@@ -380,7 +380,6 @@ class "ModelRegistry" as ModelReg {
     - _admissions: dict[str, ModelAdmission]
     - _client_lock: Lock
     + default: str
-    + fallback: list[str]
     + agent_model: str | None
     --
     + resolve_binding(alias) → (client, model, config, provider, admission, generation)

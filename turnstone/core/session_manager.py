@@ -391,11 +391,11 @@ class SessionManager:
         # Optional registry-membership check applied to the persisted
         # ``model_alias`` on the rehydrate path before threading it
         # into ``build_session``.  Production wiring passes
-        # ``registry.has_alias``; an alias that has been removed from
-        # the registry since the workstream was created is filtered
-        # out so the session_factory falls back to its default rather
-        # than raising.  Restricted to the rehydrate path — fresh
-        # creates still want unknown aliases to surface as 503.
+        # ``registry.has_alias``; a saved alias that isn't loaded is left
+        # out of the build, so the session_factory builds on its default as
+        # a stand-in and the session holds on the saved alias (#1359)
+        # rather than the build raising.  Restricted to the rehydrate path —
+        # fresh creates still want unknown aliases to surface as 503.
         self._model_validator = model_validator
         # Optional: the alias a session that names no model gets now. A
         # reopen that falls back to a default that isn't loaded retries only
@@ -1375,11 +1375,13 @@ class SessionManager:
                     # both halves, ``_save_config`` clobbers persisted
                     # config with constructor defaults before
                     # ``ChatSession.rehydrate`` reads them back.  When
-                    # ``model_validator`` is wired and the saved alias is
-                    # no longer in the registry, drop it so the factory
-                    # falls back to its default — the session_factory
-                    # itself still raises on unknown aliases, since
-                    # fresh-create paths want that to surface as a 503.
+                    # ``model_validator`` is wired and the saved alias
+                    # isn't loaded, build without it: the factory builds on
+                    # its default as a stand-in that never serves a call,
+                    # and ``rehydrate`` holds the session on the saved
+                    # alias (#1359) — the session_factory itself still
+                    # raises on unknown aliases, since fresh-create paths
+                    # want that to surface as a 503.
                     # Inside the unwind bracket, so a storage error here
                     # releases the slot and its lease; it raises as the
                     # session's own reads do (HTTP 503, retry shortly), never
@@ -1398,9 +1400,9 @@ class SessionManager:
                         and not self._model_validator(saved_alias)
                     ):
                         log.warning(
-                            "session_mgr.stale_alias_dropped ws=%s alias=%s",
-                            ws_id[:8],
-                            saved_alias,
+                            "session_mgr.saved_alias_not_loaded",
+                            ws_id=ws_id[:8],
+                            alias=saved_alias,
                         )
                         saved_alias = None
 
@@ -1636,11 +1638,18 @@ class SessionManager:
 
     @staticmethod
     def _rehydrate_candidate_alias(ws: Workstream, requested_alias: str | None) -> str | None:
-        """Concrete alias bound by a candidate, with a legacy-adapter fallback."""
+        """Concrete alias a candidate is BOUND to, with a legacy-adapter fallback.
+
+        A held session reports its saved model as ``model_alias`` while it is
+        built on a stand-in; the races below concern the binding, so they read
+        ``bound_model_alias`` (a session without it reports its binding).
+        """
         candidate = ws.session
         if candidate is None:
             return requested_alias
-        actual_alias = getattr(candidate, "model_alias", None)
+        actual_alias = getattr(candidate, "bound_model_alias", None)
+        if actual_alias is None:
+            actual_alias = getattr(candidate, "model_alias", None)
         return actual_alias if isinstance(actual_alias, str) and actual_alias else requested_alias
 
     @staticmethod

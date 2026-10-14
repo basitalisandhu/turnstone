@@ -38,8 +38,8 @@
 
 # --- Named Models (turnstone, node, eval) ---
 # Define model aliases with per-model overrides. Useful for local model
-# servers or mixing providers. Route with [model].default / fallback above,
-# or per call through task_agent's model= argument.
+# servers or mixing providers. Route with [model].default above, or per
+# call through task_agent's model= argument.
 #
 # [models.local]
 # model = "llama-3-70b"

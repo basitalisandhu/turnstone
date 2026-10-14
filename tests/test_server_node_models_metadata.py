@@ -82,7 +82,7 @@ def test_health_flag_reflects_tracker_state():
     bad_tracker = health_reg.get_tracker(provider="openai", base_url="http://x")
     bad_tracker.record_failure()
     bad_tracker.record_failure()
-    assert bad_tracker.is_degraded
+    assert not bad_tracker.is_healthy
     # "b" gets a tracker that has only seen successes.
     good_tracker = health_reg.get_tracker(provider="openai", base_url="http://y")
     good_tracker.record_success()
@@ -226,7 +226,7 @@ def test_publish_rewrites_when_health_flips():
     tracker = state.health_registry.get_tracker(provider="openai", base_url="http://x")
     for _ in range(10):
         tracker.record_failure()
-    assert tracker.is_degraded
+    assert not tracker.is_healthy
     _publish_models_metadata(state, storage, "node-a")
     assert storage.set_node_metadata_bulk.call_count == 2
 

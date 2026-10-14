@@ -8,7 +8,8 @@ itself once they are saved, and one whose background programs still run stays
 until the user closes it.
 
 These drive the CLI's own manager wiring (``_build_cli_manager``: terminal UIs,
-the default-model fallback) with real sessions on the selected storage backend.
+the hold on a model the CLI doesn't load) with real sessions on the selected
+storage backend.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from turnstone.cli import (
     _handle_ws_command,
     _start_persistence_retries,
 )
+from turnstone.core.model_registry import ModelConfig, ModelRegistry
 from turnstone.core.personas import PersonaSnapshot
 from turnstone.core.session import ChatSession
 
@@ -39,7 +41,11 @@ def make_cli(storage_backend: Any) -> Any:
     """Build CLI managers; every workstream they hold is closed at teardown."""
     managers: list[Any] = []
 
-    def build(*, startup_skill: str | None = None) -> Any:
+    def build(*, startup_skill: str | None = None, registry: ModelRegistry | None = None) -> Any:
+        # Sessions bind through *registry* when one is given, as the CLI's do;
+        # otherwise the factory only checks the alias against KNOWN_ALIASES.
+        known = registry.has_alias if registry is not None else KNOWN_ALIASES.__contains__
+
         def session_factory(
             ui: Any,
             model_alias: str | None = None,
@@ -52,7 +58,7 @@ def make_cli(storage_backend: Any) -> Any:
             **_host_options: Any,
         ) -> ChatSession:
             alias = model_alias or "default"
-            if alias not in KNOWN_ALIASES:
+            if not known(alias):
                 # The CLI's factory binds the alias through its model
                 # registry, which raises for an alias it does not define.
                 raise ValueError(f"unknown model alias {alias!r}")
@@ -60,6 +66,7 @@ def make_cli(storage_backend: Any) -> Any:
                 ui=ui,
                 ws_id=ws_id,
                 model_alias=alias,
+                registry=registry,
                 # As the CLI does: a skill named at startup applies to
                 # every workstream it creates.
                 skill=skill or startup_skill,
@@ -68,7 +75,7 @@ def make_cli(storage_backend: Any) -> Any:
                 workstream_lease=workstream_lease,
             )
 
-        manager = _build_cli_manager(session_factory, KNOWN_ALIASES.__contains__, lambda: "default")
+        manager = _build_cli_manager(session_factory, known, lambda: "default")
         managers.append(manager)
         return manager
 
@@ -172,10 +179,21 @@ def test_resume_of_the_current_workstream_stays_put(make_cli: Any, capsys: Any) 
     assert "Already in that workstream." in capsys.readouterr().out
 
 
-def test_resume_of_a_workstream_saved_with_an_alias_this_cli_lacks_uses_the_default(
+def _registry() -> ModelRegistry:
+    return ModelRegistry(
+        models={
+            alias: ModelConfig(alias, f"http://{alias}.example/v1", "k", f"{alias}-model")
+            for alias in sorted(KNOWN_ALIASES)
+        },
+        default="default",
+    )
+
+
+def test_resume_of_a_workstream_whose_model_this_cli_lacks_holds_it(
     make_cli: Any, storage_backend: Any
 ) -> None:
-    mgr = make_cli()
+    """It opens on the default as a stand-in, held on its own model (#1359)."""
+    mgr = make_cli(registry=_registry())
     left = mgr.create(user_id="")
     target = _saved(
         storage_backend, "c" * 32, "earlier", config={"model_alias": "gone", "model": "gone-model"}
@@ -185,8 +203,66 @@ def test_resume_of_a_workstream_saved_with_an_alias_this_cli_lacks_uses_the_defa
 
     opened = mgr.get(target)
     assert opened is not None and mgr.active_id == target
-    assert opened.session._model_alias == "default"
+    assert opened.session.model_held
+    assert opened.session.model_alias == "gone"
+    assert opened.session.bound_model_alias == "default"
     assert _texts(opened) == ["earlier"]
+
+
+def test_a_held_tab_runs_on_its_model_once_that_loads(make_cli: Any, storage_backend: Any) -> None:
+    """Its messages are refused until the model loads; the next one then runs
+    on it. (The CLI never reloads its registry; the test does, to drive the
+    session's own recovery.)"""
+    from tests._oidc_test_helpers import keyed_app_state
+    from tests._session_helpers import scripted_chat_client
+    from turnstone.core.session import ModelNotLoadedError
+
+    registry = _registry()
+    mgr = make_cli(registry=registry)
+    left = mgr.create(user_id="")
+    target = _saved(
+        storage_backend, "d" * 32, "earlier", config={"model_alias": "gone", "model": "gone-model"}
+    )
+    _handle_tab_command(mgr, f"/resume {target}", left, False, {})
+    held = mgr.get(target)
+    assert held is not None and held.session.model_held
+    with pytest.raises(ModelNotLoadedError):
+        held.session.send("are you there?")
+
+    gone = ModelConfig(
+        "gone", "http://gone.example/v1", "k", "gone-model", provider="openai-compatible"
+    )
+    registry.reload({**registry.models, "gone": gone}, "default", app_state=keyed_app_state())
+    served = MagicMock(side_effect=scripted_chat_client({"content": "back"}))
+    registry.get_client("gone").chat.completions.create = served
+
+    held.session.send("and now?")
+
+    assert served.called
+    assert not held.session.model_held
+    assert held.session.model_alias == "gone"
+    assert held.session.messages[-1].role == "assistant"
+
+
+def test_new_from_a_held_tab_holds_the_new_tab_on_the_same_model(
+    make_cli: Any, storage_backend: Any
+) -> None:
+    mgr = make_cli(registry=_registry())
+    left = mgr.create(user_id="")
+    target = _saved(
+        storage_backend, "b" * 32, "earlier", config={"model_alias": "gone", "model": "gone-model"}
+    )
+    _handle_tab_command(mgr, f"/resume {target}", left, False, {})
+    held = mgr.get(target)
+    assert held is not None and held.session.model_held
+
+    _handle_tab_command(mgr, "/new", held, False, {})
+
+    new = mgr.get(mgr.active_id)
+    assert new is not None and new.id != target
+    assert new.session.model_held
+    assert new.session.model_alias == "gone"
+    assert storage_backend.load_workstream_config(new.id)["model_alias"] == "gone"
 
 
 def test_a_resumed_tab_keeps_the_approvals_of_the_tab_left(

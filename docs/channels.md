@@ -209,6 +209,15 @@ both and the gateway hosts both adapters in one process.
 - Recovery uses the exact saved workstream ID; another conversation's alias cannot replace it.
   A deleted ID also remains reserved while a channel route references it, preventing a new
   workstream from receiving that channel's messages under the old identity.
+- A conversation whose model is no longer loaded (deleted, disabled, renamed, or left out of a
+  reload) waits for it instead of moving to another model (#1359). Each message is kept and answered
+  with an error that asks a Turnstone admin to check the model in the Models tab; the first message
+  after the model loads again continues the conversation, which still has the earlier ones. When the
+  model was left out because its secret store couldn't be reached, the error says it should load
+  again shortly instead, and it does, by itself, once the store answers. This applies to a live
+  conversation and to a recovery fork, which names no model, except in a Slack DM with
+  `channels.default_model_alias` set, where the fork continues on that model (unless its own model
+  is out only for now). Chat users can't run `/model`, so otherwise only an admin can end the wait.
 - A missing SSE session stops that subscription without deleting the conversation's route. Discord
   thread replies, Slack thread replies, and Slack DMs all check the saved association before sending
   the next message and restore their subscription. With a console, each SSE connection resolves the
@@ -314,13 +323,15 @@ See [Security: Database Schema](security.md#database-schema) for the
    a connection error reconnects with backoff.
 4. **Reactivation** — the next message resolves the saved route and probes
    whether that workstream is live on its owning node. If it is not, the router
-   creates a distinct workstream with the old `ws_id` as `resume_ws`. The
-   create response confirms the fork and message count; there is no separate
-   resume command or channel-specific resumed event. Only after the replacement
+   creates a distinct workstream with the old `ws_id` as `resume_ws`. The create
+   response confirms the fork and message count; there is no separate resume
+   command or channel-specific resumed event. Only after the replacement
    succeeds does the router swap the persisted route. If the source was deleted
    or pruned, an exact source-not-found response plus a second authoritative
    storage miss triggers one fresh-create retry; other fork failures leave the
-   old route intact and are surfaced normally.
+   old route intact and are surfaced normally. A replacement whose model is no
+   longer loaded is held on it, so the conversation waits for that model (see
+   Conversations above).
 5. **Close** — `/close` command closes the workstream via HTTP, deletes the
    route, unsubscribes from events, and archives the Discord thread.
 

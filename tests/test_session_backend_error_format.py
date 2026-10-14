@@ -46,14 +46,7 @@ def _stub(
         model=model,
         alias=model_alias or "",
     )
-    stub = SimpleNamespace(
-        model=model,
-        _model_alias=model_alias,
-        # Dead-binding latches, clear: the formatter checks them first and
-        # short-circuits when both are unset, like a healthy session.
-        _registry_alias_removed=None,
-        _rebind_failed_key=None,
-    )
+    stub = SimpleNamespace(model=model, _model_alias=model_alias)
     stub._lane = lane
     stub._primary_lane = lambda: stub._lane
     return stub
@@ -395,22 +388,6 @@ def test_stream_death_first_sentence_survives_discord_cut():
     assert len(first_sentence) < 500
 
 
-def test_registry_diagnosed_binding_outranks_stream_death():
-    """An alias the per-send refresh diagnosed dead outranks the raw stream
-    symptom: the rebind wording points at the admin action, the transport
-    wording at network health — the former is the actionable one."""
-    from turnstone.core.providers import IncompleteStreamError
-
-    stub = _stub()
-    stub._registry_alias_removed = "flatspark"
-    stub._registry = None
-    stub._kind = None
-    msg = _format(stub, IncompleteStreamError("stream transport failed mid-response"))
-    assert msg is not None
-    assert "has been removed from the registry" in msg
-    assert "Backend stream died" not in msg
-
-
 def test_stream_death_with_overflow_phrasing_stays_stream_death():
     """Joining the stream names into ``BACKEND_KNOWN_EXC_NAMES`` removes them
     from ``is_context_overflow``'s text-detection eligibility (its class
@@ -423,8 +400,9 @@ def test_stream_death_with_overflow_phrasing_stays_stream_death():
     assert "Context window exceeded" not in msg
 
 
-def test_terminal_fallback_stream_death_reports_actual_lane(tmp_db):
-    """Fatal formatting consumes the fallback lane that armed the stream.
+def test_terminal_stream_death_reports_the_armed_lane(tmp_db):
+    """Fatal formatting consumes the lane that armed the stream, which a
+    rebind can make differ from the session's binding.
 
     The original exception object survives the retry wrapper, while its
     side-table context contains no client, credential, principal, or query.
@@ -433,24 +411,24 @@ def test_terminal_fallback_stream_death_reports_actual_lane(tmp_db):
 
     ui = RecordingUI()  # type: ignore[no-untyped-call]
     session = make_session(model_alias="primary", ui=ui)
-    provider = provider_shell("fallback-provider")
-    fallback_lane = ModelLane(
+    provider = provider_shell("armed-provider")
+    armed_lane = ModelLane(
         provider=provider,
-        client=SimpleNamespace(base_url="https://fallback.example/v1?api_key=terminal-secret"),
-        model="fallback-kernel",
-        alias="fallback-alias",
+        client=SimpleNamespace(base_url="https://armed.example/v1?api_key=terminal-secret"),
+        model="armed-kernel",
+        alias="armed-alias",
         registry_generation=19,
         capabilities=ModelCapabilities(),
     )
     death = IncompleteStreamError("peer closed the response")
 
-    def _fail_on_fallback(consumer, *_args, **_kwargs):
-        consumer.begin_attempt(SimpleNamespace(armed=True), None, fallback_lane)
+    def _fail_on_armed_lane(consumer, *_args, **_kwargs):
+        consumer.begin_attempt(SimpleNamespace(armed=True), None, armed_lane)
         raise death
 
     session._MID_STREAM_RETRIES = 0
     with (
-        patch.object(session, "_model_turn_with_fallback", side_effect=_fail_on_fallback),
+        patch.object(session, "_primary_model_turn", side_effect=_fail_on_armed_lane),
         pytest.raises(IncompleteStreamError) as raised,
     ):
         session._stream_response()
@@ -458,9 +436,9 @@ def test_terminal_fallback_stream_death_reports_actual_lane(tmp_db):
     assert raised.value is death
     session._record_fatal_error(raised.value)
     message = ui.of("error")[-1]
-    assert "fallback-provider" in message
-    assert "https://fallback.example/v1" in message
-    assert "model=fallback-alias (id=fallback-kernel)" in message
+    assert "armed-provider" in message
+    assert "https://armed.example/v1" in message
+    assert "model=armed-alias (id=armed-kernel)" in message
     assert "primary" not in message
     assert "terminal-secret" not in message
 

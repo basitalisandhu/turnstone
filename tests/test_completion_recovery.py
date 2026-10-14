@@ -245,11 +245,9 @@ def test_attachment_faults_do_not_retry_or_degrade_the_model_backend(tmp_db, fau
     )
     with scripted_session(WorkstreamKind.INTERACTIVE, []) as (session, ui, requests):
         tracker = MagicMock()
-        session._registry = MagicMock(fallback=["spare"])
         with (
             patch("turnstone.core.session.get_attachments", side_effect=fault) as read,
             patch.object(session, "_get_health_tracker", return_value=tracker),
-            patch.object(session, "_try_fallback_lane", return_value=None) as fallback,
             pytest.raises(ModelTurnLocalError) as failure,
         ):
             session.send(
@@ -269,7 +267,6 @@ def test_attachment_faults_do_not_retry_or_degrade_the_model_backend(tmp_db, fau
         assert read.call_count == 1
         assert requests == []
         tracker.record_failure.assert_not_called()
-        fallback.assert_not_called()
 
         # Direct raw/eval callers retain their original exception contract.
         def resolve(_ids):
@@ -612,7 +609,7 @@ def test_final_synthesis_preserves_nonblank_output_and_guards_once(tmp_db, finis
 
 
 @pytest.mark.parametrize("transport_shaped", [False, True])
-def test_main_local_admission_fault_cannot_fall_back_or_compact(tmp_db, transport_shaped):
+def test_main_local_admission_fault_cannot_retry_or_compact(tmp_db, transport_shaped):
     fault = (
         APIConnectionError(request=httpx2.Request("POST", "https://example.com/v1"))
         if transport_shaped
@@ -620,15 +617,14 @@ def test_main_local_admission_fault_cannot_fall_back_or_compact(tmp_db, transpor
     )
     with scripted_session(WorkstreamKind.INTERACTIVE, []) as (session, ui, requests):
         with (
-            patch.object(session, "_admit_memory_index_request", side_effect=fault),
-            patch.object(session, "_try_fallback_lane") as fallback,
+            patch.object(session, "_admit_memory_index_request", side_effect=fault) as admit,
             patch.object(session, "_compact_messages") as compact,
             pytest.raises(ModelTurnLocalError) as failure,
         ):
             session.send("Continue.")
         assert failure.value.__cause__ is fault
         assert not requests
-        fallback.assert_not_called()
+        admit.assert_called_once()
         compact.assert_not_called()
 
 

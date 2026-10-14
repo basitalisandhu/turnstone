@@ -172,8 +172,7 @@ delegated-mode call with no effective user always refuses. A dynamic alias
 without a real static key also always refuses instead of issuing its
 SDK-construction placeholder. When a real static key is explicitly configured,
 mint failures may use it by default; set `model.auth_fail_closed = true` to
-prohibit even that fallback. A refusal is not routed through the model
-fallback chain.
+prohibit even that fallback.
 
 Dynamic token caches are encrypted in `oauth_tokens`, shared across nodes,
 and memoized on each host. Unlinking a user's OIDC identity purges their
@@ -531,14 +530,22 @@ temperature, reasoning effort, max tokens, skill, or persona. Use
 `/model <alias>` (or create/fork a workstream) when an explicit session-level
 model switch is intended.
 
-If a live workstream's alias is deleted, its next send first attempts the
-configured fallback chain. Without a usable fallback, the operator-facing
-error names the removed alias and points interactive users to `/model`; adding
-the alias back causes the next send to rebind without a process restart. If a
-replacement client cannot be constructed, Turnstone logs one
-`session.model_refresh_client_construction_failed` warning per registry
-generation and retries only after another model reload, avoiding a rebuild
-storm on every send.
+If a live workstream's alias is deleted, or left out of a reload, the workstream
+is held on it: its next send records the message and refuses before any model
+call (a reload that lands mid-send stops the send at its next model round), with
+an error that names the alias and a remedy (`/model` for interactive users, an
+admin for coordinators, their workstreams, scheduled runs and chat channels);
+nothing runs on another model. A reopened workstream whose saved alias isn't
+loaded opens held the same way, and both log one `session.model_held` warning
+per registry generation. Adding the alias back causes the next send to rebind
+without a process restart, and `/retry` re-sends a refused text message (one
+with attachments has to be sent again). If a replacement client cannot be
+constructed, the workstream is held the same way, with an error naming the
+cause; Turnstone logs one `session.model_refresh_client_construction_failed`
+warning per registry generation and retries only after another model reload,
+avoiding a rebuild storm on every send. A fix outside the registry (a restored
+certificate bundle) therefore reaches held workstreams at the next change to a
+model definition, or a restart: a Sync of unchanged definitions reloads nothing.
 
 ---
 

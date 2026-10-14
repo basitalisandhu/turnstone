@@ -715,9 +715,11 @@ def _default_model_not_loaded(alias: str, registry: Any = None) -> str:
         ]
         if loaded:
             others = f", or set [model] default to one of: {', '.join(loaded)}"
+    from turnstone.core.model_registry import models_table
+
     return (
         f"the default model '{alias}' isn't loaded{reason}. "
-        f"Check [models.{alias}] in config.toml{others}."
+        f"Check {models_table(alias)} in config.toml{others}."
     )
 
 
@@ -1232,9 +1234,12 @@ def _create_tab_like(manager: SessionManager, left: Workstream | None) -> Workst
     if snap is not None:
         persona_kwargs = {"persona": snap.name, "persona_snapshot": snap}
     config = old._config_for_save()
+    # Built on the binding the tab runs on: a tab whose model isn't loaded is
+    # held on it over a stand-in (#1359), and ``adopt_settings`` then holds the
+    # new tab on that model too.
     ws = manager.create(
         user_id="",
-        model=old._model_alias or None,
+        model=old.bound_model_alias,
         defer_emit_created=True,
         **persona_kwargs,
     )
@@ -1453,10 +1458,10 @@ def _build_cli_manager(
 ) -> SessionManager:
     """The CLI's workstream manager: a terminal UI per workstream, sessions from *session_factory*.
 
-    Opening a workstream saved with an alias this CLI does not define falls
-    back to the default model instead of failing (*has_alias* tells).
-    *default_alias* reads that default, so a reopen whose default stays
-    unloaded fails at once instead of retrying as if it raced (#1359).
+    Opening a workstream saved with an alias this CLI does not define (*has_alias* tells) builds
+    it on the default model as a stand-in and holds it on its own alias instead of failing.
+    *default_alias* reads that default, so a reopen whose default stays unloaded fails at once
+    instead of retrying as if it raced (#1359).
     """
     import queue
 

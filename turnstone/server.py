@@ -2909,6 +2909,12 @@ def _interactive_create_build_kwargs(
     }
 
 
+def _requested_model(body: dict[str, Any]) -> str | None:
+    """The model a create request names, if it names one."""
+    model = body.get("model")
+    return model.strip() if isinstance(model, str) and model.strip() else None
+
+
 async def _interactive_create_pre_commit(
     request: Request,
     ws: Workstream,
@@ -2943,6 +2949,7 @@ async def _interactive_create_pre_commit(
             source_reservation_token=source_reservation_token,
             source_required_node_id=body.get("_resume_required_node_id"),
             trusted_internal=False,
+            switch_to=_requested_model(body),
         )
         message_count = len(snapshot.turns)
         ws.project_id = snapshot.project_id
@@ -3104,11 +3111,22 @@ async def _interactive_create_prepare_install(
             "Workstream creation was superseded",
             status_code=409,
         )
-    config_to_apply = (
-        ws.session._config_for_save()
-        if skill_data and not resumed and ws.session is not None
-        else None
-    )
+    config_to_apply: dict[str, str] | None = None
+    if skill_data and not resumed and ws.session is not None:
+        config_to_apply = ws.session._config_for_save()
+    elif (
+        resumed
+        and ws.session is not None
+        and _requested_model(body) is not None
+        and not ws.session.model_held
+    ):
+        # A held fork switches to the model its request names (#1359), with
+        # that model's own sampling settings; the clone copied the source's,
+        # so record the switch in this same reservation-checked write. A fork
+        # left on the source's own model records what it runs: the backend id
+        # the alias serves now, and the sampling settings the session restored
+        # (its own alias's where the source saved none), as its next save would.
+        config_to_apply = ws.session._model_config_for_save()
     try:
         finalized = await asyncio.to_thread(
             finalize_deferred_create,
@@ -4867,7 +4885,6 @@ def _reload_model_registry_locked(app_state: Any, *, from_timer: bool = False) -
     unchanged = (
         new_registry.models == registry.models
         and admission_unchanged
-        and new_registry.fallback == registry.fallback
         and new_registry.agent_model == registry.agent_model
         and new_registry.default == registry.default
         and new_registry.task_model == registry.task_model
@@ -4890,8 +4907,7 @@ def _reload_model_registry_locked(app_state: Any, *, from_timer: bool = False) -
         registry.reload(
             new_registry.models,
             new_registry.default,
-            new_registry.fallback,
-            new_registry.agent_model,
+            agent_model=new_registry.agent_model,
             app_state=app_state,
             task_model=new_registry.task_model,
             task_effort=new_registry.task_effort,
@@ -6533,9 +6549,9 @@ def main() -> None:
         # emit_rehydrated are no-ops because those events fire from
         # out-of-band paths (create handler + WebUI._broadcast_state).
         event_emitter=interactive_adapter,
-        # Filter out persisted aliases that no longer resolve so a
-        # workstream pinned to a since-removed alias still rehydrates
-        # (on the registry default) instead of 500-ing on every reopen.
+        # Filter out persisted aliases that aren't loaded, so a workstream on
+        # one still opens instead of 500-ing on every reopen: it is built on
+        # the registry default as a stand-in and held on its own alias (#1359).
         model_validator=registry.has_alias,
         default_alias_reader=_effective_default_alias,
     )

@@ -1,8 +1,7 @@
-"""Model registry — named model configurations with fallback routing.
+"""Model registry — named model configurations.
 
 Manages multiple LLM API backends so workstreams can select their model at
-creation time or switch mid-session.  Supports a fallback chain for
-resilience when the primary model is unreachable.
+creation time or switch mid-session.
 """
 
 from __future__ import annotations
@@ -37,6 +36,11 @@ from turnstone.core.providers import (
 )
 
 log = get_logger(__name__)
+
+# Removed ``[model]`` keys a config.toml still sets, each warned about once per
+# process: a node's reloads and the console's coordinator refresh call
+# :func:`load_model_registry` again and again. Tests clear it.
+_REMOVED_MODEL_KEYS_WARNED: set[str] = set()
 
 # Window used when a model definition leaves ``context_window`` at 0 (the
 # Models tab's "auto-detect") and nothing can supply a number: the provider
@@ -531,21 +535,6 @@ def _api_surface_of(cfg: ModelConfig) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _validate_fallback(models: Mapping[str, ModelConfig], fallback: list[str] | None) -> None:
-    """Refuse a fallback list that names an alias this registry doesn't hold.
-
-    The routing aliases (``default``, ``task_model``, ``agent_model``) are not
-    checked here: they name what the operator configured, loaded or not, and
-    resolving one that isn't loaded raises :class:`UnknownModelAliasError` instead
-    of quietly running another model (#1359). An empty ``models`` is the degraded
-    "no models configured yet" state a server boots into before any definition
-    exists; every lookup raises until a hot reload adds one.
-    """
-    for alias in fallback or ():
-        if alias not in models:
-            raise ValueError(f"Fallback model '{alias}' not found in registry")
-
-
 def serves_chat(capabilities: Mapping[str, Any], model: str) -> bool:
     """Whether a definition can hold a chat, and so be picked as the default.
 
@@ -631,12 +620,13 @@ class ModelRegistry:
     read, so a changed or cleared setting takes effect at once.
 
     Args:
-        models: Mapping of alias → ModelConfig.
+        models: Mapping of alias → ModelConfig. An empty mapping is the "no models
+            configured yet" state a server boots into before any definition exists;
+            every lookup raises until a hot reload adds one.
         default: The loader's default alias (config.toml ``[model] default``, else
             the model named ``default``, else the first defined chat model). It may
             name a model that isn't loaded; the ``model.default_alias`` setting
             overrides it (see :meth:`effective_default`).
-        fallback: Ordered list of aliases to try when the primary model fails.
         agent_model: Optional alias for the task_agent sub-agent (single-knob
             fallback used when ``task_model`` is unset).
         task_model: Optional alias for the task_agent sub-agent.  Overrides
@@ -649,18 +639,15 @@ class ModelRegistry:
         self,
         models: dict[str, ModelConfig],
         default: str,
-        fallback: list[str] | None = None,
+        *,
         agent_model: str | None = None,
         task_model: str | None = None,
         task_effort: str | None = None,
         skipped_aliases: Mapping[str, str] | None = None,
         retryable_skips: Collection[str] | None = None,
     ) -> None:
-        _validate_fallback(models, fallback)
-
         self._models = dict(models)
         self.default = default
-        self.fallback = list(fallback) if fallback else []
         self.agent_model = agent_model
         self.task_model = task_model
         self.task_effort = task_effort
@@ -1019,9 +1006,8 @@ class ModelRegistry:
         self,
         models: dict[str, ModelConfig],
         default: str,
-        fallback: list[str] | None = None,
-        agent_model: str | None = None,
         *,
+        agent_model: str | None = None,
         app_state: Any,
         task_model: str | None = None,
         task_effort: str | None = None,
@@ -1036,9 +1022,6 @@ class ModelRegistry:
         WITHOUT mutating when refused, and the caller applies per-host
         policy.
 
-        Validates arguments before mutating state so a bad reload
-        does not leave the registry in an inconsistent state.
-
         Every completed swap bumps :attr:`generation`; live sessions compare
         it per send and re-resolve on mismatch, so the swap reaches them even
         when an alias keeps its backend model id (see
@@ -1051,7 +1034,6 @@ class ModelRegistry:
         # grant dialect stays valid to keep, but its mint always refuses on
         # this deployment — say so at every swap chokepoint.
         warn_profile_mismatched_aliases(models, app_state)
-        _validate_fallback(models, fallback)
         rerank_close_actions: list[Callable[[], None]] = []
         with _deferred_close_actions(rerank_close_actions), self._client_lock:
             # FIRST write inside the lock, deliberately BEFORE the map swap
@@ -1066,13 +1048,12 @@ class ModelRegistry:
             # close. Sessions' STAMPED values come from
             # resolve()/resolve_binding() under this same lock, so a stamp
             # can never be newer than the binding it vouches for. Never
-            # bumped on a refused reload: both guards raise above, before
+            # bumped on a refused reload: the key guard raises above, before
             # any mutation.
             self._generation += 1
             old_models = self._models
             self._models = dict(models)
             self.default = default
-            self.fallback = list(fallback) if fallback else []
             self.agent_model = agent_model
             self.task_model = task_model
             self.task_effort = task_effort
@@ -1211,6 +1192,16 @@ def stored_definition_error(row: Mapping[str, Any]) -> str:
             f"console do not expand ({instead})"
         )
     return ""
+
+
+def models_table(alias: str) -> str:
+    """The config.toml table header that defines *alias*, as an operator would
+    write it: ``[models.local]``, or ``[models."gpt-4.1"]`` when the alias isn't a
+    bare TOML key (unquoted, a dot would name a nested table)."""
+    import json
+
+    key = alias if re.fullmatch(r"[A-Za-z0-9_-]+", alias) else json.dumps(alias)
+    return f"[models.{key}]"
 
 
 def describe_skipped(skipped: Mapping[str, str]) -> str:
@@ -1612,13 +1603,11 @@ def load_model_registry(
     3. The CLI's ``--base-url`` / ``--api-key`` / ``--model`` synthesize a
        ``"default"`` entry when nothing else defines a model. The server
        passes none of these: its models come from the DB and config.toml only.
-    4. ``[model].default``, ``[model].fallback``, ``[model].agent_model``,
-       ``[model].task_model``, ``[model].task_effort`` control routing.
-       ``task_model`` overrides ``agent_model`` for the task sub-agent;
-       it falls back to ``agent_model`` when unset. With ``[model].default``
-       unset, the default is the model named ``default``, else the first
-       defined (:func:`pick_default_alias`). Routing aliases are kept as
-       configured even when their model didn't load (#1359).
+    4. ``[model].default``, ``[model].agent_model``, ``[model].task_model``, ``[model].task_effort``
+       control routing. ``task_model`` overrides ``agent_model`` for the task sub-agent; it falls
+       back to ``agent_model`` when unset. With ``[model].default`` unset, the default is the model
+       named ``default``, else the first defined (:func:`pick_default_alias`). Routing aliases are
+       kept as configured even when their model didn't load (#1359).
 
     ``strict``: when True, a storage read failure during the DB-rows step
     re-raises instead of degrading to a config.toml-only registry.
@@ -1661,6 +1650,15 @@ def load_model_registry(
     cfg = load_config()
     models_section: dict[str, Any] = cfg.get("models", {})
     model_section: dict[str, Any] = cfg.get("model", {})
+    if "fallback" in model_section and "fallback" not in _REMOVED_MODEL_KEYS_WARNED:
+        _REMOVED_MODEL_KEYS_WARNED.add("fallback")
+        log.warning(
+            "model_registry.fallback_ignored",
+            hint=(
+                "config.toml [model] fallback is ignored: the failover chain was removed "
+                "(#1359), and a turn whose model fails no longer moves to another model"
+            ),
+        )
     api_section = cfg.get("api")
     api_base_url_present = isinstance(api_section, dict) and bool(api_section.get("base_url"))
 
@@ -2073,20 +2071,9 @@ def load_model_registry(
         reprobe=reprobe_known_windows,
     )
 
-    # Fallback chain
-    fallback_raw = model_section.get("fallback", [])
-    fallback: list[str] = []
-    if isinstance(fallback_raw, list):
-        for alias in fallback_raw:
-            if alias in configs:
-                fallback.append(alias)
-            else:
-                log.warning("Fallback alias '%s' not found in models, ignoring", alias)
-
     return ModelRegistry(
         models=configs,
         default=default_alias,
-        fallback=fallback,
         agent_model=agent_model,
         task_model=task_model,
         task_effort=task_effort,

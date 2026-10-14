@@ -75,8 +75,12 @@ def _bind_session_lane(
     model: str,
     alias: str,
 ) -> None:
-    """Install one coherent provider-facing lane on a session test double."""
-    session._registry = registry
+    """Install one coherent provider-facing lane on a session test double.
+
+    The lane carries the stub *registry* its flags are read from. The session
+    keeps none: each model round refreshes the binding from the session's
+    registry (#1359), which needs a whole one, and would replace this lane.
+    """
     current_lane = session._model_binding.lane
     lane = resolve_lane(
         provider,
@@ -246,9 +250,9 @@ class TestMaybeAttachVllmChatReasoningGates:
         assert "reasoning" not in out[0]
 
     def test_alias_selects_its_own_config(self) -> None:
-        # The gate reads the config of the alias the LANE resolved — a
-        # fallback lane's alias, not the session's primary.  Mirrors the
-        # per-alias behaviour pinned for resolve_replay_reasoning_to_model.
+        # The gate reads the config of the alias the LANE resolved — a task
+        # agent's lane on another alias, not the session's primary.  Mirrors
+        # the per-alias behaviour pinned for resolve_replay_reasoning_to_model.
         def per_alias(alias: str) -> Any:
             return SimpleNamespace(
                 replay_reasoning_to_model=(alias == "wants-replay"),

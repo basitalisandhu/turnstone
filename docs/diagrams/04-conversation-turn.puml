@@ -51,7 +51,7 @@ end
 loop until final answer and no queued input
   Session -> UI : on_turn_start()\nreset per-stream replay buffers
   Session -> UI : state = thinking\non_thinking_start()
-  Session -> Session : _stream_response(N)\nretry + fallback policy
+  Session -> Session : _stream_response(N)\nretry policy
   Session -> Plant : model_turn(active ModelLane, Turns,\n tools, cancel_ref, on_chunk)
   activate Plant
   Plant -> Plant : canonical Turns → provider wire\nrestore ids + repair + lane-specific fold

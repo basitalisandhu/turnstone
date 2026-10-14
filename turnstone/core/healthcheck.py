@@ -32,7 +32,7 @@ class BackendHealthTracker:
         degraded --(any success)-------------> healthy
 
     Requests are **never blocked** — the degraded flag is advisory
-    (used for observability and fallback ordering).
+    (used for observability).
     """
 
     def __init__(
@@ -88,11 +88,6 @@ class BackendHealthTracker:
     def is_healthy(self) -> bool:
         with self._lock:
             return not self._degraded
-
-    @property
-    def is_degraded(self) -> bool:
-        with self._lock:
-            return self._degraded
 
     @property
     def consecutive_failures(self) -> int:

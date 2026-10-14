@@ -53,7 +53,7 @@ from turnstone.core.model_registry import (
     ModelRegistry,
     load_model_registry,
 )
-from turnstone.core.model_turn import ModelLane, resolve_model_binding
+from turnstone.core.model_turn import ModelLane, ResolvedModelBinding, resolve_model_binding
 from turnstone.core.oauth.context import TokenCoordination, oauth_context
 from turnstone.core.session import BackendAuthUnavailableError, ChatSession
 
@@ -1556,8 +1556,11 @@ class TestModelOboToken:
             capabilities=SimpleNamespace(),
             backend_auth_resolver=sess._model_backend_auth_token,
         )
+        sess._model_binding = ResolvedModelBinding(
+            lane=base_lane, config=None, registry_generation=0
+        )
 
-        lane = ChatSession._build_main_lane(sess, base_lane)
+        lane = ChatSession._primary_lane(sess)
 
         assert lane.backend_auth_resolver is sess._model_backend_auth_token
         assert lane.alias == "tf"
@@ -1569,7 +1572,7 @@ class TestModelOboToken:
     def test_main_lane_never_consults_config_store(self) -> None:
         """The alias/global sampling rungs must not reach the main loop:
         the session's own knobs replace both values ``config_store`` would
-        feed, so ``_build_main_lane`` omits the store entirely and a store
+        feed, so ``_primary_lane`` omits the store entirely and a store
         with configured rungs contributes nothing to the lane."""
         sess = MagicMock()
         sess._registry = None
@@ -1583,16 +1586,21 @@ class TestModelOboToken:
             model="m",
             alias="a",
             capabilities=SimpleNamespace(),
+            temperature=0.9,
+            reasoning_effort="low",
+        )
+        sess._model_binding = ResolvedModelBinding(
+            lane=base_lane, config=None, registry_generation=0
         )
 
-        lane = ChatSession._build_main_lane(sess, base_lane)
+        lane = ChatSession._primary_lane(sess)
 
         assert not store.mock_calls
         assert lane.temperature is None
         assert lane.reasoning_effort == "high"
 
-    def test_fallback_driver_uses_exact_primary_obo_lane(self) -> None:
-        # Regression: the driver must pass the binding's lane intact, including
+    def test_primary_turn_uses_exact_primary_obo_lane(self) -> None:
+        # Regression: the turn must pass the binding's lane intact, including
         # its alias and pinned auth config, into the retry/plant boundary.
         sess = MagicMock()
         lane = MagicMock(spec=ModelLane)
@@ -1606,7 +1614,7 @@ class TestModelOboToken:
         def prepare(wire: list[dict[str, Any]], _lane: ModelLane) -> list[dict[str, Any]]:
             return wire
 
-        assert ChatSession._model_turn_with_fallback(sess, consumer, prepare) is result
+        assert ChatSession._primary_model_turn(sess, consumer, prepare) is result
         sess._model_turn_with_retry.assert_called_once_with(
             lane,
             tracker,
@@ -1652,18 +1660,21 @@ class TestModelOboToken:
         )
         sess._model_token_client.mint_app_token_sync.assert_not_called()
 
-    def test_fail_closed_refusal_never_enters_model_fallback_chain(self) -> None:
+    def test_fail_closed_refusal_is_never_backend_health(self) -> None:
         sess = MagicMock()
         sess._model_alias = "oboagent"
         sess._model_turn_with_retry.side_effect = BackendAuthUnavailableError("mint failed")
-        sess._registry.fallback = ["static-backup"]
         tracker = MagicMock()
         sess._get_health_tracker.return_value = tracker
+        # An unarmed attempt on the backend's tracker: everything else about
+        # the failure would record it, so only the auth exclusion can stop it.
+        consumer = MagicMock()
+        consumer.attempt_armed = False
+        consumer.tracker = tracker
 
         with pytest.raises(BackendAuthUnavailableError):
-            ChatSession._model_turn_with_fallback(sess, MagicMock(), lambda wire, lane: wire)
+            ChatSession._primary_model_turn(sess, consumer, lambda wire, lane: wire)
 
-        sess._try_fallback_lane.assert_not_called()
         # An auth refusal is never reinterpreted as backend health.
         tracker.record_failure.assert_not_called()
 

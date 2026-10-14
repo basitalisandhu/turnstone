@@ -181,13 +181,15 @@ from turnstone.core.model_backend_auth import (
     BackendAuthUnavailableError,
     resolve_model_backend_auth_token,
 )
-from turnstone.core.model_registry import ModelClientConstructionError
+from turnstone.core.model_registry import ModelClientConstructionError, models_table
+from turnstone.core.model_remedies import CHAT_MODEL_REMEDY
 from turnstone.core.model_turn import (
     TRAILING_INFO_SEPARATOR,
     ModelAdmissionError,
     ModelContextLimitError,
     ModelLane,
     ModelTurnResult,
+    RefusingModelClient,
     ResolvedModelBinding,
     UsageInfo,
     WirePreparationError,
@@ -366,6 +368,9 @@ if TYPE_CHECKING:
     from turnstone.core.web_search import WebSearchClient
     from turnstone.core.workstream_lease import WorkstreamLease
 
+    # An output guard detached from the binding it judged, with its cancel event.
+    _StaleOutputGuard = tuple[OutputGuardJudge | None, threading.Event | None]
+
 # ---------------------------------------------------------------------------
 # Cancellation support
 # ---------------------------------------------------------------------------
@@ -427,6 +432,72 @@ class ConversationPersistenceError(Exception):
     flushes queued user messages, which would create a durable row *after* the
     missing boundary.
     """
+
+
+class ModelNotLoadedError(ModelTurnLocalError):
+    """A held session refused a model call, so none was made (#1359).
+
+    The hold lasts from the moment its model couldn't run (not loaded, or its
+    client couldn't be built) until a bind succeeds, so the message also covers
+    a model the registry lists again before the next send rebinds it.
+
+    A ``ModelTurnLocalError``: nothing reached a provider, so no retry,
+    recovery or backend health reads it, and the fatal formatter shows its
+    text as is.
+    """
+
+    def __init__(self, alias: str, message: str, *, retryable: bool = False) -> None:
+        RuntimeError.__init__(self, message)
+        self.stage = "model hold"
+        self.alias = alias
+        self.retryable = retryable
+
+
+class _HeldModelClient(RefusingModelClient):
+    """The client a held session's binding carries (#1359).
+
+    Holding a session swaps its binding's client for this one, so the session
+    is held exactly while its binding carries it, and the held model's identity
+    rides that one immutable snapshot. A model call that no explicit check
+    stopped fails loudly instead of running on the stand-in the session was
+    built on: ``model_turn`` raises the hold's refusal at entry, before taking
+    the stand-in's capacity slot or minting its credential, and any other use
+    of the client raises it too. ``base_url`` reads as unknown for diagnostics,
+    and special-name lookups stay ordinary ``AttributeError``s so introspection
+    behaves.
+    """
+
+    base_url = None
+    _base_url = None
+
+    def __init__(
+        self,
+        alias: str,
+        model_id: str,
+        refusal: Callable[[str], ModelNotLoadedError],
+    ) -> None:
+        self.alias = alias
+        self.model_id = model_id
+        self._refusal = refusal
+
+    def refusal(self) -> ModelNotLoadedError:
+        return self._refusal(self.alias)
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("__") or name in ("alias", "model_id", "_refusal"):
+            raise AttributeError(name)
+        raise self._refusal(self.alias)
+
+    def __repr__(self) -> str:
+        return f"<held model client {self.alias!r}>"
+
+
+def _held_identity(binding: ResolvedModelBinding) -> tuple[str, str] | None:
+    """``(alias, backend model id)`` of the model *binding* holds on, else None."""
+    client = binding.lane.client
+    if isinstance(client, _HeldModelClient):
+        return client.alias, client.model_id
+    return None
 
 
 class _MalformedToolBatchError(RuntimeError):
@@ -865,9 +936,9 @@ class _StreamTurnConsumer:
     splitter; ``provider_blocks`` are ignored (assembly owns them).
 
     The tag-scan posture follows the SAME capability the drain seam reads
-    (``server_parses_reasoning``), taken from the ACTIVE lane — primary or
-    fallback — so the interactive and drained readings of one stream
-    cannot disagree.
+    (``server_parses_reasoning``), taken from the lane the attempt armed
+    on, so the interactive and drained readings of one stream cannot
+    disagree.
 
     The trailing citations footer is emitted as CONTENT, mirroring the
     drain's conditional fold (only when the accumulated post-split content
@@ -879,7 +950,7 @@ class _StreamTurnConsumer:
     def __init__(self, session: ChatSession, my_generation: int) -> None:
         self._session = session
         self._my_generation = my_generation
-        # No lane until the walk's first begin_attempt resolves one:
+        # No lane until the first begin_attempt sets one:
         # per-attempt state has exactly ONE initializer, so a first
         # attempt and a re-issue cannot drift.
         self.lane: ModelLane | None = None
@@ -917,8 +988,8 @@ class _StreamTurnConsumer:
         """Arm display state for one creation attempt on *lane*.
 
         The usage-slot resets ride :meth:`on_stream_armed` (the
-        request-accepted instant) instead, so a long creation ladder or
-        fallback walk never blanks the reconnecting tab's status bar.
+        request-accepted instant) instead, so a long creation ladder never
+        blanks the reconnecting tab's status bar.
         """
         self.ref = ref
         self.tracker = tracker
@@ -932,7 +1003,7 @@ class _StreamTurnConsumer:
         emitting stream_end, as its call-site sequencing comment explains.
         From here until the next ``begin_attempt`` there is
         NO live attempt, so ``attempt_armed`` reads False.  Otherwise a
-        Stop or a walk-preamble failure landing in the re-create window
+        Stop or a turn-preamble failure landing in the re-create window
         reads the DEAD attempt's armed ref — re-finalizing discarded
         display state, or classifying a preamble error as another armed
         death and replacing the operator-actionable stream-death error.
@@ -2992,8 +3063,6 @@ def _tool_turn_meta(
 
 # Errors that carry their own remediation and must surface AS THEMSELVES:
 # the re-issue ladder never masks them behind an earlier stream death.
-# (Walk policy stays per-class — an auth refusal aborts the walk, a
-# wire-preparation fault continues it — only the mask reads this set.)
 _SELF_SURFACING_ERRORS: tuple[type[Exception], ...] = (
     ModelTurnLocalError,
     BackendAuthUnavailableError,
@@ -3014,9 +3083,7 @@ _NON_BACKEND_ERRORS: tuple[type[Exception], ...] = (
 
 
 def _speaks_for_backend(err: BaseException) -> bool:
-    """Whether a creation failure is a health signal for its lane — THE
-    predicate both walk arms use, so primary and fallback can never
-    classify the same error differently."""
+    """Whether a creation failure is a health signal for its lane."""
     return not isinstance(err, _NON_BACKEND_ERRORS)
 
 
@@ -3240,17 +3307,9 @@ class ChatSession:
                 backend_auth_config=model_binding.config,
             ),
         )
-        # Dead-binding latch: set to the alias when the per-send refresh
-        # finds it gone from the registry. Sends still PROCEED so the
-        # fallback chain can carry the turn; the latch only lets the
-        # terminal no-fallback error name the TRUE cause instead of the raw
-        # closed-transport symptom. Cleared as soon as the alias is listed
-        # again or on the next successful bind, so a re-created-but-broken
-        # alias reports its construction cause, never a stale "removed".
-        self._registry_alias_removed: str | None = None
-        # Once-per-(alias, generation) dedup for that warning — the removed
-        # state persists across sends.
-        self._alias_removed_warned: tuple[str, int] | None = None
+        # Once-per-(alias, generation) dedup for the hold's warning — the
+        # held state persists across sends.
+        self._held_warned: tuple[str, int] | None = None
         # Construction-failure latch: the (alias, generation) whose rebind
         # last failed, plus the cause text for the terminal error surface.
         # The refresh skips re-attempting until the generation changes,
@@ -3468,9 +3527,10 @@ class ChatSession:
         # Turns→dicts at that boundary until those layers migrate.
         self.messages: list[Turn] = []
         self._last_usage: dict[str, int] | None = None
-        # Provider tokenization varies by coherent serving identity.  A
-        # fallback's ratio and prompt anchor must not replace the primary's:
-        # the next A dispatch after A -> B fallback resumes A's estimator.
+        # Provider tokenization varies by coherent serving identity.  Another
+        # model's ratio and prompt anchor must not replace this one's: after
+        # a switch from A to B and back, the next A dispatch resumes A's
+        # estimator.
         self._token_calibrations: dict[_ModelCalibrationKey, _TokenCalibration] = {}
         self._active_token_calibration_key: _ModelCalibrationKey | None = None
         self._last_usage_calibration_key: _ModelCalibrationKey | None = None
@@ -3954,17 +4014,51 @@ class ChatSession:
 
     @property
     def model(self) -> str:
-        """Backend model id from the current coherent session binding."""
-        return self._model_binding.lane.model
+        """Backend model id of this session's model: the held model's while
+        held, else the current coherent binding's."""
+        binding = self._model_binding
+        held = _held_identity(binding)
+        return held[1] if held is not None else binding.lane.model
 
     @property
     def model_alias(self) -> str | None:
         return self._model_alias
 
     @property
+    def model_held(self) -> bool:
+        """Whether this session is held on its own model (see ``_held_model``):
+        from the moment the model couldn't run until a bind succeeds, which
+        includes while the registry lists it again before the next send."""
+        return _held_identity(self._model_binding) is not None
+
+    @property
+    def bound_model_alias(self) -> str | None:
+        """The alias of the binding the session is built on: a held session's
+        stand-in, never its own model. For lifecycle checks, not display."""
+        return self._model_binding.lane.alias or None
+
+    @property
     def _model_alias(self) -> str | None:
-        alias = self._model_binding.lane.alias
+        binding = self._model_binding
+        held = _held_identity(binding)
+        alias = held[0] if held is not None else binding.lane.alias
         return alias or None
+
+    @property
+    def _held_model(self) -> tuple[str, str] | None:
+        """The hold (#1359): ``(alias, backend model id)`` of this session's own
+        model while that model isn't loaded, else None.
+
+        Derived from the binding (see :class:`_HeldModelClient`), never stored
+        beside it. Set when a reopen or fork finds its saved model missing or
+        unbuildable, or saved without an alias (the binding is then a
+        stand-in), and when the refresh finds the bound model gone or
+        unbuildable. While held, the session reports and saves this model, and
+        every model call refuses before it is made. A successful bind replaces
+        the binding and so ends it: the model loading again (the refresh
+        rebinds it) or an explicit /model switch.
+        """
+        return _held_identity(self._model_binding)
 
     @property
     def _registry_generation(self) -> int:
@@ -4418,6 +4512,59 @@ class ChatSession:
         if snap is not None:
             config.update(snap.to_config())
         return config
+
+    def _switch_model(self, alias: str, *, principal_id: str | None = None) -> ModelConfig | None:
+        """Switch this session to *alias*, as ``/model <alias>`` does, without saving.
+
+        A successful bind replaces the binding, which ends any hold. Returns
+        the alias's config, or None when it isn't loaded (the binding is then
+        untouched). Raises :class:`ModelClientConstructionError` when the
+        alias exists but its client can't be built.
+        """
+        if self._registry is None:
+            return None
+        bind = self._bind_model_from_registry(alias)
+        if bind is None:
+            return None
+        cfg = bind[0]
+        self.context_window = cfg.context_window
+        if not self._manual_tool_truncation:
+            self.tool_truncation = _auto_tool_truncation_chars(
+                cfg.context_window, self._chars_per_token
+            )
+        # Re-resolve the sampling knobs for the new alias through the SAME
+        # shared resolvers session_factory uses, so switching away from a model
+        # with overrides doesn't leak them and every surface samples
+        # identically on the same alias.  Unset resolves to None (wire
+        # omission), replacing any prior model's value.  STORE-LESS sessions
+        # (the CLI) are the exception: there the current knobs ARE the user's
+        # explicit flags (--temperature / /reason) — the only authority that
+        # exists — so the switch keeps them unless the new alias declares its
+        # own (mirrors the max_tokens fallback below).
+        cs = self._config_store
+        if cs:
+            self.temperature = resolve_temperature_setting(cfg, cs)
+            self.reasoning_effort = resolve_effort_setting(cfg, cs)
+        else:
+            if cfg.temperature is not None:
+                self.temperature = cfg.temperature
+            if cfg.reasoning_effort:
+                self.reasoning_effort = cfg.reasoning_effort
+        self.max_tokens = (
+            cfg.max_tokens
+            if cfg.max_tokens is not None
+            else (cs.get("model.max_tokens") if cs else self.max_tokens)
+        )
+        self._init_system_messages(principal_id=principal_id)
+        self._activate_token_calibration(self._primary_lane())
+        return cfg
+
+    def _model_config_for_save(self) -> dict[str, str]:
+        """The model's share of :meth:`_config_for_save`: the model and the
+        sampling settings resolved for it, which a model switch rewrites together."""
+        config = self._config_for_save()
+        keys = ("model", "model_alias", "temperature", "reasoning_effort", "max_tokens")
+        return {key: config[key] for key in keys}
 
     def _save_config(self) -> None:
         """Persist LLM-affecting config so resumed workstreams behave identically."""
@@ -5116,7 +5263,9 @@ class ChatSession:
         Also shared by the resume restore, the ``/model`` switch, and (via
         the factory-passed ``registry_generation`` constructor argument) the
         construction path, so a member of the bind set cannot land in some
-        sites and not others.
+        sites and not others. The hold (:meth:`_hold_on`) is the one other
+        writer of the binding; both publish through
+        :meth:`_publish_binding_locked`.
 
         Disciplines, both load-bearing:
 
@@ -5133,8 +5282,8 @@ class ChatSession:
           throttled session a fresh burst. A real swap still resets: a
           lazily-built judge caches the previous binding.
 
-        A successful bind also clears the two dead-binding latches — the
-        bind IS the recovery they wait for.
+        A successful bind also clears the hold and the construction-failure
+        latch — the bind IS the recovery they wait for.
 
         Returns ``(config, binding_changed)`` so the per-send driver can
         keep a no-op rebind silent, or ``None`` when the alias could not be
@@ -5146,8 +5295,7 @@ class ChatSession:
         registry = self._registry
         if registry is None:
             return None
-        stale_output_guard: OutputGuardJudge | None = None
-        stale_output_guard_cancel: threading.Event | None = None
+        stale_output_guard: _StaleOutputGuard = (None, None)
         with self._model_binding_lock:
             # A refresh operates on the binding it observed before registry
             # reads.  An explicit /model or resume bind is authoritative and
@@ -5175,24 +5323,17 @@ class ChatSession:
                 and candidate.config == old_binding.config
             )
             if binding_changed:
-                # Publish the new binding and detach the old output-guard
-                # generation under one lock.  A concurrent evaluation then sees
-                # either the complete old triple or the complete new/empty one,
-                # never a cross-generation mix.
-                with self._output_guard_judge_lock:
-                    self._model_binding = dataclasses.replace(
+                stale_output_guard = self._publish_binding_locked(
+                    dataclasses.replace(
                         candidate,
                         lane=dataclasses.replace(
                             candidate.lane,
                             temperature=self.temperature,
                             reasoning_effort=self.reasoning_effort or None,
                         ),
-                    )
-                    stale_output_guard = self._output_guard_judge
-                    stale_output_guard_cancel = self._output_guard_judge_cancel
-                    self._output_guard_judge = None
-                    self._output_guard_judge_cancel = None
-                    self._output_guard_judge_rl = TokenBucket(rate=1.0, burst=60)
+                    ),
+                    refill_limiter=True,
+                )
             else:
                 # Preserve the exact lane object and all of its holders on an
                 # unrelated generation bump; only the snapshot stamp advances.
@@ -5200,19 +5341,54 @@ class ChatSession:
                     old_binding,
                     registry_generation=candidate.registry_generation,
                 )
-            self._registry_alias_removed = None
             self._rebind_failed_key = None
             self._rebind_failed_cause = None
-            if binding_changed:
-                self._judge = None
-        # Cancellation and retirement are deliberately outside both session
-        # locks.  A semantic generation boundary aborts its stale inference;
-        # the regex guard remains the authoritative fallback for that output.
-        if stale_output_guard_cancel is not None:
-            stale_output_guard_cancel.set()
-        if stale_output_guard is not None:
-            stale_output_guard.retire()
+        self._retire_output_guard(stale_output_guard)
         return candidate.config, binding_changed
+
+    def _publish_binding_locked(
+        self,
+        binding: ResolvedModelBinding,
+        *,
+        refill_limiter: bool,
+    ) -> _StaleOutputGuard:
+        """Install *binding* and detach what judged the old one; the caller holds
+        ``_model_binding_lock``.
+
+        The binding and the output-guard pair change under one lock, so a
+        concurrent evaluation sees either the complete old triple or the
+        complete new/empty one, never a cross-generation mix. The intent judge
+        is dropped too: a lazily-built judge caches the previous binding.
+        *refill_limiter* hands the output guard a fresh rate limiter. Returns
+        the detached output-guard pair, which the caller passes to
+        :meth:`_retire_output_guard` after releasing the lock.
+        """
+        with self._output_guard_judge_lock:
+            self._model_binding = binding
+            stale: _StaleOutputGuard = (
+                self._output_guard_judge,
+                self._output_guard_judge_cancel,
+            )
+            self._output_guard_judge = None
+            self._output_guard_judge_cancel = None
+            if refill_limiter:
+                self._output_guard_judge_rl = TokenBucket(rate=1.0, burst=60)
+        self._judge = None
+        return stale
+
+    @staticmethod
+    def _retire_output_guard(stale: _StaleOutputGuard) -> None:
+        """Cancel and retire an output guard :meth:`_publish_binding_locked` detached.
+
+        Deliberately outside both session locks. A semantic generation
+        boundary aborts its stale inference; the regex guard remains the
+        authoritative fallback for that output.
+        """
+        guard, cancel = stale
+        if cancel is not None:
+            cancel.set()
+        if guard is not None:
+            guard.retire()
 
     def _refresh_model_from_registry(self) -> None:
         """Re-resolve model/client from the registry when it changed.
@@ -5230,47 +5406,34 @@ class ChatSession:
         generation, not a field enumeration, so every future
         connection-relevant column is covered by construction.
 
-        Failure outcomes DIAGNOSE, never foreclose: an alias REMOVED from
-        the registry latches ``_registry_alias_removed``, and a
-        construction failure records its (alias, generation) plus the real
-        cause so the rebind is not re-attempted until the registry changes.
-        In both cases the send proceeds with the old binding so the
-        fallback chain can carry the turn, and only a terminal no-fallback
-        failure surfaces the latched cause (see ``_format_backend_error``).
-        Each failure warns once per (alias, generation).
+        A model that can't run HOLDS the session (#1359): when the bound
+        alias leaves the registry, or is listed but its client can't be
+        built, the session is held on it, and every model call then refuses
+        before anything is dialed (:meth:`_raise_if_held`). A held session's
+        own model rebinds here as soon as the registry lists it again,
+        whatever binding it was built on; only a successful bind ends the
+        hold. A construction failure records its (alias, generation) plus
+        the real cause, which the refusal names, and the build isn't
+        re-attempted until the registry changes: a fix outside it (a
+        restored CA bundle) waits for a model edit or a restart, since a
+        Sync of unchanged definitions reloads nothing. Each failure warns
+        once per (alias, generation).
         """
         registry = self._registry
         observed_binding = self._model_binding
-        observed_alias = observed_binding.lane.alias
+        held = _held_identity(observed_binding)
+        observed_alias = held[0] if held is not None else observed_binding.lane.alias
         if registry is None or not observed_alias:
             return
         try:
             if not registry.has_alias(observed_alias):
-                # The alias is gone — the reload that removed it already
-                # close()d its pooled client. Record the true cause for the
-                # terminal error surface and let the send proceed.
-                removed_key = (observed_alias, registry.generation)
-                with self._model_binding_lock:
-                    if self._model_binding is not observed_binding:
-                        return
-                    self._registry_alias_removed = observed_alias
-                if self._alias_removed_warned != removed_key:
-                    self._alias_removed_warned = removed_key
-                    log.warning(
-                        "session.model_refresh_alias_removed ws=%s alias=%s",
-                        self._ws_id,
-                        observed_alias,
-                    )
+                # The model isn't loaded (the reload that removed it already
+                # close()d its pooled client): hold on it.
+                held_id = held[1] if held is not None else observed_binding.lane.model
+                if self._hold_on(observed_alias, held_id, expected_binding=observed_binding):
+                    self._warn_held(observed_alias, registry.generation)
                 return
-            # Listed again: clearing here, not only on a successful bind,
-            # keeps a re-created-but-broken alias from reporting "removed"
-            # while the registry lists it; the construction arm below owns
-            # that diagnosis.
             cfg = registry.get_config(observed_alias)
-            with self._model_binding_lock:
-                if self._model_binding is not observed_binding:
-                    return
-                self._registry_alias_removed = None
             # Sampled AFTER the map reads above, pairing with reload()'s
             # bump-before-swap ordering: this reader can observe a new
             # generation with old maps (one extra idempotent rebind), but
@@ -5281,7 +5444,8 @@ class ChatSession:
             # ordering cannot wedge a binding.
             registry_generation = registry.generation
             if (
-                cfg.model == observed_binding.lane.model
+                held is None
+                and cfg.model == observed_binding.lane.model
                 and registry_generation == observed_binding.registry_generation
             ):
                 return
@@ -5291,8 +5455,8 @@ class ChatSession:
             # Construction already failed at this exact registry state;
             # re-attempting per send would rebuild the same failure under
             # the registry-wide client lock, serializing every other
-            # session's resolve. Keep the old binding limping until a
-            # reload changes the generation.
+            # session's resolve. Stay held until a reload changes the
+            # generation.
             return
         try:
             bind = self._bind_model_from_registry(
@@ -5301,23 +5465,25 @@ class ChatSession:
             )
         except ModelClientConstructionError as exc:
             # The alias still exists but its client or provider cannot be
-            # built (SDK, environment, or api_surface fault). Keep the old
-            # binding — it may still limp through the retry/fallback
-            # machinery — and record the attempted (alias, generation) plus
-            # the cause, so the rebind is not retried until a reload changes
-            # the registry and the terminal error surface can name the fault.
+            # built (SDK, environment, or api_surface fault). The binding the
+            # reload retired can't carry a turn, so hold on the model, as a
+            # removal does, and record the attempted (alias, generation) plus
+            # the cause, which the refusal names; the build isn't retried
+            # until a reload changes the registry.
             with self._model_binding_lock:
                 if self._model_binding is not observed_binding:
                     return
-                self._registry_alias_removed = None
                 self._rebind_failed_key = (observed_alias, registry_generation)
                 self._rebind_failed_cause = str(exc)
             log.warning(
-                "session.model_refresh_client_construction_failed ws=%s alias=%s err=%s",
-                self._ws_id,
-                observed_alias,
-                exc,
+                "session.model_refresh_client_construction_failed",
+                ws_id=self._ws_id,
+                alias=observed_alias,
+                err=str(exc),
             )
+            held_id = held[1] if held is not None else observed_binding.lane.model
+            if self._hold_on(observed_alias, held_id, expected_binding=observed_binding):
+                self._warn_held(observed_alias, registry_generation)
             return
         if bind is None:
             return  # alias disappeared during concurrent reload
@@ -5328,7 +5494,6 @@ class ChatSession:
                 or self._model_binding.lane.alias != observed_alias
             ):
                 return
-            self._registry_alias_removed = None
             if new_cfg.context_window and new_cfg.context_window != self.context_window:
                 self.context_window = new_cfg.context_window
                 # Recompute auto tool truncation for new context window.
@@ -5343,11 +5508,159 @@ class ChatSession:
             # session's model changed" to "a reload happened somewhere".
             self._init_system_messages()
             log.info(
-                "session.model_updated ws=%s model=%s ctx=%d",
-                self._ws_id,
-                self.model,
-                self.context_window,
+                "session.model_updated",
+                ws_id=self._ws_id,
+                model=self.model,
+                ctx=self.context_window,
             )
+
+    def _hold_on(
+        self,
+        alias: str,
+        model_id: str,
+        *,
+        expected_binding: ResolvedModelBinding | None = None,
+    ) -> bool:
+        """Hold this session on *alias* (see ``_held_model``); False when a
+        concurrent bind replaced *expected_binding* first.
+
+        Swaps the binding's client for a :class:`_HeldModelClient`, keeping the
+        stand-in's other facets for the prefix, diagnostics and context
+        figures. Cached judges built on the old client are dropped, as on any
+        binding change, so none can call through it. The output guard's rate
+        limiter isn't refilled: a held session produces no output to judge,
+        and the bind that ends the hold refills it.
+        """
+        with self._model_binding_lock:
+            binding = self._model_binding
+            if expected_binding is not None and binding is not expected_binding:
+                return False
+            if _held_identity(binding) == (alias, model_id):
+                return True
+            held_client = _HeldModelClient(alias, model_id, self._model_not_loaded_error)
+            stale_output_guard = self._publish_binding_locked(
+                dataclasses.replace(
+                    binding, lane=dataclasses.replace(binding.lane, client=held_client)
+                ),
+                refill_limiter=False,
+            )
+        self._retire_output_guard(stale_output_guard)
+        return True
+
+    def _warn_held(self, alias: str, generation: int, *, model_id: str = "") -> None:
+        """Warn once per (alias, registry generation) that the session is held;
+        *model_id* names a hold without an alias (see ``_apply_persisted_config``)."""
+        key = (alias, generation)
+        if self._held_warned != key:
+            self._held_warned = key
+            if alias:
+                log.warning("session.model_held", ws_id=self._ws_id, alias=alias)
+            else:
+                log.warning("session.model_held", ws_id=self._ws_id, model=model_id)
+
+    def _raise_if_held(self) -> None:
+        """Refuse a model call while this session's model isn't loaded (#1359).
+
+        Raised before anything is dialed: a held session's binding is a
+        stand-in (a reopen or fork) or a retired client (a live session), and
+        a call on either would run the conversation on a model nobody chose.
+        """
+        held = self._held_model
+        if held is not None:
+            raise self._model_not_loaded_error(held[0])
+
+    def _model_not_loaded_error(self, alias: str) -> ModelNotLoadedError:
+        """The hold's refusal: why the model can't run and what can be done.
+
+        ``/model`` prints the same text, so the two can't disagree. The why is
+        the registry's category, never the loader's own reason, which can name
+        secret reference paths. The remedy fits whoever reads the refusal (see
+        :meth:`_reader_routes_slash_commands`): a chat user gets the channels'
+        own advice and is told the message is kept, since chat has no
+        ``/retry``; a reader who can't run ``/model`` is pointed at the model's
+        definition; the CLI process, which reads its models from config.toml
+        once, at start, is pointed at that file. No remedy ever names another
+        model.
+        """
+        registry = self._registry
+        client = self._client_type
+        coordinator = self._kind == WorkstreamKind.COORDINATOR
+        chat = client is ClientType.CHAT and not coordinator
+        if coordinator:
+            noun = "coordinator"
+        elif chat:
+            noun = "conversation"
+        else:
+            noun = "workstream"
+        if not alias:
+            # A row saved before model aliases were recorded, held on its
+            # backend model id: only a switch can end this hold.
+            held = self._held_model
+            model_id = held[1] if held is not None else ""
+            message = (
+                f"This {noun}'s model '{model_id}' was saved without a model alias, so it "
+                "can't be matched to a loaded model."
+            )
+            if self._reader_routes_slash_commands():
+                message += " Switch to a model with /model <alias>."
+            return ModelNotLoadedError(alias, message)
+        subject = f"This {noun}'s model '{alias}'"
+        retryable = False
+        if registry is not None and registry.has_alias(alias):
+            if (
+                self._rebind_failed_key != (alias, registry.generation)
+                or not self._rebind_failed_cause
+            ):
+                # Loaded again since the last send, whose refresh rebinds it
+                # (a build that failed at an earlier registry state is retried).
+                return ModelNotLoadedError(
+                    alias, f"{subject} is loaded again; send a message to continue on it."
+                )
+            state = f"can't be used: its client couldn't be built ({self._rebind_failed_cause})"
+        else:
+            why = ""
+            if registry is not None:
+                reason, retryable = registry.unavailable_reason(alias)
+                why = f": {reason}" if reason else ""
+            state = f"isn't loaded{why}"
+        if chat:
+            kept = "your message is kept, and the conversation continues with your next message"
+            if retryable:
+                fix = f"It should load again shortly; {kept} once it's back."
+            else:
+                fix = f"{CHAT_MODEL_REMEDY}; {kept} once the model is back."
+        elif not self._reader_routes_slash_commands():
+            fix = "Try again shortly." if retryable else "Ask an admin to check its definition."
+        elif client is ClientType.CLI and self._config_store is None:
+            # The CLI process: its models come from config.toml, read once.
+            if retryable:
+                fix = "Switch to another model with /model <alias>, or restart to load it again."
+            else:
+                fix = (
+                    f"Switch to another model with /model <alias>, or check "
+                    f"{models_table(alias)} in config.toml and restart."
+                )
+        elif retryable:
+            fix = "Try again shortly, or switch to another model with /model <alias>."
+        else:
+            fix = (
+                "Switch to another model with /model <alias>, or ask an admin to check its "
+                "definition."
+            )
+        return ModelNotLoadedError(alias, f"{subject} {state}. {fix}", retryable=retryable)
+
+    def _reader_routes_slash_commands(self) -> bool:
+        """Whether whoever reads this session's errors can run ``/model``: a person
+        at the web UI or a CLI.
+
+        A coordinator routes no slash commands; a coordinator's child is read
+        by the coordinator's model, which must never be steered to another
+        model; a scheduled run is unattended; chat sends every message as a
+        message. An unknown surface gets the unattended answer too.
+        """
+        if self._kind == WorkstreamKind.COORDINATOR or self._parent_ws_id:
+            return False
+        return self._client_type in (ClientType.WEB, ClientType.CLI)
 
     def _rebuild_tool_search(self) -> None:
         """Reconstruct ToolSearchManager, preserving expanded tools."""
@@ -6140,8 +6453,8 @@ class ChatSession:
         ``use_usage_slot=False`` skips the compatibility read of ``_last_usage`` below:
         :meth:`_update_token_table` needs the estimate of the request it just sent while that slot
         already holds the call's own, possibly cumulative, counters.  ``tool_def_chars`` sizes the
-        tool definitions of THAT request for the anchor-less fallback, so a call served on a
-        fallback lane is never paired with the primary lane's tool schema.
+        tool definitions of THAT request for the anchor-less fallback, so a call is never paired
+        with another lane's tool schema.
 
         Single source of truth for "how full is the context": tool-output
         truncation (via :meth:`_remaining_token_budget`) and the
@@ -6789,8 +7102,7 @@ class ChatSession:
                 # Broadcast current name so the UI resets the "refreshing" indicator
                 if current_title:
                     self.ui.on_rename(current_title)
-            # The traceback only at DEBUG, as the request retry ("API error details") and
-            # fallback ("fallback failure detail") logs do.
+            # The traceback only at DEBUG, as the request retry log ("API error details") does.
             log.warning(
                 "ws.title.failed", ws_id=ws_id[:8], error_type=type(e).__name__, error=str(e)
             )
@@ -6819,8 +7131,13 @@ class ChatSession:
         source_reservation_token: str,
         source_required_node_id: str | None = None,
         trusted_internal: bool = False,
+        switch_to: str | None = None,
     ) -> ForkCloneSnapshot:
-        """Atomically clone, then adopt, one authorized source snapshot."""
+        """Atomically clone, then adopt, one authorized source snapshot.
+
+        *switch_to*: the model the create request names; see
+        :meth:`adopt_fork_snapshot`.
+        """
         from turnstone.core.storage import ForkCloneExpectation
 
         storage = get_storage()
@@ -6845,7 +7162,7 @@ class ChatSession:
             trusted_internal=trusted_internal,
             expected_session=expected_session,
         )
-        self.adopt_fork_snapshot(source_ws_id, snapshot)
+        self.adopt_fork_snapshot(source_ws_id, snapshot, switch_to=switch_to)
         return snapshot
 
     def rehydrate(self) -> bool:
@@ -6863,9 +7180,58 @@ class ChatSession:
         """
         return self._resume(self._ws_id, _fork_snapshot=None)
 
-    def adopt_fork_snapshot(self, source_ws_id: str, snapshot: ForkCloneSnapshot) -> None:
-        """Adopt a committed fork clone's history and config under this workstream's id."""
+    def adopt_fork_snapshot(
+        self,
+        source_ws_id: str,
+        snapshot: ForkCloneSnapshot,
+        *,
+        switch_to: str | None = None,
+    ) -> None:
+        """Adopt a committed fork clone's history and config under this workstream's id.
+
+        The fork restores as a reopen does: it continues on the source's model
+        when that model is loaded and is held on it otherwise (#1359). A held
+        fork whose request names a model (*switch_to*) then switches to it, as
+        ``/model`` would, with that model's own sampling settings: the request
+        is the switch. A source model that is out only for now (its secret
+        store didn't answer) keeps the fork held instead, so it continues on
+        its own model once the store answers rather than moving for good. The
+        chat channels' recovery forks name no model, except a Slack DM when a
+        channel model is set, so a recovered conversation whose model isn't
+        loaded mostly waits for it.
+        """
         self._resume(source_ws_id, _fork_snapshot=snapshot)
+        if switch_to:
+            self._switch_forked_model(switch_to)
+
+    def _switch_forked_model(self, alias: str) -> None:
+        """Run an adopted fork on *alias*, the model its request names, when the
+        source's own model can't run, so the fork is held; see
+        :meth:`adopt_fork_snapshot`."""
+        held = self._held_model
+        if held is None:
+            return  # the fork continues on the source's model
+        registry = self._registry
+        if held[0] and registry is not None and registry.unavailable_reason(held[0])[1]:
+            return  # out only for now: hold, rather than move the fork for good
+        try:
+            switched = self._switch_model(alias)
+        except ModelClientConstructionError as exc:
+            log.warning(
+                "session.fork_switch_failed",
+                ws_id=self._ws_id,
+                alias=alias,
+                err=str(exc),
+            )
+            return
+        if switched is not None:
+            log.info(
+                "session.fork_switched",
+                ws_id=self._ws_id,
+                saved_alias=held[0],
+                saved_model=held[1],
+                model_alias=alias,
+            )
 
     def _resume(
         self,
@@ -7016,21 +7382,32 @@ class ChatSession:
             ),
         )
 
-    def _apply_persisted_config(self, config: dict[str, str], scalars: _ConfigScalars) -> None:
+    def _apply_persisted_config(
+        self,
+        config: dict[str, str],
+        scalars: _ConfigScalars,
+    ) -> None:
         """Apply a persisted config's model, sampling, instructions and skill settings.
 
-        The persona stamp is applied separately: it is construction-time.
+        The persona stamp is applied separately: it is construction-time. A
+        saved model that doesn't bind (it isn't loaded, or its client can't be
+        built) holds the session on it (#1359), and so does a row saved before
+        model aliases were recorded, on the backend model id it names.
         """
         # Restore model via registry (same path as /model command).
         # An alias vanishing between the ``has_alias`` check and the
-        # resolve returns None with the binding untouched, so the
-        # constructor's coherent default falls through to the
-        # unreachable-alias branch instead of raising out of the resume.
+        # resolve returns None with the binding untouched, so it falls
+        # through to the hold below instead of raising out of the resume.
         saved_alias = config.get("model_alias", "")
         saved_model = config.get("model", "")
+        registry = self._registry
         bound_cfg: ModelConfig | None = None
-        bind_cause_logged = False
-        if saved_alias and self._registry and self._registry.has_alias(saved_alias):
+        failed_build: tuple[int, str] | None = None
+        if saved_alias and registry is not None and registry.has_alias(saved_alias):
+            # Sampled before the attempt, as the per-send refresh does: a
+            # generation read after a failure can be newer than the state that
+            # failed, and the latch would then skip the retry after a fix.
+            generation = registry.generation
             try:
                 bind_res = self._bind_model_from_registry(saved_alias)
                 bound_cfg = bind_res[0] if bind_res is not None else None
@@ -7038,19 +7415,14 @@ class ChatSession:
                 # The saved alias IS in the registry; its client failed
                 # to construct. Log that cause — the unreachable-alias
                 # arm below would point operators at a registry state
-                # that is not the problem — and keep the constructor's
-                # default binding, as for a missing alias.
-                default_diagnostics = lane_diagnostics(self._primary_lane())
+                # that is not the problem — and latch it for the hold.
                 log.warning(
-                    "Resume: saved alias=%r is in the registry but its "
-                    "client could not be constructed (%s); keeping "
-                    "default provider=%s model=%s",
-                    saved_alias,
-                    exc,
-                    default_diagnostics.provider_type,
-                    default_diagnostics.model,
+                    "session.resume_client_construction_failed",
+                    ws_id=self._ws_id,
+                    alias=saved_alias,
+                    err=str(exc),
                 )
-                bind_cause_logged = True
+                failed_build = (generation, str(exc))
         if bound_cfg is not None:
             self.context_window = bound_cfg.context_window
             if not self._manual_tool_truncation:
@@ -7059,29 +7431,51 @@ class ChatSession:
                 )
             bound_diagnostics = lane_diagnostics(self._primary_lane())
             log.info(
-                "Resume: resolved alias=%s → provider=%s, model=%s, ctx=%d",
-                saved_alias,
-                bound_diagnostics.provider_type,
-                bound_diagnostics.model,
-                bound_cfg.context_window,
+                "session.resume_model_resolved",
+                ws_id=self._ws_id,
+                alias=saved_alias,
+                provider=bound_diagnostics.provider_type,
+                model=bound_diagnostics.model,
+                ctx=bound_cfg.context_window,
             )
-        elif not bind_cause_logged and (saved_alias or saved_model):
-            # Saved alias is unset or no longer in the registry.
-            # Don't copy ``saved_model`` onto the constructor's
-            # default provider/client — pairing a removed model
-            # name with the default provider produces an API call
-            # the default provider can't service, which is exactly
-            # the broken state operators see today on the reopen
-            # path.  The constructor already resolved a coherent
-            # default; keep it intact and warn so the missing
-            # alias is auditable.
+        elif saved_alias and registry is not None:
+            # The saved model doesn't bind: hold on it (#1359). The
+            # constructor's binding stays as a stand-in that can't make a call
+            # (see ``_hold_on``); the session reports and saves the saved
+            # model, its turns refuse until that model loads again or the user
+            # switches, and nothing pairs ``saved_model`` with another provider.
+            # A failed build is latched as the per-send refresh latches one, so
+            # the refusal names its cause and the next send doesn't rebuild it
+            # at the same registry state.
+            if failed_build is not None:
+                with self._model_binding_lock:
+                    self._rebind_failed_key = (saved_alias, failed_build[0])
+                    self._rebind_failed_cause = failed_build[1]
+            self._hold_on(saved_alias, saved_model)
+            self._warn_held(saved_alias, registry.generation)
+        elif saved_model and registry is not None:
+            # A row saved before model aliases were recorded names only a
+            # backend model id, which no definition is keyed by. Hold with no
+            # alias rather than guess which definition (or provider) served
+            # it: nothing can match an empty alias, so only a /model switch
+            # ends this hold, and saves keep the row as it was.
+            self._hold_on("", saved_model)
+            self._warn_held("", registry.generation, model_id=saved_model)
+        elif saved_alias or saved_model:
+            # No registry to resolve the saved model. Don't copy
+            # ``saved_model`` onto the constructor's provider/client — pairing
+            # a model name with another provider produces an API call that
+            # provider can't service. The constructor already resolved a
+            # coherent binding; keep it intact and warn so the change is
+            # auditable.
             default_diagnostics = lane_diagnostics(self._primary_lane())
             log.warning(
-                "Resume: saved alias=%r model=%r unreachable; keeping default provider=%s model=%s",
-                saved_alias,
-                saved_model,
-                default_diagnostics.provider_type,
-                default_diagnostics.model,
+                "session.resume_model_unresolved",
+                ws_id=self._ws_id,
+                saved_alias=saved_alias,
+                saved_model=saved_model,
+                provider=default_diagnostics.provider_type,
+                model=default_diagnostics.model,
             )
         if "temperature" in config:
             # "" = unset (wire omission); "None" guards rows written
@@ -7213,12 +7607,12 @@ class ChatSession:
     ) -> list[dict[str, Any]]:
         """Return *system_messages* plus additions required by *caps*.
 
-        The primary prefix stays cache-stable. A fallback can need stricter
-        client-side posture than that prefix declares: nonce-fenced operator
-        turns require their trust declaration, and synthetic ``tool_search``
-        benefits from its discovery hint. Add only facts missing from the
-        primary composition; a native fallback may harmlessly retain the
-        primary's stricter declarations.
+        The primary prefix stays cache-stable. A lane other than the one it
+        was composed for can need stricter client-side posture than that
+        prefix declares: nonce-fenced operator turns require their trust
+        declaration, and synthetic ``tool_search`` benefits from its discovery
+        hint. Add only facts missing from the primary composition; a native
+        lane may harmlessly retain the primary's stricter declarations.
         """
         primary_additions = self._capability_prompt_additions(self._get_capabilities())
         missing = [
@@ -7718,8 +8112,8 @@ class ChatSession:
         # supported lifecycle transition.
         caps = self._get_capabilities()
         # Operator-instruction trust anchor — declared only on the fold path.
-        # A fallback whose posture needs it gets it on the transient prefix in
-        # ``_system_messages_for_lane`` without mutating this cached primary
+        # Another lane whose posture needs it gets it on the transient prefix
+        # in ``_system_messages_for_lane`` without mutating this cached primary
         # prefix.
         operator_addition = self._operator_prompt_addition(caps)
         if operator_addition:
@@ -8020,12 +8414,12 @@ class ChatSession:
         if cancel_ref is not None and cancel_ref.aborted:
             raise GenerationCancelled
         # caps is the ACTIVE attempt's capabilities, threaded from its lane so
-        # a fallback to a model with different media support converts on the
-        # right caps; default to the primary only when called without one.
+        # a lane with different media support converts on the right caps;
+        # default to the primary only when called without one.
         if caps is None:
             caps = self._get_capabilities()
         # Per-send memo (see send()): the wire resolver is re-invoked on every
-        # round-trip and per fallback model, so without this a PDF in history is
+        # round-trip and per serving lane, so without this a PDF in history is
         # re-rasterized / a blob re-base64'd once per round-trip.  Key on
         # (id, caps/representation-signature): the same stored blob
         # materializes differently per capability set, while only extracted
@@ -8726,7 +9120,7 @@ class ChatSession:
         # label is part of the content the fold + repair passes carry through.
         messages = self._inject_sender_labels(messages)
         # *caps* is the SERVING lane's capabilities when the streaming
-        # wrapper prepares per attempt — a fallback whose template rejects
+        # wrapper prepares per attempt — a lane whose template rejects
         # mid-conversation system roles must get the folded shape even when
         # the primary keeps them inline.  Raw callers default to the primary.
         fold_caps = caps if caps is not None else self._get_capabilities()
@@ -8778,10 +9172,10 @@ class ChatSession:
 
         The agent's system prompt is composed once from the primary lane's
         posture, so it declares the operator fence only when the primary
-        folds.  The agent's own lane, or a fallback, can fold when the primary
-        does not, and its output-guard advisories would then arrive in a fence
-        its prompt never declared, reading like the injections they warn
-        about.  The main loop adds the missing declaration per serving lane
+        folds.  The agent's own lane can fold when the primary does not, and
+        its output-guard advisories would then arrive in a fence its prompt
+        never declared, reading like the injections they warn about.  The
+        main loop adds the missing declaration per serving lane
         (``_system_messages_for_lane``); this is the task agent's equivalent,
         limited to the fence declaration because the agent's tool set is
         fixed and the tool-search hint does not apply.
@@ -9259,42 +9653,6 @@ class ChatSession:
                 f"settings. It is NOT the alias's static API key."
             )
 
-        # A binding the per-send refresh diagnosed dead outranks the raw
-        # transport symptom, which points at network health instead of the
-        # admin action that caused it. Reached only when no fallback carried
-        # the turn. Remediation is PER-LANE: /model is routable only on the
-        # CLI and node-interactive command lanes, so the console coordinator
-        # — which routes no slash commands — gets recreate-or-adjust wording.
-        context_is_primary = serving_context is None or alias == (self._model_alias or "")
-        if context_is_primary and (
-            self._registry_alias_removed
-            or (
-                self._rebind_failed_key is not None
-                and self._rebind_failed_key[0] == self._model_alias
-            )
-        ):
-            available = ""
-            if self._registry is not None and self._registry.count:
-                available = f" Available: {', '.join(self._registry.list_aliases())}"
-            if self._kind == WorkstreamKind.COORDINATOR:
-                remedy = "Recreate the alias or adjust the workstream model."
-            else:
-                remedy = "Switch to another model with /model <alias>."
-            if self._registry_alias_removed:
-                return (
-                    f"The model '{self._registry_alias_removed}' this session "
-                    f"was using has been removed from the registry, and no "
-                    f"fallback model could carry the turn. {remedy}"
-                    f"{available}{raw_tail}"
-                )
-            cause = self._rebind_failed_cause or "client construction failed"
-            return (
-                f"The model '{self._model_alias}' is in the registry but its "
-                f"client could not be rebuilt after a registry change: {cause}. "
-                f"The previous binding then failed to carry the turn. {remedy}"
-                f"{available}{raw_tail}"
-            )
-
         try:
             status_code = getattr(exc, "status_code", None)
         except Exception:
@@ -9483,7 +9841,11 @@ class ChatSession:
         :meth:`_clean_incoming_text`, since its result is saved as an assistant
         turn.  Extraction leaves it out: its answer becomes a tool result, which
         the output guard reads as it came and the fold cleans on the wire.
+
+        A held session refuses here (:meth:`_raise_if_held`): every caller
+        runs on the session's own lane, a stand-in while held.
         """
+        self._raise_if_held()
         lane = lane or self._primary_lane()
         effective_principal_id = (
             (self._mcp_effective_user_id or "").strip()
@@ -9758,23 +10120,7 @@ class ChatSession:
             return None
         return self._health_registry.get_tracker_for_alias(self._registry, self._model_alias)
 
-    def _build_main_lane(
-        self,
-        lane: ModelLane,
-    ) -> ModelLane:
-        """Apply this workstream's sampling knobs to a resolved binding lane.
-
-        The session's OWN sampling knobs override the lane's
-        operator-resolved rungs: a resumed workstream with unset knobs must
-        keep OMITTING them rather than picking up per-alias config.
-        """
-        return dataclasses.replace(
-            lane,
-            temperature=self.temperature,
-            reasoning_effort=self.reasoning_effort or None,
-        )
-
-    def _model_turn_with_fallback(
+    def _primary_model_turn(
         self,
         consumer: _StreamTurnConsumer,
         prepare_wire: Callable[[list[dict[str, Any]], ModelLane], list[dict[str, Any]]],
@@ -9782,16 +10128,23 @@ class ChatSession:
         *,
         principal_id: str | None = None,
     ) -> ModelTurnResult:
-        """Run one plant call with lane-swap fallback: one ``model_turn``
-        ladder per lane.
+        """Run one plant call on the session's own lane: one ``model_turn`` ladder.
 
         Success records at stream admission (the consumer's ``on_stream_armed``
-        hook); creation-ladder exhaustion records failure HERE, once per lane.
-        An ARMED death records neither: it re-raises to the visible-stream
-        owner in ``_stream_response`` instead of streaming another alias over
-        displayed content. An accepted response that shared recovery rejected
-        (an empty completion) is that owner's business too, never the walk's.
+        hook); creation-ladder exhaustion records failure HERE, on the tracker
+        of the lane its last attempt dialed (a retry may have moved to a rebound
+        lane). An ARMED death records neither: it re-raises to the
+        visible-stream owner in ``_stream_response``. An accepted response that
+        shared recovery rejected (an empty completion) is that owner's business
+        too.
+
+        Each round refreshes the binding first (two compares when nothing
+        changed): a reload between the rounds of one send may have removed the
+        model, which then holds and refuses here, or retired its client, which
+        then rebinds instead of failing (#1359).
         """
+        self._refresh_model_from_registry()
+        self._raise_if_held()
         tracker = self._get_health_tracker()
         primary_lane = self._primary_lane()
         try:
@@ -9804,136 +10157,19 @@ class ChatSession:
                 principal_id=principal_id,
             )
         except (BackendAuthUnavailableError, ModelTurnLocalError, CompletionRecoveryError):
-            # Authentication and local faults stop here; accepted responses
-            # belong to shared recovery.
+            # Authentication and local faults are no backend's health; accepted
+            # responses belong to shared recovery.
             raise
-        except Exception as primary_err:
-            if consumer.attempt_armed:
-                # Mid-stream death: the re-issue ladder owns it (UI finalize,
-                # backoff, discard, full re-create) — not the fallback walk.
-                raise
-            # A wire-preparation fault is the session's data, never backend
-            # health — but it DOES enter the walk: prepare runs per lane
-            # (fold posture follows lane.capabilities), so another lane's
-            # posture may serve a turn the primary's could not.
-            if tracker and _speaks_for_backend(primary_err):
+        except Exception as err:
+            # A mid-stream death belongs to the re-issue ladder, and a
+            # wire-preparation fault is the session's data, never backend health.
+            # The failure is the last attempt's lane's, whose tracker the
+            # consumer holds.
+            dialed = consumer.tracker
+            if not consumer.attempt_armed and dialed and _speaks_for_backend(err):
                 with local_model_call("backend health"):
-                    tracker.record_failure()
-            if not self._registry or not self._registry.fallback:
-                raise
-            # Try each fallback model: healthy backends first, degraded ones as
-            # a last resort, configured order within each tier.
-            candidates: list[tuple[str, bool]] = []
-            for alias in self._registry.fallback:
-                if alias == self._model_alias:
-                    continue
-                degraded = False
-                if self._health_registry:
-                    fb_tracker = self._health_registry.get_tracker_for_alias(self._registry, alias)
-                    degraded = bool(fb_tracker and fb_tracker.is_degraded)
-                candidates.append((alias, degraded))
-            for alias, degraded in sorted(candidates, key=lambda candidate: candidate[1]):
-                if degraded:
-                    self._publish_fallback_notice(
-                        my_generation, f"[Fallback {alias} is degraded, trying anyway]"
-                    )
-                result = self._try_fallback_lane(
-                    alias,
-                    consumer,
-                    prepare_wire,
-                    my_generation,
-                    principal_id=principal_id,
-                )
-                if result is not None:
-                    return result
-            raise primary_err
-
-    def _publish_fallback_notice(self, my_generation: int, message: str) -> None:
-        """Publish one fallback-walk notice, or stop the walk for a superseded owner."""
-        with local_model_call("fallback publication"):
-            published = self._publish_for_generation(
-                my_generation,
-                functools.partial(self.ui.on_info, message),
-                allow_cancelled=False,
-            )
-        if not published:
-            raise GenerationCancelled() from None
-
-    def _try_fallback_lane(
-        self,
-        alias: str,
-        consumer: _StreamTurnConsumer,
-        prepare_wire: Callable[[list[dict[str, Any]], ModelLane], list[dict[str, Any]]],
-        my_generation: int,
-        *,
-        principal_id: str | None = None,
-    ) -> ModelTurnResult | None:
-        """Attempt a single fallback lane.  Returns the result or ``None``.
-
-        Records failure on the fallback's health tracker (success records via the armed
-        hook) so health ordering learns across requests. An ARMED death re-raises rather
-        than returning ``None``: its tokens may be on screen, and the next alias must not
-        stream over them.
-
-        Caller must ensure ``self._registry`` is not ``None``.
-        """
-        registry = self._registry
-        if registry is None:
-            raise RuntimeError("fallback lane resolution requires a model registry")
-        fb_tracker = (
-            self._health_registry.get_tracker_for_alias(registry, alias)
-            if self._health_registry
-            else None
-        )
-        try:
-            backend_auth_resolver = (
-                self._model_backend_auth_resolver_for_principal(principal_id)
-                if principal_id is not None
-                else self._model_backend_auth_token
-            )
-            binding = resolve_model_binding(
-                registry,
-                alias,
-                config_store=self._config_store,
-                backend_auth_resolver=backend_auth_resolver,
-            )
-            fb_lane = self._build_main_lane(binding.lane)
-            self._publish_fallback_notice(
-                my_generation, f"[Primary model failed, falling back to {alias}]"
-            )
-            return self._model_turn_with_retry(
-                fb_lane,
-                fb_tracker,
-                consumer,
-                prepare_wire,
-                my_generation,
-                principal_id=principal_id,
-            )
-        except (BackendAuthUnavailableError, ModelTurnLocalError, CompletionRecoveryError):
-            # Local policy and accepted responses are never another lane's business.
+                    dialed.record_failure()
             raise
-        except Exception as fb_err:
-            if consumer.attempt_armed:
-                raise
-            # This lane's wire-preparation fault is not its health signal,
-            # and it must not abort the walk: prepare is lane-variant, so
-            # the next alias may still serve the turn.
-            if fb_tracker and _speaks_for_backend(fb_err):
-                with local_model_call("backend health"):
-                    fb_tracker.record_failure()
-            # Class name only in the UI line: a ConnectError's text can
-            # carry a credential-bearing base_url, and this string lands in
-            # the browser transcript and the persisted event stream.
-            log.warning(
-                "fallback.failed",
-                alias=alias,
-                error_type=type(fb_err).__name__,
-            )
-            log.debug("fallback failure detail", exc_info=True)
-            self._publish_fallback_notice(
-                my_generation, f"[Fallback {alias} also failed: {type(fb_err).__name__}]"
-            )
-            return None
 
     def _stop_retrying(
         self,
@@ -9959,7 +10195,7 @@ class ChatSession:
         *,
         principal_id: str | None = None,
     ) -> ModelTurnResult:
-        """One lane's creation ladder around ``model_turn``.
+        """The creation ladder around ``model_turn`` on the session's own lane.
 
         Per-attempt state is a FRESH generation-scoped ``_CancelRef`` whose
         ``on_first_append`` hook marks the request-accepted instant, which
@@ -9971,30 +10207,49 @@ class ChatSession:
         Generation-scoping makes an orphan's ref read ``aborted`` via
         supersession, so ``model_turn`` refuses dispatch for it.
 
-        Sampling knobs ride the lane (see ``_build_main_lane``); the
+        Sampling knobs ride the lane (see ``_primary_lane``); the
         credential resolves INSIDE ``model_turn`` per attempt, after its
         entry abort read, so a Stop set before the turn mints no token on
         a dynamically authenticated alias (#972).
+
+        A reload during a retry's backoff may retire the lane's client, and a
+        retry on it would only fail again, so each retry refreshes the binding
+        first: it refuses if the model is now held, and moves to the rebound
+        lane, with that lane's health tracker, when the reload rebound it
+        (#1359).
         """
         if principal_id is not None:
             lane = self._lane_for_backend_auth_principal(lane, principal_id)
-        # Wire preparation, attachment materialization, and tool-output budget
-        # helpers all read the session estimator.  Activate the exact lane
-        # before any of them can run.
-        self._activate_token_calibration(lane)
-        diagnostics = lane_diagnostics(lane)
-        safe_url = diagnostics.base_url.split("?")[0]  # query params may contain keys
-        caps = require_lane_capabilities(lane)
-        lane_budget = self._utility_budget_snapshot(lane)
-        log.debug(
-            "API call: provider=%s model=%s base_url=%s",
-            diagnostics.provider_type,
-            diagnostics.model,
-            safe_url,
-        )
+        ladder_binding_lane = self._model_binding.lane
+        prepared_lane: ModelLane | None = None
         last_err: Exception | None = None
         for attempt in range(self._MAX_RETRIES + 1):
             self._check_cancelled(my_generation)
+            if attempt:
+                self._refresh_model_from_registry()
+                self._raise_if_held()
+                if self._model_binding.lane is not ladder_binding_lane:
+                    ladder_binding_lane = self._model_binding.lane
+                    lane = self._primary_lane()
+                    if principal_id is not None:
+                        lane = self._lane_for_backend_auth_principal(lane, principal_id)
+                    tracker = self._get_health_tracker()
+            if lane is not prepared_lane:
+                prepared_lane = lane
+                # Wire preparation, attachment materialization, and tool-output
+                # budget helpers all read the session estimator.  Activate the
+                # exact lane before any of them can run.
+                self._activate_token_calibration(lane)
+                diagnostics = lane_diagnostics(lane)
+                safe_url = diagnostics.base_url.split("?")[0]  # query params may contain keys
+                caps = require_lane_capabilities(lane)
+                lane_budget = self._utility_budget_snapshot(lane)
+                log.debug(
+                    "session.api_call",
+                    provider=diagnostics.provider_type,
+                    model=diagnostics.model,
+                    base_url=safe_url,
+                )
             ref = _CancelRef(self, my_generation, on_first_append=consumer.on_stream_armed)
             # Attachment fallbacks can make their own model call (perception)
             # while the primary request is still being prepared.  Give that
@@ -12629,8 +12884,14 @@ class ChatSession:
 
             # Title work is generation-free auxiliary work, but launch it only
             # after the opening rows are durable.  Otherwise a fast title update
-            # can overtake a blocked user-row insert.
-            if not self._title_generated and user_input.strip() and not from_wake:
+            # can overtake a blocked user-row insert.  A held session refuses
+            # this send, and would refuse the title's model call too.
+            if (
+                not self._title_generated
+                and user_input.strip()
+                and not from_wake
+                and self._held_model is None
+            ):
                 self._title_generated = True
                 title_messages = tuple(self.messages)
 
@@ -12723,14 +12984,13 @@ class ChatSession:
             if turn_principal_id:
                 self._bind_acting_user_for_generation(turn_principal_id, my_generation)
             self._check_generation_admission(my_generation)
-            # A dead binding diagnosed by the refresh does NOT fail fast here:
-            # the send proceeds so the fallback chain can carry the turn, and
-            # ``_format_backend_error`` surfaces the latched cause if it cannot.
+            # Rebinds a model that changed or loaded again, and holds the
+            # session when its model isn't loaded (#1359); the hold refuses
+            # below, once the user's message is recorded for /retry.
             self._refresh_model_from_registry()
             self._check_generation_admission(my_generation)
             # Context checks and the user-row estimate below must use the primary
-            # binding's tokenizer even when the preceding accepted turn came from
-            # a fallback lane.
+            # binding's tokenizer, which the refresh above may have just rebound.
             self._activate_token_calibration(self._primary_lane())
             self._check_generation_admission(my_generation)
             # A force successor may claim while its predecessor's accepted
@@ -12763,6 +13023,10 @@ class ChatSession:
             # the live generation's history.  A stale thread raises here and the
             # except-GenerationCancelled handler returns without touching state.
             self._check_cancelled(my_generation)
+            # A held session's model isn't loaded: refuse before any model call,
+            # the pre-send compaction's included. The message stays recorded, so
+            # /retry re-sends it once the model loads again or the user switches.
+            self._raise_if_held()
 
             # Proactive pre-send compaction (Layer A): a rehydrated resume — or a
             # session that never compacted under a larger-window model before a
@@ -12984,8 +13248,8 @@ class ChatSession:
                         deferred_persistence=durable,
                     )
                     # The canonical Turn: minted tool ids, finalized native
-                    # lane, and the SERVING lane's producer, so a
-                    # fallback-served turn is not labeled with the primary's.
+                    # lane, and the SERVING lane's producer, so a turn served
+                    # before a rebind is not labeled with the new binding's.
                     accepted_tool_call_ids = tuple(
                         call.id for call in completed_result.turn.tool_calls if call.id
                     )
@@ -13149,11 +13413,6 @@ class ChatSession:
                     allow_cancelled=True,
                 ):
                     return
-                # Fallback B produced the accepted result, but every new
-                # agentic round starts at primary A.  Restore A's estimator
-                # before tool-result admission or end-of-turn compaction reads
-                # the remaining budget.
-                self._activate_token_calibration(self._primary_lane())
                 stopped_to_compact = stopped_to_compact_out[0] if stopped_to_compact_out else False
 
                 if not tool_calls:
@@ -14767,13 +15026,11 @@ class ChatSession:
     def _stream_response(self, my_generation: int = 0) -> ModelTurnResult:
         """Run one resilient streaming turn: sample, surface, re-issue on death.
 
-        The plant call is ONE ``model_turn`` invocation per attempt
-        (creation + drain fused), reached through the lane-swap fallback
-        walk; chunk→UI translation lives in the frame's
-        :class:`_StreamTurnConsumer`, handed over as ``on_chunk``.  Wire
-        preparation is the ``prepare_wire`` closure, so a mid-retry
-        registry rebind needs no explicit re-prepare: the next attempt
-        re-runs the closure against the refreshed binding.
+        The plant call is ONE ``model_turn`` invocation per attempt (creation + drain fused),
+        reached through :meth:`_primary_model_turn`; chunk→UI translation lives in the frame's
+        :class:`_StreamTurnConsumer`, handed over as ``on_chunk``.  Wire preparation is the
+        ``prepare_wire`` closure, so a mid-retry registry rebind needs no explicit re-prepare: the
+        next attempt re-runs the closure against the refreshed binding.
 
         A wire death DURING body iteration surfaces after the request was
         accepted (the attempt's ``_CancelRef`` armed), so neither the SDK's
@@ -14786,9 +15043,8 @@ class ChatSession:
         Empty ordinary stops share that allowance with stream deaths. Both
         require an accepted request known to disable native tools. A JSON
         error body rejected before any stream exists is a creation failure
-        and belongs to the lane's creation ladder and fallback walk. Each
-        reissue retains that walk; it cannot reset the accepted-attempt
-        allowance.
+        and belongs to the lane's creation ladder. Each reissue retains that
+        ladder; it cannot reset the accepted-attempt allowance.
         """
         # Reject an orphan before any provider-bound work. Prefix refresh and
         # first-index capture run at the request-admission boundary below, after
@@ -14813,13 +15069,11 @@ class ChatSession:
         debug_printed = False
 
         def _prepare(lowered: list[dict[str, Any]], lane: ModelLane) -> list[dict[str, Any]]:
-            """The main loop's ``prepare_wire``: system prepend + the
-            session lowering passes, plus the debug request dump behind a
-            once-per-invocation latch, so re-issues and fallback lanes
-            re-run the passes but not the dump.  send()'s overflow
-            recovery calls ``_stream_response`` again and prints again —
-            post-compaction the wire CHANGED, and the re-prepared dump is
-            the one that diagnoses the recovery (a named #832 delta)."""
+            """The main loop's ``prepare_wire``: system prepend + the session lowering passes, plus
+            the debug request dump behind a once-per-invocation latch, so re-issues re-run the
+            passes but not the dump.  send()'s overflow recovery calls ``_stream_response`` again
+            and prints again — post-compaction the wire CHANGED, and the re-prepared dump is the one
+            that diagnoses the recovery (a named #832 delta)."""
             nonlocal debug_printed
             caps = require_lane_capabilities(lane)
             prefix = self._system_messages_for_lane(caps)
@@ -14856,7 +15110,7 @@ class ChatSession:
                     and not dead_partial
                 ):
                     # Nothing ever streamed this send: a Stop in the
-                    # creation/walk window with no prior armed death.  A turn
+                    # creation window with no prior armed death.  A turn
                     # that never streamed writes no assistant row — a
                     # marker-only row would replay to the model as context on
                     # every later turn.  (An ARMED zero-token Stop still
@@ -14887,7 +15141,7 @@ class ChatSession:
         with self._recovered_serving_failures() as recovered_failures:
             while True:
                 try:
-                    result = self._model_turn_with_fallback(
+                    result = self._primary_model_turn(
                         consumer,
                         _prepare,
                         my_generation,
@@ -15025,8 +15279,8 @@ class ChatSession:
                             self._publish_for_generation(my_generation, _discard_failed_stream)
                             raise
                     if not armed:
-                        # Creation-phase failure: the walk already ran its full
-                        # ladder + fallbacks.  Mid re-issue it must not MASK
+                        # Creation-phase failure: the lane already ran its full
+                        # creation ladder.  Mid re-issue it must not MASK
                         # the original stream death (a closed-client re-create
                         # raises RuntimeError and would replace the
                         # operator-actionable wording). An empty completion
@@ -15175,11 +15429,12 @@ class ChatSession:
                             self._cancel_stream = None  # drop the dead SDK handle
                         # A concurrent ModelRegistry.reload() closes cached
                         # clients whose connection config changed — the
-                        # in-flight read then dies with a ReadError and
-                        # the old lane's client is CLOSED. Generation-gated (two compares
-                        # when nothing changed); the next attempt's
+                        # in-flight read then dies with a ReadError and the old
+                        # lane's client is CLOSED. Generation-gated (two
+                        # compares when nothing changed); the next round
+                        # refreshes again at its top (#1359), and its
                         # ``prepare_wire`` closure re-prepares against whatever
-                        # binding the walk resolves.
+                        # binding the refreshes leave.
                         self._refresh_model_from_registry()
                     except GenerationCancelled:
                         # A Stop landing in the backoff window aborts the turn
@@ -28942,11 +29197,13 @@ class ChatSession:
                 info = f"Model: {cyan(self.model)}"
                 if self._model_alias:
                     info += f" ({self._model_alias})"
+                held = self._held_model
+                if held is not None:
+                    # The refusal's own text, so /model and a refused turn agree.
+                    info += f"\n{self._model_not_loaded_error(held[0])}"
                 if self._registry and self._registry.count > 1:
                     avail = ", ".join(self._registry.list_aliases())
                     info += f"\nAvailable: {avail}"
-                    if self._registry.fallback:
-                        info += f"\nFallback: {', '.join(self._registry.fallback)}"
                     if self._registry.agent_model:
                         info += f"\nAgent model: {self._registry.agent_model}"
                 self.ui.on_info(info)
@@ -28959,45 +29216,11 @@ class ChatSession:
                 # while listing it as available.
                 cfg = None
                 construction_error: str | None = None
-                if self._registry:
-                    try:
-                        switch_bind = self._bind_model_from_registry(arg)
-                        cfg = switch_bind[0] if switch_bind is not None else None
-                    except ModelClientConstructionError as exc:
-                        construction_error = str(exc)
+                try:
+                    cfg = self._switch_model(arg, principal_id=command_principal)
+                except ModelClientConstructionError as exc:
+                    construction_error = str(exc)
                 if cfg is not None:
-                    self.context_window = cfg.context_window
-                    if not self._manual_tool_truncation:
-                        self.tool_truncation = _auto_tool_truncation_chars(
-                            cfg.context_window, self._chars_per_token
-                        )
-                    # Re-resolve the sampling knobs for the new alias through
-                    # the SAME shared resolvers session_factory uses, so
-                    # switching away from a model with overrides doesn't leak
-                    # them and every surface samples identically on the same
-                    # alias.  Unset resolves to None (wire omission),
-                    # replacing any prior model's value.  STORE-LESS sessions
-                    # (the CLI) are the exception: there the current knobs
-                    # ARE the user's explicit flags (--temperature / /reason)
-                    # — the only authority that exists — so the switch keeps
-                    # them unless the new alias declares its own (mirrors the
-                    # max_tokens fallback below).
-                    cs = self._config_store
-                    if cs:
-                        self.temperature = resolve_temperature_setting(cfg, cs)
-                        self.reasoning_effort = resolve_effort_setting(cfg, cs)
-                    else:
-                        if cfg.temperature is not None:
-                            self.temperature = cfg.temperature
-                        if cfg.reasoning_effort:
-                            self.reasoning_effort = cfg.reasoning_effort
-                    self.max_tokens = (
-                        cfg.max_tokens
-                        if cfg.max_tokens is not None
-                        else (cs.get("model.max_tokens") if cs else self.max_tokens)
-                    )
-                    self._init_system_messages(principal_id=command_principal)
-                    self._activate_token_calibration(self._primary_lane())
                     self._save_config()
                     self.ui.on_info(f"Switched to {cyan(arg)}: {self.model}")
                 elif construction_error is not None:

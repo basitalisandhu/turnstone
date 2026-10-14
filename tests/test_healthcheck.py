@@ -41,7 +41,6 @@ class TestBackendHealthTracker:
     def test_starts_healthy(self) -> None:
         t = _make_tracker()
         assert t.is_healthy is True
-        assert t.is_degraded is False
         assert t.consecutive_failures == 0
 
     def test_failures_below_threshold(self, mock_metrics: MagicMock) -> None:
@@ -56,21 +55,20 @@ class TestBackendHealthTracker:
         t = _make_tracker(failure_threshold=3)
         for _ in range(3):
             t.record_failure()
-        assert t.is_degraded is True
         assert t.is_healthy is False
 
     def test_stays_degraded_on_more_failures(self, mock_metrics: MagicMock) -> None:
         t = _make_tracker(failure_threshold=2)
         for _ in range(5):
             t.record_failure()
-        assert t.is_degraded is True
+        assert t.is_healthy is False
         assert t.consecutive_failures == 5
 
     def test_success_clears_degraded(self, mock_metrics: MagicMock) -> None:
         t = _make_tracker(failure_threshold=2)
         t.record_failure()
         t.record_failure()
-        assert t.is_degraded is True
+        assert t.is_healthy is False
         t.record_success()
         assert t.is_healthy is True
         assert t.consecutive_failures == 0
@@ -163,7 +161,7 @@ class TestHealthTrackerRegistry:
         # Degrade the cloud tracker
         t_cloud.record_failure()
         t_cloud.record_failure()
-        assert t_cloud.is_degraded is True
+        assert t_cloud.is_healthy is False
         # Local should be unaffected
         assert t_local.is_healthy is True
 
