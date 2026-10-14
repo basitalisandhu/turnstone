@@ -19,9 +19,15 @@ RUN rm -f /etc/dpkg/dpkg.cfg.d/docker
 # bundles, training-data JSONL with multi-MB single records) can't OOM us.
 # ffmpeg transcodes omni STT uploads (browser webm/opus) to the 16 kHz mono
 # WAV the omni chat-audio lane decodes. tini is the container's PID 1 (see
-# ENTRYPOINT).
+# ENTRYPOINT). The version check refuses a curl or libcurl (curl's own, and
+# git's) older than trixie-security's 8.14.1-2+deb13u7, which fixes
+# CVE-2026-92392; any newer build passes.
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     libpq5 git curl jq man-db manpages procps file ripgrep ffmpeg tini \
+    && for p in curl libcurl4t64 libcurl3t64-gnutls; do \
+         dpkg --compare-versions "$(dpkg-query -W -f='${Version}' "$p")" ge 8.14.1-2+deb13u7 \
+           || { echo "$p is older than 8.14.1-2+deb13u7" >&2; exit 1; }; \
+       done \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js LTS (for npx-based MCP servers like @modelcontextprotocol/server-github)
