@@ -256,3 +256,14 @@ class TestClassifyUpload:
         kind, _mime, rej = classify_upload("big.png", "image/png", big)
         assert kind is None
         assert rej is not None and rej.code == "too_large" and rej.status == 413
+
+    def test_jpeg_with_too_many_scans_rejected(self) -> None:
+        # Each scan costs a decode pass over the whole picture, every time a
+        # thumbnail or a model request decodes it.
+        from tests._jpeg_helpers import jpeg_with_scans
+
+        assert classify_upload("ok.jpg", "image/jpeg", jpeg_with_scans(0))[0] == "image"
+        kind, _mime, rej = classify_upload("slow.jpg", "image/jpeg", jpeg_with_scans(150))
+        assert kind is None
+        assert rej is not None and (rej.code, rej.status) == ("unsupported", 400)
+        assert "more than 100 passes" in rej.message

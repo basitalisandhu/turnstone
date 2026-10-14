@@ -531,6 +531,26 @@ frozen.
 
 ### Fixed
 
+- **A JPEG saved in an extreme number of passes no longer ties up a CPU.** A progressive JPEG
+  decodes in passes (scans), each costing a pass over the whole picture, and a small file can
+  hold thousands. Chat attachment uploads now refuse a JPEG with more than 100 scans, and
+  thumbnails and the orientation fix applied to images sent to the model skip one already
+  stored; real encoders write about 10.
+- **A rotated photo with unusual EXIF gets an upright thumbnail and reaches the model upright.**
+  Turning a picture by its EXIF orientation also rewrote the rest of its EXIF, which failed when
+  another entry was stored in an unexpected type: the photo got no thumbnail and was sent to the
+  model sideways. Thumbnails and images sent to the model now read the orientation tag directly.
+- **Pictures in a conversation are no longer decoded again on every turn.** Each send rebuilds the
+  request from the stored pictures: every PNG without EXIF before its pixels was decoded to look for
+  an orientation tag after them, and every rotated photo was decoded, turned and re-encoded, tens of
+  milliseconds per picture on every turn. The server now keeps each picture's result.
+- **Creating a session with several attachments says which file it refused.** The create stops at
+  the first file it can't take, and the error didn't say which one; it now starts with that file's
+  name.
+- **Thumbnails of large photos take a fraction of the time and memory.** A JPEG now decodes at the
+  smallest scale that still covers its thumbnail, so a 12-megapixel photo takes about 30 ms and
+  1.5 MB instead of 60 ms and 95 MB, which adds up when a new session's ten photos all ask for
+  theirs at once.
 - **A host that can't run the PDF worker says so.** On macOS, which refuses a finite address-space
   limit, on any host whose sandbox blocks `setrlimit`, and on a host where the worker's temporary
   directory can't be created or the worker can't start, every PDF that needed local processing was
