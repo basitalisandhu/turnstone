@@ -785,6 +785,7 @@ SHELL_TEMPLATE = """<!doctype html>
       window.TS_APP = {
         boot() {},
         getClusterState() { return { nodes: {} }; },
+        bucketByParent() { return { roots: [], orphans: [], childrenMap: {} }; },
         onRender() {},
       };
       window.TS_ADMIN = {};
@@ -915,6 +916,7 @@ PROXYBRAND_FRAME_TEMPLATE = """<!doctype html>
       window.TS_APP = {
         boot() {},
         getClusterState() { return { nodes: {} }; },
+        bucketByParent() { return { roots: [], orphans: [], childrenMap: {} }; },
         onRender() {},
       };
       window.TS_ADMIN = {};
