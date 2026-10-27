@@ -20,6 +20,16 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   servers that predate the 2026-07-28 revision do, failed to connect with "The
   connection closed before the server answered". The connection now falls back
   to the `initialize` handshake, as it does for other refusals.
+- **A speech model's `max_concurrency` now applies to dictation and read-aloud
+  (#1485).** Speech-to-text and text-to-speech called the model directly, so a
+  limit set on a speech model was never enforced. Dictation now waits up to 15
+  seconds for a free slot, on four threads per node of its own, and read-aloud
+  takes one only if it is free at once, in addition to the node's limit of two
+  clips. When no slot comes free in time the node answers 429 with
+  `Retry-After`, which the browser retries. On a direct connection, a dictation
+  whose browser leaves stops waiting for a slot. Transcribing an audio
+  attachment for a chat model that can't take audio waits for a slot like any
+  model call.
 
 ## [2026-10-26]
 

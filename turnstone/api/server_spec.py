@@ -496,9 +496,11 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "Transcribe a short audio clip (multipart/form-data, field 'audio') "
         "using the configured STT model role.  Returns the transcript for the "
         "client to place into the composer; this endpoint never sends on the "
-        "user's behalf.  Returns 503 when no STT role is configured.",
+        "user's behalf.  Returns 429 with Retry-After when the node has no free "
+        "dictation thread, or the STT model no free max_concurrency slot, within "
+        "15 seconds; 503 when no STT role is configured.",
         response_model=SpeechToTextResponse,
-        error_codes=[400, 403, 404, 413, 502, 503],
+        error_codes=[400, 403, 404, 413, 429, 502, 503],
         tags=["Attachments"],
     ),
     EndpointSpec(
@@ -506,8 +508,9 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "POST",
         "Synthesize text to speech audio for browser playback using the "
         "configured TTS model role.  Returns audio bytes; 429 with Retry-After "
-        "when the node is already synthesizing as many clips as it runs at once; "
-        "503 when no TTS role is configured.",
+        "when the node is already synthesizing as many clips as it runs at once, "
+        "or the TTS model has no free max_concurrency slot; 503 when no TTS role "
+        "is configured.",
         request_model=TextToSpeechRequest,
         error_codes=[400, 429, 502, 503],
         tags=["Chat"],

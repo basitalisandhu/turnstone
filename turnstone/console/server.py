@@ -304,8 +304,9 @@ _GENERATED_WS_ID_COLLISION_RETRY_CAP = 3
 # the mTLS re-create).  Node endpoints that answer degraded-but-in-time
 # responses size their backstops strictly UNDER this bound — e.g. the
 # quick-command ``running`` answer (turnstone/core/session_routes.py
-# _COMMAND_RESPONSE_BACKSTOP_S); a test pins the inequality.  The SSE
-# proxy client's granular Timeout is a separate contract.
+# _COMMAND_RESPONSE_BACKSTOP_S) and a dictation's wait for its model's
+# admission slot (turnstone/server.py _STT_ADMISSION_WAIT_S); tests pin
+# both.  The SSE proxy client's granular Timeout is a separate contract.
 _PROXY_CLIENT_TIMEOUT_S = 30
 
 # How long the console waits for a node's ``tts`` answer, and only for that

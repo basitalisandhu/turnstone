@@ -5,14 +5,14 @@ from __future__ import annotations
 import threading
 import time
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    import pytest
+import pytest
 
 import turnstone.core.admission as admission_mod
+from tests._helpers import slot_held
 from tests._oidc_test_helpers import keyed_app_state
-from turnstone.core.admission import ModelAdmission
+from turnstone.core.admission import AdmissionTimeoutError, ModelAdmission
 from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
 from turnstone.core.model_registry import ModelConfig, ModelRegistry
 
@@ -125,6 +125,98 @@ def test_cancelled_waiter_is_removed_and_never_admitted() -> None:
     assert isinstance(errors[0], DeadlineCancelledError)
     assert gate.snapshot().queued == 0
     holder.release()
+    assert gate.snapshot().in_flight == 0
+
+
+def test_a_waiter_whose_timeout_runs_out_gives_up_its_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        admission_mod,
+        "log",
+        SimpleNamespace(
+            info=lambda event, **fields: events.append((event, fields)),
+            warning=lambda event, **fields: events.append((event, fields)),
+        ),
+    )
+    gate = ModelAdmission("primary", 1)
+
+    with slot_held(gate):
+        started = time.monotonic()
+        with pytest.raises(AdmissionTimeoutError):
+            gate.acquire(timeout=0.05)
+        assert time.monotonic() - started >= 0.05
+
+    assert gate.snapshot().queued == 0
+    assert [event for event, _ in events] == ["model.admission_timeout"]
+    assert events[0][1]["alias"] == "primary"
+    assert events[0][1]["in_flight"] == 1
+    gate.acquire(timeout=0).release()
+    assert gate.snapshot().in_flight == 0
+
+
+def test_a_waiter_with_a_timeout_is_admitted_when_a_slot_frees_in_time() -> None:
+    gate = ModelAdmission("primary", 1)
+    holder = gate.acquire()
+    admitted = threading.Event()
+
+    def _waiter() -> None:
+        with gate.acquire(timeout=2.0):
+            admitted.set()
+
+    thread = threading.Thread(target=_waiter, daemon=True)
+    thread.start()
+    _wait_until(lambda: gate.snapshot().queued == 1)
+    holder.release()
+
+    assert admitted.wait(1.0)
+    thread.join(1.0)
+    assert not thread.is_alive()
+    assert gate.snapshot().in_flight == 0
+
+
+def test_a_zero_timeout_never_waits_and_never_moves_ahead_of_the_queue() -> None:
+    gate = ModelAdmission("primary", 1)
+    holder = gate.acquire(timeout=0)  # a free slot is taken at once
+    # Give the slot back after 2 s at the latest, so a refusal that waits
+    # instead fails rather than hanging the run.
+    give_back = threading.Timer(2.0, holder.release)
+    give_back.start()
+    acquired = threading.Event()
+    release_waiter = threading.Event()
+
+    def _waiter() -> None:
+        with gate.acquire():
+            acquired.set()
+            release_waiter.wait(2.0)
+
+    thread = threading.Thread(target=_waiter, daemon=True)
+    thread.start()
+    try:
+        _wait_until(lambda: gate.snapshot().queued == 1)
+
+        with pytest.raises(AdmissionTimeoutError):
+            gate.acquire(timeout=0)
+        assert gate.snapshot().queued == 1  # the refusal took no place in the queue
+
+        give_back.cancel()
+        give_back.join()
+        # Free the slot while holding the gate's (reentrant) lock, so the queued
+        # waiter cannot wake and claim it first: the slot is free and the waiter
+        # still queued when the zero-timeout caller asks.
+        with gate._cv:
+            holder.release()
+            with pytest.raises(AdmissionTimeoutError):
+                gate.acquire(timeout=0)
+        assert acquired.wait(1.0)
+    finally:
+        give_back.cancel()
+        give_back.join()
+        holder.release()  # a no-op unless the test failed before releasing it
+        release_waiter.set()
+        thread.join(1.0)
+    assert not thread.is_alive()
     assert gate.snapshot().in_flight == 0
 
 

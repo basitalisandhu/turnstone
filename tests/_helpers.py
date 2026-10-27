@@ -3,12 +3,16 @@ not fixtures, and several test files want to import them directly."""
 
 from __future__ import annotations
 
+import contextlib
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
+
+    from turnstone.core.admission import AdmissionLease, ModelAdmission
 
 
 def opaque_png() -> bytes:
@@ -85,6 +89,24 @@ def wait_until(cond: Callable[[], bool], timeout: float = 5.0) -> None:
         # without re-looking makes the helper itself a flake source.
         return
     raise AssertionError("condition not met within timeout")
+
+
+@contextlib.contextmanager
+def slot_held(gate: ModelAdmission, *, at_most: float = 2.0) -> Iterator[AdmissionLease]:
+    """Hold one of an admission *gate*'s slots for the block, for *at_most* seconds at most.
+
+    A call under test that should be refused but waits for the slot instead gets it once the
+    time is up, and fails its assertion rather than hanging the run.
+    """
+    lease = gate.acquire()
+    give_back = threading.Timer(at_most, lease.release)
+    give_back.start()
+    try:
+        yield lease
+    finally:
+        give_back.cancel()
+        give_back.join()
+        lease.release()
 
 
 def make_chat_session(**overrides: Any) -> Any:

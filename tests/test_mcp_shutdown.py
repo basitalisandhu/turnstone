@@ -552,6 +552,7 @@ def test_node_shutdown_allows_revocation_to_finish_during_manager_drain(
             app.state.watch_runner = None
             app.state.registry = None
             app.state.tts = server._SpeechCapacity()
+            app.state.stt = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             entered, finished = threading.Event(), threading.Event()
             observed: list[bool] = []
 

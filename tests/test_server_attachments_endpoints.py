@@ -9,18 +9,23 @@ pending-list, GET /content, DELETE, auth isolation, and the extended
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import queue
 import threading
-from typing import Any
+import time
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, call
 
 import httpx2
 import pytest
 from starlette.testclient import TestClient
 
-from tests._helpers import opaque_png
+from tests._helpers import opaque_png, slot_held, wait_until
 from turnstone.core.audio import _TTS_BACKEND_TIMEOUT_S
 from turnstone.core.settings_registry import SETTINGS
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 # Magic-byte-valid 1x1 PNG
 PNG_1x1 = opaque_png()
@@ -1190,7 +1195,9 @@ def voice_app_client(tmp_path):
         yield client, mock_client
     finally:
         client.close()
-        app.state.tts.shutdown()  # the synthesis threads; the lifespan never ran
+        # The synthesis and dictation threads; the lifespan never ran.
+        app.state.tts.shutdown()
+        app.state.stt.shutdown(wait=True)
         reset_storage()
 
 
@@ -1279,6 +1286,46 @@ class TestSpeechToTextStream:
         assert mock_client.audio.transcriptions.with_streaming_response.create.called
 
 
+def _call_as_departing_caller(
+    app: Any, path: str, headers: dict[str, str], body: bytes
+) -> list[dict[str, Any]]:
+    """Call *app* as a client that sends *body* and then hangs up; return what it sent back.
+
+    A handler is not cancelled when its caller leaves, so only a raw ASGI call like this one
+    shows what the node's departure watcher does.
+    """
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 80),
+    }
+    body_sent = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal body_sent
+        if not body_sent:
+            body_sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}  # the caller has gone
+
+    messages: list[dict[str, Any]] = []
+
+    async def send(message: dict[str, Any]) -> None:
+        messages.append(message)
+
+    asyncio.run(app(scope, receive, send))
+    return messages
+
+
 class TestTextToSpeech:
     def test_a_caller_that_leaves_stops_the_synthesis_quietly(self, voice_app_client, monkeypatch):
         """A handler isn't cancelled when its caller leaves.  The watcher closes
@@ -1286,7 +1333,7 @@ class TestTextToSpeech:
         without raising: no 500, no error traceback, and its budget comes back."""
         import turnstone.server as srv
 
-        monkeypatch.setattr(srv, "_TTS_DISCONNECT_POLL_S", 0.01)
+        monkeypatch.setattr(srv, "_AUDIO_DISCONNECT_POLL_S", 0.01)
         client, mock_client = voice_app_client
         manager = mock_client.audio.speech.with_streaming_response.create.return_value
         closed = threading.Event()
@@ -1302,35 +1349,9 @@ class TestTextToSpeech:
         manager.__enter__.return_value.close.side_effect = closed.set
 
         headers = {**_auth("userA"), "Content-Type": "application/json"}
-        scope = {
-            "type": "http",
-            "asgi": {"version": "3.0"},
-            "http_version": "1.1",
-            "method": "POST",
-            "scheme": "http",
-            "path": "/v1/api/tts",
-            "raw_path": b"/v1/api/tts",
-            "query_string": b"",
-            "root_path": "",
-            "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
-            "client": ("127.0.0.1", 50000),
-            "server": ("testserver", 80),
-        }
-        body_sent = False
-
-        async def receive() -> dict[str, Any]:
-            nonlocal body_sent
-            if not body_sent:
-                body_sent = True
-                return {"type": "http.request", "body": b'{"text": "hello"}', "more_body": False}
-            return {"type": "http.disconnect"}  # the caller has gone
-
-        messages: list[dict[str, Any]] = []
-
-        async def send(message: dict[str, Any]) -> None:
-            messages.append(message)
-
-        asyncio.run(client.app(scope, receive, send))
+        messages = _call_as_departing_caller(
+            client.app, "/v1/api/tts", headers, b'{"text": "hello"}'
+        )
 
         assert closed.is_set()
         assert messages[0]["status"] == 499
@@ -1545,6 +1566,194 @@ class TestVoiceStreamLifecycle:
 
         assert abort_ref.aborted
         handle.close.assert_called()
+
+
+@contextlib.contextmanager
+def _voice_alias_full(client) -> Iterator[Any]:
+    """Hold the voice alias's only slot, as a call already running would, for 2 s at most."""
+    gate = client.app.state.registry.get_admission("voice")
+    gate.set_limit(1)
+    with slot_held(gate):
+        yield gate
+
+
+class TestVoiceAdmission:
+    """Voice calls take the voice alias's ``max_concurrency`` slots."""
+
+    @pytest.mark.parametrize("route", ["stt", "stt-stream"])
+    def test_a_dictation_that_gets_no_slot_in_time_is_told_the_node_is_busy(
+        self, voice_app_client, monkeypatch, route
+    ):
+        import turnstone.server as srv
+
+        # Long enough that the access check and parse fit, so the refusal comes from
+        # the gate rather than the wait for a thread; under the 2 s the slot is held.
+        monkeypatch.setattr(srv, "_STT_ADMISSION_WAIT_S", 0.5)
+        client, mock_client = voice_app_client
+        with _voice_alias_full(client) as gate:
+            resp = _voice_request(client, route, user_id="userA")
+
+        assert resp.status_code == 429
+        assert resp.headers["retry-after"] == "5"
+        assert "busy" in resp.json()["error"]
+        mock_client.audio.transcriptions.with_streaming_response.create.assert_not_called()
+        assert gate.snapshot().queued == 0
+
+    def test_a_play_that_finds_its_alias_full_is_refused_at_once(self, voice_app_client):
+        # Refused, not queued, as when the node's own synthesis threads are taken.
+        client, mock_client = voice_app_client
+        with _voice_alias_full(client) as gate:
+            resp = _voice_request(client, "tts", user_id="userA")
+
+        assert resp.status_code == 429
+        assert resp.headers["retry-after"] == "5"
+        assert "busy" in resp.json()["error"]
+        mock_client.audio.speech.with_streaming_response.create.assert_not_called()
+        assert gate.snapshot().queued == 0
+        assert client.app.state.tts.in_flight == 0
+
+    @pytest.mark.parametrize("path", ["speech-to-text", "speech-to-text/stream"])
+    def test_a_dictation_whose_caller_leaves_gives_up_its_place(
+        self, voice_app_client, monkeypatch, path
+    ):
+        """A handler isn't cancelled when its caller leaves.  The watcher aborts
+        the queued wait, so the dictation neither holds its place nor later
+        transcribes for nobody, and the handler answers quietly."""
+        import turnstone.server as srv
+
+        monkeypatch.setattr(srv, "_AUDIO_DISCONNECT_POLL_S", 0.01)
+        client, mock_client = voice_app_client
+        boundary = "voice-boundary"
+        body = (
+            (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="audio"; filename="speech.webm"\r\n'
+                "Content-Type: audio/webm\r\n\r\n"
+            ).encode()
+            + b"RIFFfake"
+            + f"\r\n--{boundary}--\r\n".encode()
+        )
+        headers = {
+            **_auth("userA"),
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        }
+        with _voice_alias_full(client) as gate:
+            messages = _call_as_departing_caller(
+                client.app, f"/v1/api/workstreams/ws-A/{path}", headers, body
+            )
+
+        assert messages[0]["status"] == 499
+        assert gate.snapshot().queued == 0
+        mock_client.audio.transcriptions.with_streaming_response.create.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("route", "call"), [("stt", "transcribe"), ("stt-stream", "transcribe_stream")]
+    )
+    def test_a_dictation_runs_on_its_own_threads_and_its_wait_counts_from_arrival(
+        self, voice_app_client, monkeypatch, route, call
+    ):
+        """A dictation never waits on the shared workers the heartbeat and access checks
+        need, keeps the request's log fields, and has its wait for a slot cut by the time
+        already spent since the request arrived."""
+        import turnstone.core.audio as audio_mod
+        import turnstone.server as srv
+        from turnstone.core.log import ctx_user_id
+
+        client, _ = voice_app_client
+        check = srv._require_ws_access
+
+        def _slow_check(*args: Any, **kwargs: Any) -> Any:
+            time.sleep(0.2)
+            return check(*args, **kwargs)
+
+        seen: dict[str, Any] = {}
+
+        def _transcription(**kwargs: Any) -> Any:
+            seen["thread"] = threading.current_thread().name
+            seen["user_id"] = ctx_user_id.get()
+            seen["wait"] = kwargs["admission_wait_s"]
+            if call == "transcribe":
+                return audio_mod.TranscriptionResult(
+                    transcript="hi", model_alias="voice", model="m"
+                )
+            return iter(["hi"])
+
+        monkeypatch.setattr(srv, "_require_ws_access", _slow_check)
+        monkeypatch.setattr(audio_mod, call, _transcription)
+        resp = _voice_request(client, route, user_id="userA")
+
+        assert resp.status_code == 200, resp.text
+        assert seen["thread"].startswith("stt")
+        assert seen["user_id"] == "userA"
+        assert seen["wait"] <= srv._STT_ADMISSION_WAIT_S - 0.2
+
+    def test_a_dictation_that_gets_no_thread_in_time_is_told_the_node_is_busy(
+        self, voice_app_client, monkeypatch
+    ):
+        """With every dictation thread held by a long transcription, the next dictation is
+        refused within its budget instead of queueing past the console's wait."""
+        import turnstone.server as srv
+
+        monkeypatch.setattr(srv, "_STT_ADMISSION_WAIT_S", 0.2)
+        client, mock_client = voice_app_client
+        release = threading.Event()
+        long_ones = [
+            client.app.state.stt.submit(release.wait, 5) for _ in range(srv._STT_MAX_THREADS)
+        ]
+        try:
+            wait_until(lambda: all(f.running() for f in long_ones))
+            resp = _voice_request(client, "stt", user_id="userA")
+        finally:
+            release.set()
+            for f in long_ones:
+                f.result(timeout=5)
+
+        assert resp.status_code == 429
+        assert resp.headers["retry-after"] == "5"
+        assert "busy" in resp.json()["error"]
+        mock_client.audio.transcriptions.with_streaming_response.create.assert_not_called()
+
+    def test_a_call_that_outlives_its_budget_reports_no_unhandled_error(self, monkeypatch):
+        """A dictation still in its call when the budget runs out is waited for, and its
+        failure surfaces through the handler only.  Cancelling a shield around it instead
+        makes asyncio report the failure as unhandled, with a traceback per refusal."""
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+
+        import turnstone.server as srv
+        from turnstone.core.audio import AudioBusyError
+
+        monkeypatch.setattr(srv, "_STT_ADMISSION_WAIT_S", 0.05)
+        threads = ThreadPoolExecutor(max_workers=1)
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(stt=threads)))
+        reported: list[dict[str, Any]] = []
+
+        def _outlives_the_budget(**_kwargs: Any) -> None:
+            time.sleep(0.2)
+            raise AudioBusyError("no free slot")
+
+        async def _dictate() -> None:
+            asyncio.get_running_loop().set_exception_handler(
+                lambda _loop, context: reported.append(context)
+            )
+            with pytest.raises(AudioBusyError):
+                await srv._run_dictation(request, time.monotonic(), _outlives_the_budget)
+            await asyncio.sleep(0.05)  # let any done-callback report land
+
+        try:
+            asyncio.run(_dictate())
+        finally:
+            threads.shutdown(wait=True)
+        assert reported == []
+
+    def test_dictation_wait_leaves_room_in_the_console_wait(self):
+        """A dictation waits for a slot for at most half of the console's wait
+        for a forwarded request, so the transcode and the transcription still fit
+        and a busy node answers 429 itself, before the console gives up on it."""
+        from turnstone.console.server import _PROXY_CLIENT_TIMEOUT_S
+        from turnstone.server import _STT_ADMISSION_WAIT_S
+
+        assert 0 < 2 * _STT_ADMISSION_WAIT_S <= _PROXY_CLIENT_TIMEOUT_S
 
 
 # ---------------------------------------------------------------------------

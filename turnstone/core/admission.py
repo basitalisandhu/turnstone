@@ -31,6 +31,10 @@ def _call_hook(target: Any, name: str) -> None:
             hook()
 
 
+class AdmissionTimeoutError(RuntimeError):
+    """No slot came free within the caller's ``timeout``."""
+
+
 @dataclass(frozen=True, slots=True)
 class AdmissionSnapshot:
     """Non-sensitive instantaneous state for logs and tests."""
@@ -124,8 +128,15 @@ class ModelAdmission:
     def _available(self) -> bool:
         return self._limit == 0 or self._in_flight < self._limit
 
-    def acquire(self, *, cancel_ref: Any = None) -> AdmissionLease:
-        """Wait FIFO for a slot, abandoning promptly when *cancel_ref* aborts."""
+    def acquire(self, *, cancel_ref: Any = None, timeout: float | None = None) -> AdmissionLease:
+        """Wait FIFO for a slot, abandoning promptly when *cancel_ref* aborts.
+
+        *timeout* is for a caller whose own caller stops waiting: ``None`` waits
+        until a slot frees, and a number of seconds gives up the place in the
+        queue and raises :class:`AdmissionTimeoutError` once that long has
+        passed.  ``0`` takes a free slot or refuses at once, and never moves
+        ahead of a queued waiter.
+        """
         if bool(getattr(cancel_ref, "aborted", False)):
             raise DeadlineCancelledError("cancel_ref aborted during model admission")
 
@@ -155,6 +166,23 @@ class ModelAdmission:
                         waiting = False
                         break
                     waited = time.monotonic() - started
+                    if timeout is not None and waited >= timeout:
+                        # No wakeup: this ticket is not at the head or no slot is
+                        # free, so its leaving lets no other waiter in.
+                        with contextlib.suppress(ValueError):
+                            self._waiters.remove(ticket)
+                        waiting = False
+                        log.info(
+                            "model.admission_timeout",
+                            alias=self.alias,
+                            limit=self._limit,
+                            in_flight=self._in_flight,
+                            queued=len(self._waiters),
+                            wait_seconds=round(waited, 3),
+                        )
+                        raise AdmissionTimeoutError(
+                            f"no {self.alias!r} admission slot within {timeout:g} s"
+                        )
                     if not warned and waited >= _STALL_WARNING_SECONDS:
                         warned = True
                         log.warning(
@@ -165,7 +193,11 @@ class ModelAdmission:
                             queued=len(self._waiters),
                             wait_seconds=round(waited, 3),
                         )
-                    self._cv.wait(_CANCEL_POLL_SECONDS)
+                    self._cv.wait(
+                        _CANCEL_POLL_SECONDS
+                        if timeout is None
+                        else min(_CANCEL_POLL_SECONDS, timeout - waited)
+                    )
 
                 self._in_flight += 1
                 # When the limit is wider than one, let the new FIFO head claim

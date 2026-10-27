@@ -1,20 +1,21 @@
 """Speech-to-text and text-to-speech over the OpenAI audio wire protocol.
 
-STT/TTS are model *roles* (settings ``stt.model_alias`` / ``tts.model_alias``),
-resolved the same way as ``judge.model``.  A role resolves to a registry alias
-whose client is an OpenAI-SDK-compatible client (provider ``openai`` /
-``openai-compatible`` / ``google`` / ``xai``); the same ``client.audio.*`` calls
-then work against OpenAI, a local vLLM / vLLM-Omni server, or any compatible
-backend — selected purely by the alias's ``base_url``.  Anthropic models have no
-audio API, so they are capability-gated out of these roles (Claude stays valid
-as the agent model).
+STT/TTS are model *roles* (settings ``audio.stt_model_alias`` / ``audio.tts_model_alias``),
+resolved the same way as ``judge.model``.  A role resolves to a registry alias whose client is an
+OpenAI-SDK-compatible client (provider ``openai`` / ``openai-compatible`` / ``google`` / ``xai``);
+the same ``client.audio.*`` calls then work against OpenAI, a local vLLM / vLLM-Omni server, or
+any compatible backend — selected purely by the alias's ``base_url``.  Anthropic models have no
+audio API, so they are capability-gated out of these roles (Claude stays valid as the agent model).
 
-No local in-process models and no silent fallbacks: an unconfigured or failing
-backend is surfaced as a typed error the endpoint maps to 503 / 502.
+No local in-process models and no silent fallbacks: an unconfigured or failing backend is surfaced
+as a typed error the endpoint maps to 503 / 502.  Each backend call holds one of its alias's
+``max_concurrency`` slots, as every generation does; a call that gets no slot within the time
+its caller allows is refused with a typed error the endpoint maps to 429.
 """
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx2
 
+from turnstone.core.admission import AdmissionTimeoutError
 from turnstone.core.log import get_logger
 from turnstone.core.model_backend_auth import BackendAuthUnavailableError
 from turnstone.core.model_turn import (
@@ -34,9 +36,11 @@ from turnstone.core.providers._protocol import refuse_aborted_request
 from turnstone.core.server_compat import merge_server_compat
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping
+    from collections.abc import Callable, Generator, Iterator, Mapping
 
+    from turnstone.core.admission import AdmissionLease
     from turnstone.core.model_registry import ModelConfig
+    from turnstone.core.model_turn import ModelLane
 
 log = get_logger(__name__)
 
@@ -149,6 +153,92 @@ class AudioBackendError(RuntimeError):
     """A configured audio backend failed during execution (maps to 502)."""
 
 
+class AudioBusyError(RuntimeError):
+    """The role's alias had no free slot in the time the caller allows (maps to 429)."""
+
+
+def _admit(lane: ModelLane, *, cancel_ref: Any, wait_s: float | None) -> AdmissionLease | None:
+    """Take one of the alias's ``max_concurrency`` slots for a backend call.
+
+    It is the gate every generation on the alias takes in ``model_turn``, taken
+    at the same point: after local preparation such as the transcode, before the
+    credential is minted.  *wait_s* bounds the wait for a slot (``None`` waits
+    until one frees, ``0`` refuses at once) and :class:`AudioBusyError` reports a
+    wait that ran out; an abort of *cancel_ref* ends the wait with
+    ``DeadlineCancelledError``.
+    """
+    if lane.admission is None:
+        return None
+    try:
+        return lane.admission.acquire(cancel_ref=cancel_ref, timeout=wait_s)
+    except AdmissionTimeoutError as exc:
+        raise AudioBusyError(f"Audio model alias {lane.alias!r} has no free slot") from exc
+
+
+@contextlib.contextmanager
+def _admitted(lane: ModelLane, *, cancel_ref: Any, wait_s: float | None) -> Iterator[None]:
+    """Hold one of the alias's slots (see :func:`_admit`) for the block."""
+    lease = _admit(lane, cancel_ref=cancel_ref, wait_s=wait_s)
+    with lease if lease is not None else contextlib.nullcontext():
+        yield
+
+
+class _AdmittedStream:
+    """A backend chat stream that gives its admission slot back when it closes.
+
+    The slot is held for as long as the backend streams.  Two closers can race from different
+    threads: the :class:`_TranscriptDeltas` handed to the caller, when iteration ends or it is
+    closed, and the caller's abort ref.  The first closes the stream and releases the slot; the
+    other does nothing.
+    """
+
+    def __init__(self, stream: Any, lease: AdmissionLease | None) -> None:
+        self._stream = stream
+        self._lease = lease
+        self._close_once = threading.Lock()
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._stream)
+
+    def close(self) -> None:
+        if not self._close_once.acquire(blocking=False):
+            return
+        try:
+            close = getattr(self._stream, "close", None)
+            if callable(close):
+                close()
+        finally:
+            if self._lease is not None:
+                self._lease.release()
+
+
+class _TranscriptDeltas:
+    """The transcript deltas of one :class:`_AdmittedStream`, for the caller to iterate.
+
+    Ending or closing it closes the stream and gives the slot back, also before the first delta
+    is read, which a bare generator can't do: one closed before its first ``next()`` never runs its
+    ``finally``.  Close it from the thread that iterates it.  Any other thread aborts the caller's
+    ``cancel_ref`` instead, which closes the held stream without touching a generator that may be
+    running.
+    """
+
+    def __init__(self, held: _AdmittedStream, cancel_ref: Any) -> None:
+        self._held = held
+        self._deltas = _iter_stream_deltas(held, cancel_ref=cancel_ref)
+
+    def __iter__(self) -> _TranscriptDeltas:
+        return self
+
+    def __next__(self) -> str:
+        return next(self._deltas)
+
+    def close(self) -> None:
+        try:
+            self._deltas.close()
+        finally:
+            self._held.close()
+
+
 def _resolve_audio_binding(
     *,
     registry: Any,
@@ -245,10 +335,11 @@ def is_speech_only_model(capabilities: Mapping[str, Any], model: str) -> bool:
 def resolve_role_alias(*, config_store: Any | None, registry: Any | None, role: str) -> str | None:
     """Return the configured, capability-eligible alias for *role*, or ``None``.
 
-    Resolution: ``<role>.model_alias`` setting → must exist in the registry →
-    must be capability-eligible for the role.  Any miss returns ``None`` so the
-    caller surfaces a 503 (or hides the affordance) rather than calling a
-    backend that can't serve audio.
+    Resolution: the role's setting (``audio.stt_model_alias`` /
+    ``audio.tts_model_alias``, see :data:`_ROLE_SETTING`) → must exist in the
+    registry → must be capability-eligible for the role.  Any miss returns
+    ``None`` so the caller surfaces a 503 (or hides the affordance) rather than
+    calling a backend that can't serve audio.
     """
     if registry is None or config_store is None:
         return None
@@ -369,6 +460,7 @@ def _transcribe_via_chat(
     extra_body: dict[str, Any] | None = None,
     max_tokens: int = _OMNI_STT_MAX_TOKENS,
     cancel_ref: Any = None,
+    admission_wait_s: float | None = None,
 ) -> str:
     """Transcribe by handing the clip to an omni *chat* model as ``input_audio``.
 
@@ -384,17 +476,18 @@ def _transcribe_via_chat(
     wav = _to_wav_16k_mono(data)
     audio_b64 = base64.b64encode(wav).decode("ascii")
     lane = binding.lane
-    client = lane_call_client(lane, cancel_ref=cancel_ref)
-    manager = client.chat.completions.with_streaming_response.create(
-        model=lane.model,
-        messages=_omni_chat_messages(prompt, audio_b64),
-        max_tokens=max_tokens,
-        extra_body=extra_body or None,
-    )
-    refuse_aborted_request(cancel_ref)
-    with manager as response:
-        _capture_audio_handle(cancel_ref, response)
-        resp = response.parse()
+    with _admitted(lane, cancel_ref=cancel_ref, wait_s=admission_wait_s):
+        client = lane_call_client(lane, cancel_ref=cancel_ref)
+        manager = client.chat.completions.with_streaming_response.create(
+            model=lane.model,
+            messages=_omni_chat_messages(prompt, audio_b64),
+            max_tokens=max_tokens,
+            extra_body=extra_body or None,
+        )
+        refuse_aborted_request(cancel_ref)
+        with manager as response:
+            _capture_audio_handle(cancel_ref, response)
+            resp = response.parse()
     choices = getattr(resp, "choices", None) or []
     if not choices:
         return ""
@@ -408,6 +501,7 @@ def _transcribe_binding(
     filename: str,
     prompt: str = "",
     cancel_ref: Any = None,
+    admission_wait_s: float | None = None,
 ) -> TranscriptionResult:
     """Transcribe through one already-resolved binding generation."""
     lane = binding.lane
@@ -428,7 +522,6 @@ def _transcribe_binding(
     refuse_aborted_request(cancel_ref)
     try:
         if endpoint:
-            client = lane_call_client(lane, cancel_ref=cancel_ref)
             kwargs: dict[str, Any] = {
                 "model": model,
                 "file": (filename or "speech.webm", data),
@@ -436,11 +529,13 @@ def _transcribe_binding(
             }
             if prompt:
                 kwargs["prompt"] = prompt
-            manager = client.audio.transcriptions.with_streaming_response.create(**kwargs)
-            refuse_aborted_request(cancel_ref)
-            with manager as response:
-                _capture_audio_handle(cancel_ref, response)
-                resp = response.parse()
+            with _admitted(lane, cancel_ref=cancel_ref, wait_s=admission_wait_s):
+                client = lane_call_client(lane, cancel_ref=cancel_ref)
+                manager = client.audio.transcriptions.with_streaming_response.create(**kwargs)
+                refuse_aborted_request(cancel_ref)
+                with manager as response:
+                    _capture_audio_handle(cancel_ref, response)
+                    resp = response.parse()
             transcript = (getattr(resp, "text", "") or "").strip()
         else:
             transcript = _transcribe_via_chat(
@@ -449,8 +544,9 @@ def _transcribe_binding(
                 prompt or _OMNI_STT_PROMPT,
                 extra_body=_omni_chat_extra_body(cfg),
                 cancel_ref=cancel_ref,
+                admission_wait_s=admission_wait_s,
             )
-    except (AudioBackendError, BackendAuthUnavailableError):
+    except (AudioBackendError, AudioBusyError, BackendAuthUnavailableError):
         raise
     except Exception as exc:
         refuse_aborted_request(cancel_ref)
@@ -469,6 +565,7 @@ def transcribe(
     config_store: Any | None = None,
     backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
     cancel_ref: Any = None,
+    admission_wait_s: float | None = None,
 ) -> TranscriptionResult:
     """Transcribe ``data`` using the STT role alias's audio backend.
 
@@ -480,6 +577,10 @@ def transcribe(
     the endpoint path (vocabulary bias) and as the instruction on the chat path;
     the chat path falls back to :data:`_OMNI_STT_PROMPT` so a bare omni call still
     emits a clean transcript rather than a conversational reply.
+
+    The backend call holds one of the alias's ``max_concurrency`` slots.
+    ``admission_wait_s`` bounds the wait for it (``None`` waits until one frees),
+    and :class:`AudioBusyError` reports a wait that ran out.
     """
     binding = _resolve_audio_binding(
         registry=registry,
@@ -493,14 +594,16 @@ def transcribe(
         filename=filename,
         prompt=prompt,
         cancel_ref=cancel_ref,
+        admission_wait_s=admission_wait_s,
     )
 
 
-def _iter_stream_deltas(stream: Any, *, cancel_ref: Any = None) -> Iterator[str]:
+def _iter_stream_deltas(stream: Any, *, cancel_ref: Any = None) -> Generator[str]:
     """Yield non-empty content deltas from an OpenAI streaming chat response.
 
-    Owns the stream's lifecycle: exhausting or closing this generator releases
-    the underlying HTTP connection, so an abandoned stream can't leak it.
+    Owns the stream's lifecycle once started: exhausting or closing this generator
+    closes the stream.  A generator closed before its first ``next()`` runs none of
+    its body, which is why callers get a :class:`_TranscriptDeltas` around it.
     """
     try:
         try:
@@ -532,14 +635,21 @@ def transcribe_stream(
     config_store: Any | None = None,
     backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
     cancel_ref: Any = None,
+    admission_wait_s: float | None = None,
 ) -> Iterator[str]:
     """Stream transcript content deltas for the STT role alias.
 
-    Resolve, transcode, and opening the streaming-chat request all run eagerly
-    (before the returned generator yields its first delta) so the caller can
-    surface a clean 503 / 502; only the token iteration is deferred.  A
+    Resolve, transcode, admission and opening the streaming-chat request all run
+    eagerly (before the returned generator yields its first delta) so the caller
+    can surface a clean 503 / 502 / 429; only the token iteration is deferred.  A
     whisper-style endpoint alias has no chat stream, so it emits the whole
     transcript as a single chunk.
+
+    ``admission_wait_s`` bounds the wait for one of the alias's
+    ``max_concurrency`` slots, as for :func:`transcribe`.  The open stream holds
+    its slot until it closes: when the returned iterator ends or is closed, read
+    or not, or when *cancel_ref* aborts, which also covers an iterator that is
+    dropped without being closed.
     """
     binding = _resolve_audio_binding(
         registry=registry,
@@ -566,6 +676,7 @@ def transcribe_stream(
             filename="speech.webm",
             prompt=prompt,
             cancel_ref=cancel_ref,
+            admission_wait_s=admission_wait_s,
         ).transcript
         return iter([text] if text else [])
     caps = getattr(cfg, "capabilities", None) or {}
@@ -577,24 +688,36 @@ def transcribe_stream(
     wav = _to_wav_16k_mono(data)
     audio_b64 = base64.b64encode(wav).decode("ascii")
     try:
-        client = lane_call_client(lane, cancel_ref=cancel_ref)
-        request_kwargs = {
-            "model": model,
-            "messages": _omni_chat_messages(prompt or _OMNI_STT_PROMPT, audio_b64),
-            "max_tokens": _OMNI_STT_MAX_TOKENS,
-            "extra_body": _omni_chat_extra_body(cfg) or None,
-            "stream": True,
-            "timeout": _OMNI_STT_TIMEOUT_S,
-        }
-        refuse_aborted_request(cancel_ref)
-        stream = client.chat.completions.create(**request_kwargs)
-        _capture_audio_handle(cancel_ref, stream)
-    except BackendAuthUnavailableError:
+        lease = _admit(lane, cancel_ref=cancel_ref, wait_s=admission_wait_s)
+        try:
+            client = lane_call_client(lane, cancel_ref=cancel_ref)
+            request_kwargs = {
+                "model": model,
+                "messages": _omni_chat_messages(prompt or _OMNI_STT_PROMPT, audio_b64),
+                "max_tokens": _OMNI_STT_MAX_TOKENS,
+                "extra_body": _omni_chat_extra_body(cfg) or None,
+                "stream": True,
+                "timeout": _OMNI_STT_TIMEOUT_S,
+            }
+            refuse_aborted_request(cancel_ref)
+            stream = client.chat.completions.create(**request_kwargs)
+        except BaseException:
+            if lease is not None:
+                lease.release()
+            raise
+        # From here the stream owns the slot: closing it gives the slot back.
+        held = _AdmittedStream(stream, lease)
+        try:
+            _capture_audio_handle(cancel_ref, held)
+        except BaseException:
+            held.close()
+            raise
+    except (AudioBusyError, BackendAuthUnavailableError):
         raise
     except Exception as exc:
         refuse_aborted_request(cancel_ref)
         raise AudioBackendError(f"Transcription backend failed: {exc}") from exc
-    return _iter_stream_deltas(stream, cancel_ref=cancel_ref)
+    return _TranscriptDeltas(held, cancel_ref)
 
 
 # -- transcript memoization (no-native-audio wire fallback) -------------------
@@ -631,6 +754,10 @@ def transcribe_cached(
     upstream) and does *not* cache failures, so a transient outage doesn't
     poison the memo.  Cancellation and dynamic-auth refusal remain control flow
     and propagate to the caller.
+
+    It runs inside a chat turn, before the turn takes its own model's slot, so
+    it waits for a slot on the STT alias as a generation would: until one frees
+    or *cancel_ref* aborts.
     """
     refuse_aborted_request(cancel_ref)
     try:
@@ -693,8 +820,15 @@ def synthesize(
     config_store: Any | None = None,
     backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
     cancel_ref: Any = None,
+    admission_wait_s: float | None = None,
 ) -> SpeechResult:
-    """Synthesize ``text`` to speech using the TTS role alias's audio backend."""
+    """Synthesize ``text`` to speech using the TTS role alias's audio backend.
+
+    The backend call holds one of the alias's ``max_concurrency`` slots.
+    ``admission_wait_s`` bounds the wait for it (``None`` waits until one frees,
+    ``0`` refuses at once), and :class:`AudioBusyError` reports a wait that ran
+    out.
+    """
     binding = _resolve_audio_binding(
         registry=registry,
         alias=alias,
@@ -711,24 +845,26 @@ def synthesize(
         raise AudioUnavailableError(f"TTS model alias {alias!r} cannot synthesize speech")
     refuse_aborted_request(cancel_ref)
     try:
-        # One bounded attempt.  A retry repeats the whole clip, which would outlast
-        # the console's wait, and the timeout covers the wait for headers, which an
-        # abort can't cut short because no response handle exists yet.
-        client = lane_call_client(lane, cancel_ref=cancel_ref).with_options(
-            max_retries=0,
-            timeout=httpx2.Timeout(_TTS_BACKEND_TIMEOUT_S, connect=5.0),
-        )
-        manager = client.audio.speech.with_streaming_response.create(
-            model=model,
-            voice=voice or _DEFAULT_VOICE,
-            input=text,
-            response_format=response_format,
-        )
-        refuse_aborted_request(cancel_ref)
-        with manager as response:
-            _capture_audio_handle(cancel_ref, response)
-            audio_bytes = response.read()
-    except BackendAuthUnavailableError:
+        with _admitted(lane, cancel_ref=cancel_ref, wait_s=admission_wait_s):
+            # One bounded attempt.  A retry repeats the whole clip, which would
+            # outlast the console's wait, and the timeout covers the wait for
+            # headers, which an abort can't cut short because no response handle
+            # exists yet.
+            client = lane_call_client(lane, cancel_ref=cancel_ref).with_options(
+                max_retries=0,
+                timeout=httpx2.Timeout(_TTS_BACKEND_TIMEOUT_S, connect=5.0),
+            )
+            manager = client.audio.speech.with_streaming_response.create(
+                model=model,
+                voice=voice or _DEFAULT_VOICE,
+                input=text,
+                response_format=response_format,
+            )
+            refuse_aborted_request(cancel_ref)
+            with manager as response:
+                _capture_audio_handle(cancel_ref, response)
+                audio_bytes = response.read()
+    except (AudioBusyError, BackendAuthUnavailableError):
         raise
     except Exception as exc:
         refuse_aborted_request(cancel_ref)

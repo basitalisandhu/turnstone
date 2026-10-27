@@ -1320,7 +1320,15 @@ role carries the same gate on its `ModelLane`, so main turns, judges, task
 agents, perception, compaction, and background generation coordinate through
 one FIFO. Endpoint reranking carries the same gate on its `RerankLane`, so a
 reranker alias cannot exceed that cap or bypass capacity shared with another
-role. Two aliases never share a gate implicitly, even when their URLs are
+role. Speech-to-text and speech synthesis call the client directly
+(`turnstone/core/audio.py`) and take the lane's gate themselves, after the
+transcode; a streamed transcript holds its slot until the stream closes. A
+voice request waits only as long as its browser caller allows (`acquire`'s
+`timeout`: 15 seconds for dictation, counted from the request's arrival, and 0
+for read-aloud, refused at once), then gets 429. Dictation waits for its
+slot on four threads of its own per node, so those waits never hold the shared
+workers the heartbeat and access checks use; a streamed transcript is still read
+on them. Two aliases never share a gate implicitly, even when their URLs are
 identical. For calls with context-first request admission, `model_turn()`
 admits the request before materializing attachment fallbacks; an oversized
 refusal therefore invokes neither attachment resolution nor nested

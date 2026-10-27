@@ -8,13 +8,18 @@ helper code runs end-to-end without a network call.
 from __future__ import annotations
 
 import shutil
+import threading
+import time
 from unittest.mock import MagicMock
 
 import httpx2
 import openai
 import pytest
 
+import turnstone.core.admission as admission_mod
+from tests._helpers import slot_held, wait_until
 from turnstone.core import audio
+from turnstone.core.admission import ModelAdmission
 from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
 from turnstone.core.model_backend_auth import BackendAuthUnavailableError
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
@@ -45,12 +50,23 @@ class _FakeConfigStore:
 
 
 class _FakeRegistry:
-    """Minimal registry exposing the surface audio.py uses."""
+    """Minimal registry exposing the surface audio.py uses.
 
-    def __init__(self, alias: str, cfg: _Cfg, client: object) -> None:
+    With an ``admission`` gate it answers the six-value binding a real registry
+    gives, so audio calls take that gate's slots.
+    """
+
+    def __init__(
+        self,
+        alias: str,
+        cfg: _Cfg,
+        client: object,
+        admission: ModelAdmission | None = None,
+    ) -> None:
         self._alias = alias
         self._cfg = cfg
         self._client = client
+        self._admission = admission
         self.default = alias
         self.generation = 0
         self.resolve_binding_calls = 0
@@ -68,6 +84,15 @@ class _FakeRegistry:
         if alias not in (None, self._alias):
             raise ValueError(alias)
         self.resolve_binding_calls += 1
+        if self._admission is not None:
+            return (
+                self._client,
+                self._cfg.model,
+                self._cfg,
+                self._provider,
+                self._admission,
+                self.generation,
+            )
         return self._client, self._cfg.model, self._cfg, self._provider, self.generation
 
 
@@ -1019,3 +1044,311 @@ class TestTranscribeStream:
             )
 
         client.chat.completions.create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# The alias's max_concurrency gate
+# ---------------------------------------------------------------------------
+
+
+class _ClockAnHourAhead:
+    """Stands in for ``time`` in turnstone.core.admission: an hour ahead of the real clock."""
+
+    @staticmethod
+    def monotonic() -> float:
+        return time.monotonic() + 3600.0
+
+
+def _omni_chat_manager(text: str):
+    manager, _response = _response_manager(
+        parsed=MagicMock(choices=[MagicMock(message=MagicMock(content=text))])
+    )
+    return manager
+
+
+class TestAudioAdmission:
+    """Every audio backend call holds one of its alias's ``max_concurrency`` slots."""
+
+    def test_a_transcription_holds_a_slot_for_its_call(self):
+        gate = ModelAdmission("voice", 1)
+        client = MagicMock()
+        manager, _response = _response_manager(parsed=MagicMock(text="hi"))
+        held: list[int] = []
+
+        def _create(**_kwargs):
+            held.append(gate.snapshot().in_flight)
+            return manager
+
+        client.audio.transcriptions.with_streaming_response.create.side_effect = _create
+        result = audio.transcribe(
+            registry=_FakeRegistry("voice", _Cfg("whisper-1"), client, gate),
+            alias="voice",
+            data=b"x",
+            filename="a.wav",
+        )
+
+        assert result.transcript == "hi"
+        assert held == [1]
+        assert gate.snapshot().in_flight == 0
+
+    def test_an_omni_transcription_takes_its_slot_after_the_transcode(self, monkeypatch):
+        # The transcode is local work and can take seconds, so it must not hold
+        # the backend's slot.
+        gate = ModelAdmission("omni", 1)
+        held: dict[str, int] = {}
+
+        def _transcode(data: bytes) -> bytes:
+            held["transcode"] = gate.snapshot().in_flight
+            return data
+
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", _transcode)
+        client = MagicMock()
+        manager = _omni_chat_manager("hello")
+
+        def _create(**_kwargs):
+            held["create"] = gate.snapshot().in_flight
+            return manager
+
+        client.chat.completions.with_streaming_response.create.side_effect = _create
+        result = audio.transcribe(
+            registry=_FakeRegistry(
+                "omni", _Cfg("gemma-omni", {"supports_audio_input": True}), client, gate
+            ),
+            alias="omni",
+            data=b"x",
+            filename="a.webm",
+        )
+
+        assert result.transcript == "hello"
+        assert held == {"transcode": 0, "create": 1}
+        assert gate.snapshot().in_flight == 0
+
+    def test_a_full_alias_refuses_a_transcription_once_its_wait_runs_out(self):
+        gate = ModelAdmission("voice", 1)
+        client = MagicMock()
+
+        with slot_held(gate):
+            started = time.monotonic()
+            with pytest.raises(audio.AudioBusyError):
+                audio.transcribe(
+                    registry=_FakeRegistry("voice", _Cfg("whisper-1"), client, gate),
+                    alias="voice",
+                    data=b"x",
+                    filename="a.wav",
+                    admission_wait_s=0.05,
+                )
+            assert time.monotonic() - started >= 0.05
+
+        client.audio.transcriptions.with_streaming_response.create.assert_not_called()
+        assert gate.snapshot().queued == 0
+
+    def test_an_in_turn_transcription_waits_until_its_turn_is_cancelled(self, monkeypatch):
+        """The wire fallback waits for a slot as a generation does: with no
+        bound, until the turn's cancel ref aborts."""
+        audio._clear_transcript_cache_for_test()
+        gate = ModelAdmission("w", 1)
+        holder = gate.acquire()
+        client = MagicMock()
+        ref = StreamAbortRef()
+        errors: list[BaseException] = []
+        finished = threading.Event()
+
+        def _transcribe() -> None:
+            try:
+                audio.transcribe_cached(
+                    registry=_FakeRegistry("w", _Cfg("whisper-1"), client, gate),
+                    alias="w",
+                    content_hash="queued",
+                    data=b"x",
+                    filename="a.wav",
+                    cancel_ref=ref,
+                )
+            except BaseException as exc:  # test records the worker's exact exit
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=_transcribe, daemon=True)
+        thread.start()
+        wait_until(lambda: gate.snapshot().queued == 1)
+        # An hour passes on the gate's clock, so any bound on the wait would run out.
+        monkeypatch.setattr(admission_mod, "time", _ClockAnHourAhead)
+        assert not finished.wait(0.6)
+        ref.abort()
+
+        assert finished.wait(2.0)
+        assert len(errors) == 1
+        assert isinstance(errors[0], DeadlineCancelledError)
+        assert gate.snapshot().queued == 0
+        client.audio.transcriptions.with_streaming_response.create.assert_not_called()
+        holder.release()
+
+    def test_an_open_stream_holds_its_slot_until_it_has_been_read(self, monkeypatch):
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        gate = ModelAdmission("omni", 1)
+        stream = MagicMock()
+        stream.__iter__.return_value = iter([_stream_chunk("hello")])
+        client = MagicMock()
+        client.chat.completions.create.return_value = stream
+
+        deltas = audio.transcribe_stream(
+            registry=_FakeRegistry(
+                "omni", _Cfg("omni", {"supports_audio_input": True}), client, gate
+            ),
+            alias="omni",
+            data=b"x",
+            cancel_ref=StreamAbortRef(),
+        )
+
+        assert gate.snapshot().in_flight == 1
+        assert list(deltas) == ["hello"]
+        assert gate.snapshot().in_flight == 0
+        stream.close.assert_called_once()
+
+    def test_closing_a_stream_nobody_read_gives_its_slot_back(self, monkeypatch):
+        # No cancel ref: closing the returned iterator alone must free the slot,
+        # which a generator closed before its first next() would not.
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        gate = ModelAdmission("omni", 1)
+        stream = MagicMock()
+        client = MagicMock()
+        client.chat.completions.create.return_value = stream
+
+        deltas = audio.transcribe_stream(
+            registry=_FakeRegistry(
+                "omni", _Cfg("omni", {"supports_audio_input": True}), client, gate
+            ),
+            alias="omni",
+            data=b"x",
+        )
+        assert gate.snapshot().in_flight == 1
+        deltas.close()
+
+        assert gate.snapshot().in_flight == 0
+        stream.close.assert_called_once()
+
+    def test_aborting_a_stream_nobody_read_gives_its_slot_back(self, monkeypatch):
+        # The endpoint aborts its ref on every exit, so an iterator it drops
+        # unread and unclosed still frees the slot.
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        gate = ModelAdmission("omni", 1)
+        stream = MagicMock()
+        client = MagicMock()
+        client.chat.completions.create.return_value = stream
+        ref = StreamAbortRef()
+
+        deltas = audio.transcribe_stream(
+            registry=_FakeRegistry(
+                "omni", _Cfg("omni", {"supports_audio_input": True}), client, gate
+            ),
+            alias="omni",
+            data=b"x",
+            cancel_ref=ref,
+        )
+        ref.abort()
+        assert gate.snapshot().in_flight == 0
+        stream.close.assert_called_once()
+        # A second closer frees nothing more.
+        deltas.close()
+        assert gate.snapshot().in_flight == 0
+        stream.close.assert_called_once()
+
+    def test_a_stream_that_fails_to_open_gives_its_slot_back(self, monkeypatch):
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        gate = ModelAdmission("omni", 1)
+        client = MagicMock()
+        client.chat.completions.create.side_effect = RuntimeError("backend down")
+
+        with pytest.raises(audio.AudioBackendError):
+            audio.transcribe_stream(
+                registry=_FakeRegistry(
+                    "omni", _Cfg("omni", {"supports_audio_input": True}), client, gate
+                ),
+                alias="omni",
+                data=b"x",
+            )
+
+        assert gate.snapshot().in_flight == 0
+
+    def test_a_stream_aborted_as_it_opens_gives_its_slot_back(self, monkeypatch):
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        gate = ModelAdmission("omni", 1)
+        stream = MagicMock()
+        client = MagicMock()
+        ref = StreamAbortRef()
+
+        def _create(**_kwargs):
+            ref.abort()  # the caller leaves while the backend answers
+            return stream
+
+        client.chat.completions.create.side_effect = _create
+
+        with pytest.raises(DeadlineCancelledError):
+            audio.transcribe_stream(
+                registry=_FakeRegistry(
+                    "omni", _Cfg("omni", {"supports_audio_input": True}), client, gate
+                ),
+                alias="omni",
+                data=b"x",
+                cancel_ref=ref,
+            )
+
+        assert gate.snapshot().in_flight == 0
+        stream.close.assert_called_once()
+
+    def test_a_full_alias_refuses_a_stream_before_it_opens(self, monkeypatch):
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        gate = ModelAdmission("omni", 1)
+        client = MagicMock()
+
+        with slot_held(gate), pytest.raises(audio.AudioBusyError):
+            audio.transcribe_stream(
+                registry=_FakeRegistry(
+                    "omni", _Cfg("omni", {"supports_audio_input": True}), client, gate
+                ),
+                alias="omni",
+                data=b"x",
+                admission_wait_s=0,
+            )
+
+        client.chat.completions.create.assert_not_called()
+        assert gate.snapshot().queued == 0
+
+    def test_a_synthesis_holds_a_slot_for_its_call(self):
+        gate = ModelAdmission("voice", 1)
+        client, clone = _tts_client()
+        manager, _response = _response_manager(body=b"audio")
+        held: list[int] = []
+
+        def _create(**_kwargs):
+            held.append(gate.snapshot().in_flight)
+            return manager
+
+        clone.audio.speech.with_streaming_response.create.side_effect = _create
+        result = audio.synthesize(
+            registry=_FakeRegistry("voice", _Cfg("gpt-4o-mini-tts"), client, gate),
+            alias="voice",
+            text="hi",
+            voice="nova",
+            admission_wait_s=0,
+        )
+
+        assert result.audio_bytes == b"audio"
+        assert held == [1]
+        assert gate.snapshot().in_flight == 0
+
+    def test_a_full_alias_refuses_a_synthesis_at_once(self):
+        gate = ModelAdmission("voice", 1)
+        client, clone = _tts_client()
+
+        with slot_held(gate), pytest.raises(audio.AudioBusyError):
+            audio.synthesize(
+                registry=_FakeRegistry("voice", _Cfg("gpt-4o-mini-tts"), client, gate),
+                alias="voice",
+                text="hi",
+                voice="nova",
+                admission_wait_s=0,
+            )
+
+        clone.audio.speech.with_streaming_response.create.assert_not_called()
+        assert gate.snapshot().queued == 0

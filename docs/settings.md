@@ -76,10 +76,12 @@ Read-aloud (`POST /v1/api/tts`) has fixed limits rather than settings:
   can't take the threads the node's other work needs. A third play is refused
   with 429 and `Retry-After`, which the browser waits out and retries twice,
   rather than queued, since queue time would come out of the console's 90
-  seconds. The limit is per node and shared by every user. On a backend that
-  synthesizes one clip at a time, a play started beside a long one waits behind
-  it and can still time out: after 80 seconds of silence at the node, or at the
-  console's 90 seconds.
+  seconds. The limit is per node and shared by every user. A play also needs one
+  of the speech model's [`max_concurrency`](#per-model-concurrency) slots when
+  its definition sets a limit, and is refused the same way when none is free. On
+  a backend that synthesizes one clip at a time, a play started beside a long
+  one waits behind it and can still time out: after 80 seconds of silence at the
+  node, or at the console's 90 seconds.
 
 A play the user replaces with another, or whose pane or tab closes, cancels its
 request. The console passes that on to the node, which closes the backend call
@@ -137,8 +139,8 @@ Each model definition may set `max_concurrency` to limit simultaneous model
 generations for that alias in one Turnstone process. `0` or an omitted value
 means unlimited. The gate is shared by every role using the alias—interactive
 turns, coordinators, task agents, judges, output guards, perception, compaction,
-and title generation—and a streaming generation holds its slot until the
-stream is fully drained or closed.
+title generation, speech-to-text and speech synthesis—and a streaming generation
+holds its slot until the stream is fully drained or closed.
 
 Admission is strictly per alias. Two aliases remain independent even when they
 point to the same URL; Turnstone does not infer shared capacity from endpoint
@@ -147,7 +149,25 @@ each retry releases its slot before backoff and reacquires for the next wire
 attempt. The cap is local to each process, not cluster-wide; account for the
 number of nodes targeting the same inference server. Cohere/Jina reranking
 selected through the Reranker role consumes the same gate as every other use of
-that alias. Direct STT/TTS protocol calls do not consume this generation cap.
+that alias.
+
+Voice requests wait less than generations do, because a browser is waiting on
+each one. Through the console a dictation waits at most 30 seconds for a node's
+answer, so dictation waits up to 15 seconds for a slot, counted from the
+request's arrival (its transcode, usually tens of milliseconds, comes on top;
+`_STT_ADMISSION_WAIT_S` in `turnstone/server.py`). A play needs most of its 90
+seconds for synthesis, so read-aloud does not wait at all (see
+[Speech Synthesis Limits](#speech-synthesis-limits)). When no slot comes free in
+time the node answers 429 with `Retry-After`, which the browser waits out and
+retries twice. A node admits at most four dictations at once: each transcodes,
+waits for its slot and opens its backend call on a thread of its own
+(`_STT_MAX_THREADS`), and more wait for a thread within the same 15 seconds. A
+streamed transcript is then read on the node's shared workers. Transcribing an
+audio attachment for a chat model that can't take audio waits as long as any
+generation. When one alias serves both chat and dictation, dictation waits
+behind chat replies; a second alias for the same server, with its own
+`max_concurrency`, keeps the two apart, at the cost of the server seeing both at
+once.
 
 ### Judge batch parallelism
 
