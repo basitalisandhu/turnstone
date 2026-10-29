@@ -28,12 +28,14 @@ from tests.conftest import make_mcp_token_cipher
 from turnstone.core.auth import AuthResult
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.mcp_oauth import (
+    OAUTH_REGISTRATION_MODES,
     MCPOAuthExchangeError,
     _validate_return_url,
     exchange_code,
     handle_mcp_oauth_authorize,
     handle_mcp_oauth_callback,
     register_dynamic_client,
+    registers_a_client,
 )
 from turnstone.core.oauth.context import TokenCoordination, oauth_context
 from turnstone.core.oauth.http import ASMetadata, OAuthError
@@ -970,6 +972,170 @@ class TestDCR:
         secret = token_store.get_oauth_client_secret(row["server_id"])
         assert secret == "dcr-secret"
 
+    @staticmethod
+    def _registering(client_secret: str | None) -> Any:
+        async def _post(url: str, *args: Any, **kwargs: Any) -> Any:
+            if url.endswith("/register"):
+                body: dict[str, Any] = {"client_id": "dcr-client-new"}
+                if client_secret is not None:
+                    body["client_secret"] = client_secret
+                return _mk_response(201, body)
+            raise AssertionError(f"unexpected POST {url}")
+
+        return _post
+
+    def test_a_registration_without_a_secret_clears_the_old_one(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        """A public client gets no secret: one a previous registration left behind must not go
+        out with the new client id."""
+        server_id = _seed_oauth_user_server(storage, client_id=None, registration_mode="dcr")
+        token_store = _make_token_store(storage)
+        token_store.set_oauth_client_secret(server_id, "secret-from-the-old-server")
+        http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
+        http_client_mock.post.side_effect = self._registering(None)
+
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+        with _public_addr_patch():
+            resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
+
+        assert resp.status_code == 302
+        row = storage.get_mcp_server_by_name("srv-oauth")
+        assert row is not None and row["oauth_client_id"] == "dcr-client-new"
+        assert token_store.get_oauth_client_secret(server_id) is None
+
+    @pytest.mark.parametrize("failing", ["secret", "client_id"])
+    def test_a_registered_client_that_cannot_be_saved_fails_the_start(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock, failing: str
+    ) -> None:
+        server_id = _seed_oauth_user_server(storage, client_id=None, registration_mode="dcr")
+        token_store = _make_token_store(storage)
+        token_store.set_oauth_client_secret(server_id, "secret-from-the-old-server")
+        http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
+        http_client_mock.post.side_effect = self._registering("dcr-secret-new")
+
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+        target = (
+            patch.object(
+                token_store, "encrypt_oauth_client_secret", side_effect=RuntimeError("down")
+            )
+            if failing == "secret"
+            else patch.object(storage, "update_mcp_server", side_effect=RuntimeError("down"))
+        )
+        with _public_addr_patch(), target:
+            resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
+
+        assert resp.status_code == 502
+        assert "could not be saved" in resp.json()["error"]
+        row = storage.get_mcp_server_by_name("srv-oauth")
+        assert row is not None and not row["oauth_client_id"]
+
+    def test_a_registration_that_loses_to_another_host_uses_its_client(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        """Two hosts register at once: the first to save wins, and the row never pairs one
+        registration's client id with the other's secret."""
+        server_id = _seed_oauth_user_server(storage, client_id=None, registration_mode="dcr")
+        token_store = _make_token_store(storage)
+        http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
+
+        async def _post(url: str, *args: Any, **kwargs: Any) -> Any:
+            if url.endswith("/register"):
+                # Another host registers and saves its client while this one is at the AS.
+                storage.update_mcp_server(server_id, oauth_client_id="client-from-another-host")
+                token_store.set_oauth_client_secret(server_id, "secret-from-another-host")
+                return _mk_response(
+                    201, {"client_id": "dcr-client-new", "client_secret": "dcr-secret-new"}
+                )
+            raise AssertionError(f"unexpected POST {url}")
+
+        http_client_mock.post.side_effect = _post
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+        with _public_addr_patch():
+            resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
+
+        assert resp.status_code == 302, resp.text
+        params = urllib.parse.parse_qs(urllib.parse.urlsplit(resp.headers["location"]).query)
+        assert params["client_id"] == ["client-from-another-host"]
+        row = storage.get_mcp_server_by_name("srv-oauth")
+        assert row is not None and row["oauth_client_id"] == "client-from-another-host"
+        assert token_store.get_oauth_client_secret(server_id) == "secret-from-another-host"
+
+    @pytest.mark.parametrize(
+        "move",
+        [
+            {"oauth_authorization_server_url": "https://new-as.example.net"},
+            {"url": "https://mcp2.example.com/sse"},
+        ],
+        ids=["authorization-server", "server-url"],
+    )
+    @pytest.mark.parametrize(
+        "registered_meanwhile", [None, "client-of-the-new-server"], ids=["cleared", "re-registered"]
+    )
+    def test_a_registration_overtaken_by_a_move_is_not_saved(
+        self,
+        storage: SQLiteBackend,
+        http_client_mock: MagicMock,
+        move: dict[str, Any],
+        registered_meanwhile: str | None,
+    ) -> None:
+        """While the registration is at the authorization server discovery found, an admin
+        points the server elsewhere and the console drops the client: the old server's client
+        never lands next to the new settings, and a client another host registered at the new
+        server is not taken for this flow, which discovery sent to the old one."""
+        server_id = _seed_oauth_user_server(storage, client_id=None, registration_mode="dcr")
+        token_store = _make_token_store(storage)
+        http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
+
+        async def _post(url: str, *args: Any, **kwargs: Any) -> Any:
+            assert url.endswith("/register"), url
+            assert storage.update_mcp_server(
+                server_id,
+                purge_oauth_rows=True,
+                oauth_client_secret_ct=None,
+                oauth_as_issuer_cached=None,
+                oauth_client_id=registered_meanwhile,
+                **move,
+            )
+            return _mk_response(201, {"client_id": "client-of-the-old-as", "client_secret": "s"})
+
+        http_client_mock.post.side_effect = _post
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+        with _public_addr_patch():
+            resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
+
+        assert resp.status_code == 502, resp.text
+        row = storage.get_mcp_server_by_name("srv-oauth")
+        assert row is not None and row["oauth_client_id"] == registered_meanwhile
+        assert token_store.get_oauth_client_secret(server_id) is None
+
+    def test_a_server_moved_before_its_registration_registers_nothing(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        """Discovery read the server, then an admin moved it before the registration lock: no
+        client is registered at the authorization server discovery found."""
+        server_id = _seed_oauth_user_server(storage, client_id=None, registration_mode="dcr")
+        token_store = _make_token_store(storage)
+
+        async def _get(url: str, *args: Any, **kwargs: Any) -> Any:
+            storage.update_mcp_server(server_id, url="https://mcp2.example.com/sse")
+            return _mk_response(200, _good_as_metadata_doc())
+
+        http_client_mock.get.side_effect = _get
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+        with _public_addr_patch():
+            resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
+
+        assert resp.status_code == 502, resp.text
+        http_client_mock.post.assert_not_called()
+        row = storage.get_mcp_server_by_name("srv-oauth")
+        assert row is not None and row["oauth_client_id"] is None
+
     def test_registration_transport_error_answers_502(self, storage: SQLiteBackend) -> None:
         """A transport failure at the registration endpoint is a 502 that names DCR, through a
         real client: the catch has to match the client's library, or the error escapes as a
@@ -1529,9 +1695,10 @@ class TestAuthorizationResponseChecks:
         self, storage: SQLiteBackend, http_client_mock: MagicMock
     ) -> None:
         _seed_oauth_user_server(storage)
-        _seed_pending(storage)
         storage.delete_mcp_server("srv-id-1")
         _seed_oauth_user_server(storage, server_id="srv-id-2")
+        # A /start that read the deleted server and wrote its row after the purges.
+        _seed_pending(storage)
         self._ready(http_client_mock)
 
         resp, _ = self._callback(storage, http_client_mock, "code=auth-code&state=valid-state")
@@ -1921,3 +2088,47 @@ class TestValidateReturnUrl:
         assert (
             _validate_return_url("https://app.example.com:8443/admin", self.REDIRECT_BASE) is None
         )
+
+
+@pytest.mark.parametrize("mode", [*OAUTH_REGISTRATION_MODES, None])
+def test_every_registration_mode_either_registers_a_client_or_uses_the_operators(
+    storage: SQLiteBackend, http_client_mock: MagicMock, mode: str | None
+) -> None:
+    """A mode the console accepts but no flow acts on would repeat the old ``dynamic`` drift."""
+    from turnstone.core.mcp_oauth import _register_dynamic_client_if_needed
+
+    _seed_oauth_user_server(storage, client_id=None, registration_mode=mode)
+    row = storage.get_mcp_server_by_name("srv-oauth")
+    assert row is not None
+    register = AsyncMock(return_value=("registered-client", None))
+    app = _build_app(
+        storage=storage, http_client=http_client_mock, token_store=_make_token_store(storage)
+    )
+    request = MagicMock()
+    request.app = app
+
+    async def _run() -> Any:
+        with patch("turnstone.core.mcp_oauth.register_dynamic_client", new=register):
+            return await _register_dynamic_client_if_needed(
+                request=request,
+                storage=storage,
+                token_store=_make_token_store(storage),
+                http_client=http_client_mock,
+                as_metadata=MagicMock(),
+                server_row=row,
+                server_id="srv-id-1",
+                server_name="srv-oauth",
+                user_id="user-1",
+                redirect_uri="https://console.example.com/v1/api/mcp/oauth/callback",
+                registration_mode=mode or "",
+            )
+
+    client_id, error = asyncio.run(_run())
+
+    assert error is None
+    if registers_a_client(mode):
+        register.assert_awaited_once()
+        assert client_id == "registered-client"
+    else:
+        register.assert_not_awaited()
+        assert client_id == ""

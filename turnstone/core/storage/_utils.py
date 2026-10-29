@@ -34,8 +34,10 @@ from turnstone.core.storage._protocol import (
 )
 from turnstone.core.storage._schema import (
     conversations,
+    mcp_oauth_pending,
     mcp_servers,
     memory_index_snapshots,
+    oauth_tokens,
     project_members,
     projects,
     role_permission_overrides,
@@ -1606,11 +1608,10 @@ SKILL_SUMMARY_COLUMNS = (
     "kind",
     "allowed_tools",
 )
-# ``oauth_client_secret_ct`` is intentionally absent from this set.  It has
-# its own dedicated writer (``StorageBackend.set_mcp_oauth_client_secret_ct``)
-# so the encrypt/None-to-clear semantics — owned by
-# :class:`turnstone.core.mcp_crypto.MCPTokenStore` — live in one place and
-# the generic ``update_mcp_server`` cannot accept a raw ciphertext blob.
+# ``oauth_client_secret_ct`` is intentionally absent from this set: a create or an update writes
+# it only through its own ``oauth_client_secret_ct`` keyword, with ciphertext from
+# :class:`turnstone.core.mcp_crypto.MCPTokenStore`, so a secret commits with the change it comes
+# with and never arrives as an ordinary field.
 MCP_SERVER_MUTABLE = frozenset(
     {
         "name",
@@ -1664,6 +1665,35 @@ MODEL_DEFINITION_MUTABLE = frozenset(
 # from "compare against NULL". Shared by both backends so the calibrate
 # retry loop reads one contract.
 CAPS_COMPARE_UNSET: object = object()
+
+
+def delete_mcp_oauth_rows_on_connection(conn: Any, server_name: str) -> int:
+    """Delete the user tokens and pending OAuth flows keyed by *server_name*, in *conn*'s
+    transaction. ``mcp_pending_consent`` rows stay: they record work waiting on a consent."""
+    tokens_result = conn.execute(
+        sa.delete(oauth_tokens).where(oauth_tokens.c.token_key == server_name)
+    )
+    pending_result = conn.execute(
+        sa.delete(mcp_oauth_pending).where(mcp_oauth_pending.c.server_name == server_name)
+    )
+    return int(tokens_result.rowcount or 0) + int(pending_result.rowcount or 0)
+
+
+def purge_mcp_oauth_rows_after_update(
+    conn: Any, old_name: str, new_name: str, *, purge: bool
+) -> None:
+    """Purge, in *conn*'s transaction, the OAuth rows an MCP server update leaves stale.
+
+    The old name's rows go when *purge* is set or the server is renamed. On a rename the new
+    name's rows go too: the update proved no other server holds that name, so rows under it are
+    left from one deleted or renamed before, never inherited.
+    """
+    if purge or new_name != old_name:
+        delete_mcp_oauth_rows_on_connection(conn, old_name)
+    if new_name != old_name:
+        delete_mcp_oauth_rows_on_connection(conn, new_name)
+
+
 PROJECT_MUTABLE = frozenset({"name", "visibility", "state", "parent_project_id"})
 PROMPT_POLICY_MUTABLE = frozenset({"name", "content", "tool_gate", "priority", "enabled"})
 # ``name`` (the slug create requests reference) is deliberately immutable —

@@ -7,6 +7,10 @@ from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
 from turnstone.core.workstream import SAVED_PAGE_DEFAULT_LIMIT
 
+# Sentinel for ``update_mcp_server``'s client-secret write: distinguishes "leave the stored
+# secret" (every ordinary caller) from "clear it" (``None``).
+MCP_SECRET_UNCHANGED: object = object()
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
     from contextlib import AbstractContextManager
@@ -2898,7 +2902,11 @@ class StorageBackend(Protocol):
         oauth_as_issuer_cached: str | None = None,
     ) -> bool:
         """Create an MCP server definition. Return whether inserted: a taken server_id, name or
-        registry_name inserts nothing."""
+        registry_name inserts nothing.
+
+        When it inserts, the same transaction deletes the user tokens and pending OAuth flows
+        keyed by *name*: the name was free, so they were left by a server deleted or renamed
+        before, and a new server never inherits them."""
         ...
 
     def get_mcp_server(self, server_id: str) -> dict[str, Any] | None:
@@ -2913,8 +2921,27 @@ class StorageBackend(Protocol):
         """Return MCP servers ordered by name."""
         ...
 
-    def update_mcp_server(self, server_id: str, **fields: Any) -> bool:
-        """Update specified fields on an MCP server. Returns True if found.
+    def update_mcp_server(
+        self,
+        server_id: str,
+        *,
+        purge_oauth_rows: bool = False,
+        oauth_client_secret_ct: Any = MCP_SECRET_UNCHANGED,
+        expected: Mapping[str, Any] | None = None,
+        **fields: Any,
+    ) -> bool:
+        """Update specified fields on an MCP server. Returns True if a row was updated.
+
+        *purge_oauth_rows* deletes the user tokens and pending OAuth flows keyed by the row's
+        current name in the same transaction as the update, read under a lock, so the change and
+        the purge commit together or not at all. A rename always does so, and also deletes the
+        rows keyed by the new name, which were left by a server deleted or renamed before.
+
+        *oauth_client_secret_ct* writes the client secret's ciphertext (``None`` clears it) in
+        the same statement: the one place besides ``set_mcp_oauth_client_secret_ct`` that takes
+        ciphertext, kept out of the generic *fields*. *expected* maps columns to the values the
+        caller decided from; the update applies only while the row still holds them (``None``
+        compares as NULL), so False means the row is gone or was changed meanwhile.
 
         Raises :class:`StorageConflictError` when a new name or registry_name is taken.
         """
@@ -2925,21 +2952,25 @@ class StorageBackend(Protocol):
         ...
 
     def delete_mcp_server(self, server_id: str) -> bool:
-        """Delete an MCP server definition. Returns True if existed."""
+        """Delete an MCP server definition. Returns True if existed.
+
+        The user tokens and pending OAuth flows keyed by its name are deleted in the same
+        transaction: a later server can take the name."""
         ...
 
     # -- MCP OAuth client secret ---------------------------------------------
     #
-    # ``oauth_client_secret_ct`` is intentionally absent from
-    # ``MCP_SERVER_MUTABLE`` (see ``_utils.py``).  It has its own dedicated
-    # writer so the encrypt/None-to-clear semantics live in one place — see
-    # ``set_mcp_oauth_client_secret_ct`` below.
+    # ``oauth_client_secret_ct`` is intentionally absent from ``MCP_SERVER_MUTABLE`` (see
+    # ``_utils.py``): creates and updates take it through their own keyword, and the writer below
+    # sets it alone.
 
     def set_mcp_oauth_client_secret_ct(self, server_id: str, secret_ct: bytes | None) -> bool:
         """Update only the encrypted OAuth client-secret column.
 
-        Returns True when a row was updated. ``None`` clears the column.
-        Bypasses ``MCP_SERVER_MUTABLE`` deliberately.
+        Returns True when a row was updated. ``None`` clears the column. Bypasses
+        ``MCP_SERVER_MUTABLE`` deliberately. A secret that comes with a server change or a client
+        registration goes in that write instead (``update_mcp_server``'s
+        ``oauth_client_secret_ct``), so it never pairs with another change's client id.
         """
         ...
 

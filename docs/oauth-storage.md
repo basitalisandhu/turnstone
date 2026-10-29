@@ -87,9 +87,12 @@ does not add a cache-cleanup sweep.
   mints share the captured credential and persist refresh-token rotation.
 - **MCP disconnect:** the user's connections page deletes the local `oauth_user`
   grant and attempts upstream revocation. Sign-in passthrough and model mint
-  caches are excluded from that page. MCP admin purges delete token rows and
-  pending browser authorization states in one transaction; that purge does not
-  delete pending-consent rows or captured OIDC credentials.
+  caches are excluded from that page. An MCP server edit that changes what its
+  tokens are bound to, and every server deletion, purges its token rows and
+  pending browser authorization states in the same transaction as the change,
+  so neither lands without the other; creating or renaming a server also purges
+  rows left under its new name. That purge does not delete pending-consent rows
+  or captured OIDC credentials.
 - **Model edits and deletion:** changes to alias, audience, scopes, or auth mode
   purge the affected alias's delegated and app token caches. Model purges delete
   only token rows; they leave MCP authorization states and captured credentials

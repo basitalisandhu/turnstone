@@ -34,10 +34,10 @@ class MCPTokenStore(TokenStore):
     def set_oauth_client_secret(self, server_id: str, plaintext_secret: str | None) -> bool:
         """Encrypt plaintext and persist via the dedicated storage writer.
 
-        Pass ``None`` to clear the column.  Empty string is encrypted
-        normally (Fernet accepts empty plaintext); callers that treat
-        empty as "clear" must convert to ``None`` at their API boundary
-        first — the admin form does this before invoking the helper.
+        Pass ``None`` to clear the column. An empty string is encrypted
+        normally (Fernet accepts empty plaintext). The console's creates and
+        updates, and a client registration, write the secret with their change
+        instead (``encrypt_oauth_client_secret``); this helper seeds tests.
 
         Returns ``False`` when ``server_id`` does not exist.
         """
@@ -45,6 +45,12 @@ class MCPTokenStore(TokenStore):
             return self._storage.set_mcp_oauth_client_secret_ct(server_id, None)
         secret_ct = self._cipher.encrypt(plaintext_secret.encode("utf-8"))
         return self._storage.set_mcp_oauth_client_secret_ct(server_id, secret_ct)
+
+    def encrypt_oauth_client_secret(self, plaintext_secret: str) -> bytes:
+        """Encrypt a client secret for a write that stores it with the server row itself: a
+        create, or ``update_mcp_server``'s ``oauth_client_secret_ct``, so the secret commits
+        with the change it belongs to."""
+        return self._cipher.encrypt(plaintext_secret.encode("utf-8"))
 
     def get_oauth_client_secret(self, server_id: str) -> str | None:
         """Decrypt and return the per-server OAuth client secret, or None.

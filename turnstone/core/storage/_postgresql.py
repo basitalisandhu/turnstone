@@ -40,6 +40,7 @@ from turnstone.core.storage._lease import (
 )
 from turnstone.core.storage._protocol import (
     FORK_RESERVATION_CONFIG_KEY,
+    MCP_SECRET_UNCHANGED,
     USER_SCOPED_AUTH_TYPES,
     AttachmentWrite,
     ConversationCommitWorkstreamGoneError,
@@ -206,6 +207,9 @@ from turnstone.core.storage._utils import (
     consented_server_clause as _consented_server_clause,
 )
 from turnstone.core.storage._utils import (
+    delete_mcp_oauth_rows_on_connection as _delete_mcp_oauth_rows,
+)
+from turnstone.core.storage._utils import (
     delete_messages_after_core as _delete_messages_after_core,
 )
 from turnstone.core.storage._utils import (
@@ -225,6 +229,9 @@ from turnstone.core.storage._utils import (
 )
 from turnstone.core.storage._utils import (
     prune_workstreams_shared as _prune_workstreams_shared,
+)
+from turnstone.core.storage._utils import (
+    purge_mcp_oauth_rows_after_update as _purge_mcp_oauth_rows_after_update,
 )
 from turnstone.core.storage._utils import (
     reconstruct_messages as _reconstruct_messages,
@@ -5733,6 +5740,10 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                 .returning(mcp_servers.c.server_id)
             )
             inserted = result.scalar_one_or_none() is not None
+            if inserted:
+                # The name was free, so rows under it are left from a server deleted or renamed
+                # before: a new server never inherits them.
+                _delete_mcp_oauth_rows(conn, name)
             conn.commit()
             return inserted
 
@@ -5773,7 +5784,15 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             rows = conn.execute(q).fetchall()
             return [_row_to_dict(r, *_MCP_SERVER_BOOL_FIELDS) for r in rows]
 
-    def update_mcp_server(self, server_id: str, **fields: Any) -> bool:
+    def update_mcp_server(
+        self,
+        server_id: str,
+        *,
+        purge_oauth_rows: bool = False,
+        oauth_client_secret_ct: Any = MCP_SECRET_UNCHANGED,
+        expected: Mapping[str, Any] | None = None,
+        **fields: Any,
+    ) -> bool:
 
         fields = {k: v for k, v in fields.items() if k in _MCP_SERVER_MUTABLE}
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -5783,22 +5802,51 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         from turnstone.core.storage._protocol import StorageConflictError
 
         with self._conn() as conn:
-            try:
-                result = conn.execute(
-                    sa.update(mcp_servers)
+            current: Any = None
+            if purge_oauth_rows or "name" in fields:
+                # Lock the row before reading the name the OAuth rows are keyed by, so the purge
+                # and the change commit together.
+                current = conn.execute(
+                    sa.select(mcp_servers.c.name)
                     .where(mcp_servers.c.server_id == server_id)
-                    .values(**fields)
-                )
+                    .with_for_update()
+                ).fetchone()
+            values = dict(fields)
+            if oauth_client_secret_ct is not MCP_SECRET_UNCHANGED:
+                values["oauth_client_secret_ct"] = oauth_client_secret_ct
+            stmt = sa.update(mcp_servers).where(mcp_servers.c.server_id == server_id)
+            for column, value in (expected or {}).items():
+                # Conditional write: only while the row still holds what the caller decided from.
+                col = mcp_servers.c[column]
+                stmt = stmt.where(col.is_(None) if value is None else col == value)
+            try:
+                result = conn.execute(stmt.values(**values))
             except sa.exc.IntegrityError as exc:
                 conn.rollback()
                 msg = str(exc.orig) if exc.orig is not None else str(exc)
                 raise StorageConflictError(f"mcp_server conflict ({server_id}): {msg}") from exc
+            if result.rowcount > 0 and current is not None:
+                old_name = current[0]
+                _purge_mcp_oauth_rows_after_update(
+                    conn, old_name, fields.get("name", old_name), purge=purge_oauth_rows
+                )
             conn.commit()
             return result.rowcount > 0
 
     def delete_mcp_server(self, server_id: str) -> bool:
 
         with self._conn() as conn:
+            row = conn.execute(
+                sa.select(mcp_servers.c.name)
+                .where(mcp_servers.c.server_id == server_id)
+                .with_for_update()
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return False
+            # The OAuth rows are keyed by the name, which a later server can take: they go in the
+            # same transaction as the row.
+            _delete_mcp_oauth_rows(conn, row[0])
             result = conn.execute(
                 sa.delete(mcp_servers).where(mcp_servers.c.server_id == server_id)
             )
@@ -6083,14 +6131,9 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
     def delete_mcp_oauth_rows_by_server_name(self, server_name: str) -> int:
         """Purge user tokens + pending OAuth state for *server_name*."""
         with self._conn() as conn:
-            tokens_result = conn.execute(
-                sa.delete(oauth_tokens).where(oauth_tokens.c.token_key == server_name)
-            )
-            pending_result = conn.execute(
-                sa.delete(mcp_oauth_pending).where(mcp_oauth_pending.c.server_name == server_name)
-            )
+            deleted = _delete_mcp_oauth_rows(conn, server_name)
             conn.commit()
-            return int(tokens_result.rowcount or 0) + int(pending_result.rowcount or 0)
+            return deleted
 
     def get_mcp_oauth_client_secret_ct(self, server_id: str) -> bytes | None:
         """Return the encrypted OAuth client secret column or None."""

@@ -948,7 +948,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "Create an MCP server definition",
         request_model=CreateMcpServerRequest,
         response_model=McpServerDetail,
-        error_codes=[400, 409],
+        error_codes=[400, 409, 503],
         tags=["Admin"],
     ),
     EndpointSpec(
@@ -965,7 +965,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "Update an MCP server definition",
         request_model=UpdateMcpServerRequest,
         response_model=McpServerDetail,
-        error_codes=[400, 404, 409],
+        error_codes=[400, 404, 409, 503],
         tags=["Admin"],
     ),
     EndpointSpec(
@@ -973,7 +973,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "DELETE",
         "Delete an MCP server definition",
         response_model=StatusResponse,
-        error_codes=[404],
+        error_codes=[404, 503],
         tags=["Admin"],
     ),
     EndpointSpec(

@@ -2887,6 +2887,23 @@ def _build_redirect_uri(redirect_base: str) -> str:
     return f"{redirect_base}/v1/api/mcp/oauth/callback"
 
 
+# How an oauth_user server gets its client: an operator-registered client id, or one registered at
+# the authorization server on first use (RFC 7591).
+OAUTH_REGISTRATION_MODES = ("preregistered", "dcr")
+
+
+def registers_a_client(registration_mode: str | None) -> bool:
+    """Does an oauth_user server in *registration_mode* register its client at the authorization
+    server (RFC 7591)? Every other mode, unset included, uses the operator's client id."""
+    return registration_mode == "dcr"
+
+
+# The server columns a dynamically registered client is bound to: the console drops the client
+# when the URL or the Authorization Server URL of a registering server changes, and a change of
+# mode decides whether the server registers at all.
+_DCR_BINDING_COLUMNS = ("url", "oauth_authorization_server_url", "oauth_registration_mode")
+
+
 async def _register_dynamic_client_if_needed(
     *,
     request: Request,
@@ -2905,17 +2922,21 @@ async def _register_dynamic_client_if_needed(
 
     Returns ``(client_id, None)`` on success / no-op (the row already
     has a ``client_id``), or ``(None, exc)`` when DCR was needed but
-    failed at the AS.
+    failed: refused at the AS, or registered there but not saved here.
 
     Per-server lock + re-fetch resolves the concurrent-/start race that
     would otherwise overwrite a freshly-persisted client_id with a
     second registration's value, leaving the first user's authorize
-    flow pointing at a code-mismatched client at /callback.
+    flow pointing at a code-mismatched client at /callback. A server
+    whose binding (``_DCR_BINDING_COLUMNS``) no longer matches the row
+    discovery read registers nothing, and a registration it overtakes
+    is not saved: the client belongs to the authorization server that
+    discovery found.
     """
     existing = server_row.get("oauth_client_id") or ""
     if existing:
         return existing, None
-    if registration_mode != "dcr":
+    if not registers_a_client(registration_mode):
         return "", None
 
     lock = _dcr_lock_for(request.app.state, server_id)
@@ -2924,10 +2945,12 @@ async def _register_dynamic_client_if_needed(
         # while we were waiting. If the row now has a client_id, reuse
         # it without making a second registration call.
         latest_row = await asyncio.to_thread(storage.get_mcp_server_by_name, server_name)
-        if latest_row is not None:
-            persisted_client_id = latest_row.get("oauth_client_id") or ""
-            if persisted_client_id:
-                return persisted_client_id, None
+        binding = {column: server_row.get(column) for column in _DCR_BINDING_COLUMNS}
+        if latest_row is None or any(latest_row.get(c) != v for c, v in binding.items()):
+            return None, oauth_http.OAuthError("the server was changed while connecting; try again")
+        read_client_id = latest_row.get("oauth_client_id")
+        if read_client_id:
+            return read_client_id, None
 
         try:
             client_id, client_secret = await register_dynamic_client(
@@ -2939,33 +2962,44 @@ async def _register_dynamic_client_if_needed(
         except oauth_http.OAuthError as exc:
             return None, exc
 
+        # The id and the secret go in one statement, the secret replaced outright (cleared when
+        # the registration returned none): a client id must never pair with a secret that another
+        # registration, or another authorization server, issued. The write applies only while
+        # the row still has the id read above and the binding discovery read, so of two hosts
+        # registering at once the first wins and the other uses its client, and a registration
+        # a move to another authorization server overtook is not saved; a write that fails
+        # fails the flow.
         try:
-            await asyncio.to_thread(
+            written = await asyncio.to_thread(
                 storage.update_mcp_server,
                 server_id,
+                oauth_client_secret_ct=(
+                    token_store.encrypt_oauth_client_secret(client_secret)
+                    if client_secret
+                    else None
+                ),
+                expected={"oauth_client_id": read_client_id, **binding},
                 oauth_client_id=client_id,
             )
+            winner = ""
+            if not written:
+                current = await asyncio.to_thread(storage.get_mcp_server_by_name, server_name)
+                if current is not None and all(current.get(c) == v for c, v in binding.items()):
+                    winner = current.get("oauth_client_id") or ""
         except Exception:
             log.warning(
                 "mcp_server.oauth.persist_dcr_client_id_failed",
                 server_name=server_name,
                 exc_info=True,
             )
-        secret_persisted = False
-        if client_secret:
-            try:
-                await asyncio.to_thread(
-                    token_store.set_oauth_client_secret,
-                    server_id,
-                    client_secret,
-                )
-                secret_persisted = True
-            except Exception:
-                log.warning(
-                    "mcp_server.oauth.persist_dcr_client_secret_failed",
-                    server_name=server_name,
-                    exc_info=True,
-                )
+            written, winner = False, ""
+        if not written:
+            if winner:
+                # Another host registered first: its client is the one this flow uses.
+                return winner, None
+            return None, oauth_http.OAuthError(
+                "registered at the authorization server, but it could not be saved; try again"
+            )
         await _audit_event(
             request.app.state,
             server_id=server_id,
@@ -2974,7 +3008,7 @@ async def _register_dynamic_client_if_needed(
             server_name=server_name,
             detail={
                 "client_id": client_id,
-                "has_secret": secret_persisted,
+                "has_secret": bool(client_secret),
             },
         )
         return client_id, None

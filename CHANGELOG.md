@@ -16,7 +16,10 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 > records what each pending MCP sign-in was started against. A sign-in begun
 > before the upgrade fails as expired; connecting again works. Custom storage
 > backends must accept and return the new pending-flow fields (`as_issuer`,
-> `iss_parameter_supported`, `server_id`, `server_url`, `audience`).
+> `iss_parameter_supported`, `server_id`, `server_url`, `audience`), take
+> `purge_oauth_rows` on `update_mcp_server`, and purge an MCP server's
+> name-keyed OAuth rows inside the transaction that creates, updates or
+> deletes it.
 
 ### Security
 
@@ -33,7 +36,6 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   later one stands. An error from the authorization server is shown once the
   state, the user and `iss` check out, and a response that repeats any
   parameter is refused.
-
 - **An MCP server's authorization server stays pinned.** Once discovered, it
   moves only when an operator changes the server's URL or Authorization Server
   URL, or when a value stored by an earlier version is refused on its text
@@ -46,6 +48,35 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   is removed, and the user is asked to connect again. A refresh that finishes
   or fails after the user consented again no longer overwrites or removes the
   new grant.
+- **An MCP server change and the purge of its sign-ins land together.** A change
+  that rebinds a server's tokens (its name, auth type, URL, authorization server
+  or audience, or an on-behalf-of server's scopes) and every deletion purge its
+  per-user tokens and pending sign-ins in the same transaction; when that fails,
+  the change answers `503` and nothing is changed. A create, update or deletion
+  whose commit was cut off reads the server again: one that landed is audited
+  and reloaded as usual, and when that can't be told the reply says the change
+  may have been saved. Creating or renaming a server also clears tokens left
+  under its new name.
+- **A dynamically registered client never keeps an earlier secret.**
+  Registration saves the client id together with the secret the authorization
+  server returned (or clears the secret when there is none), in one write that
+  applies only while no other registration has saved a client and the server
+  still points where discovery found it; a connect that loses that race uses the
+  winner's client, and one whose write fails, or whose server moved, is refused.
+  A change of the Server URL or the Authorization Server URL of a server that
+  registers dynamically (before or after the save) drops the registered client's
+  id and secret, so that secret never reaches another authorization server. A
+  client secret now commits with the server change it comes with.
+
+### Changed
+
+- **`oauth_registration_mode` accepts only `preregistered` and `dcr`.** The
+  documented `dynamic` never registered a client; setting it is now refused
+  with `400`, while a row that stores it keeps it until changed.
+- **An MCP server update answers `409` when another request changed the
+  server meanwhile.** The update decides its purge and its client changes from
+  the server as it read it, and now applies only while the server still holds
+  those values; otherwise nothing is written.
 
 ## [1.9.1]
 

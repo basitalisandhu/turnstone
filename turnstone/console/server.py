@@ -79,7 +79,11 @@ from turnstone.core.http_failures import (
     may_have_reached_server,
 )
 from turnstone.core.http_headers import HEADER_VALUE_RE, HeaderValueError
-from turnstone.core.mcp_oauth import is_user_scoped_auth
+from turnstone.core.mcp_oauth import (
+    OAUTH_REGISTRATION_MODES,
+    is_user_scoped_auth,
+    registers_a_client,
+)
 from turnstone.core.memory import get_workstream_display_names
 from turnstone.core.metacognition import field_str, sanitize_display
 from turnstone.core.model_oauth import get_model_token_client
@@ -144,7 +148,9 @@ from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 from turnstone.core.storage import (
     WorkstreamLeaseHeldError,
     WorkstreamLeaseLostError,
+    storage_errors,
 )
+from turnstone.core.storage._protocol import MCP_SECRET_UNCHANGED
 from turnstone.core.token_store.crypto import STARTUP_KEY_REQUIRED_HINT
 from turnstone.core.web_helpers import (
     WORKSTREAM_UNREADABLE_CODE,
@@ -10915,22 +10921,26 @@ async def admin_registry_install(request: Request) -> JSONResponse:
     server_id = uuid.uuid4().hex
     audit_uid, ip = _audit_context(request)
 
-    created = storage.create_mcp_server(
-        server_id=server_id,
-        name=name,
-        transport=config["transport"],
-        command=config.get("command", ""),
-        args=json.dumps(config.get("args", [])),
-        url=config.get("url", ""),
-        headers=json.dumps(merged_headers),
-        env=json.dumps(merged_env),
-        auto_approve=False,
-        enabled=True,
-        created_by=audit_uid,
-        registry_name=registry_name,
-        registry_version=config["registry_version"],
-        registry_meta=json.dumps(config["registry_meta"]),
-    )
+    try:
+        created = storage.create_mcp_server(
+            server_id=server_id,
+            name=name,
+            transport=config["transport"],
+            command=config.get("command", ""),
+            args=json.dumps(config.get("args", [])),
+            url=config.get("url", ""),
+            headers=json.dumps(merged_headers),
+            env=json.dumps(merged_env),
+            auto_approve=False,
+            enabled=True,
+            created_by=audit_uid,
+            registry_name=registry_name,
+            registry_version=config["registry_version"],
+            registry_meta=json.dumps(config["registry_meta"]),
+        )
+    except storage_errors():
+        log.warning("admin.mcp.install_failed name=%s", name, exc_info=True)
+        return _admin_change_not_saved()
     if not created:
         # Another request installed this registry server, or took the name, since the checks above.
         # A retry's checks say which.
@@ -11318,6 +11328,65 @@ def _canonical_oauth_user_url(
         return url, JSONResponse({"error": f"url: {exc}"}, status_code=400)
 
 
+# The reply to an admin change refused because storage failed partway: nothing was written, and
+# the same request can be sent again.
+_ADMIN_CHANGE_NOT_SAVED = "The change could not be saved, and nothing was changed. Try again."
+
+# Returned when a server update's compare-and-set finds the row changed since the request read it.
+_MCP_SERVER_CHANGED_MEANWHILE = (
+    "The server was changed by another request since this one read it. Reload it and try again."
+)
+
+# The columns an MCP server update takes its purge, issuer and client decisions from; the write
+# applies only while the row still holds the values the request read.
+_MCP_BINDING_COLUMNS = (
+    "name",
+    "auth_type",
+    "url",
+    "oauth_authorization_server_url",
+    "oauth_audience",
+    "oauth_scopes",
+    "oauth_registration_mode",
+)
+
+
+# Returned when a write failed in a way that may still have committed, and reading again could
+# not tell.
+_ADMIN_CHANGE_MAYBE_SAVED = "The change may not have been saved. Check before trying again."
+
+
+def _admin_change_not_saved() -> JSONResponse:
+    return JSONResponse({"error": _ADMIN_CHANGE_NOT_SAVED}, status_code=503)
+
+
+def _mcp_write_in_doubt(
+    storage: Any, server_id: str, landed: Callable[[dict[str, Any] | None], bool]
+) -> JSONResponse | None:
+    """After a storage error on an MCP server write, read the row again: a failure as the commit
+    was acknowledged may still have committed.
+
+    Returns ``None`` when *landed* says the row shows the write, for the caller to go on as after
+    a success (audit, reload); otherwise the 503 that nothing was changed, or, when the row
+    cannot be read, the 503 that the change may have been saved.
+    """
+    try:
+        row = storage.get_mcp_server(server_id)
+    except storage_errors():
+        return JSONResponse({"error": _ADMIN_CHANGE_MAYBE_SAVED}, status_code=503)
+    return None if landed(row) else _admin_change_not_saved()
+
+
+def _parse_registration_mode(value: Any) -> tuple[str | None, JSONResponse | None]:
+    """Return the cleaned ``oauth_registration_mode``, or a 400 for a value no flow runs."""
+    mode = _clean_oauth_text(value)
+    if mode is None or mode in OAUTH_REGISTRATION_MODES:
+        return mode, None
+    allowed = " or ".join(repr(name) for name in OAUTH_REGISTRATION_MODES)
+    return None, JSONResponse(
+        {"error": f"oauth_registration_mode must be {allowed}"}, status_code=400
+    )
+
+
 def _same_oauth_resource(existing_url: str, new_url: str) -> bool:
     """True when two server URLs name the same RFC 8707 resource.
 
@@ -11353,8 +11422,8 @@ def _oauth_columns_to_clear(auth_type: str | None) -> dict[str, None]:
     ``oauth_audience`` (+ ``oauth_scopes`` under rfc8693) but none of the
     oauth_user-only columns; ``static``/``none`` use no OAuth columns at all.
     ``oauth_client_secret_ct`` is owned by a dedicated write path and is not
-    included here. Callers that cannot persist ``oauth_as_issuer_cached`` (the
-    create path) drop that key.
+    included here. The create and update paths pass every key, the cached
+    issuer included.
     """
     if auth_type == "oauth_user":
         return {}
@@ -11589,51 +11658,43 @@ def _require_token_store_for_oauth_secret(
     return None
 
 
-def _apply_oauth_client_secret(
-    request: Request,
-    *,
-    server_id: str,
-    body: dict[str, Any],
-    auth_type: str,
-    audit_uid: str,
-    storage: Any,
-    ip: str,
-) -> tuple[bool | None, JSONResponse | None]:
-    """Encrypt + persist the operator-supplied client secret.
+def _client_secret_write(
+    request: Request, body: dict[str, Any], *, auth_type: str
+) -> tuple[Any, JSONResponse | None]:
+    """The client-secret ciphertext a create or update stores with the server row.
 
-    ``oauth_client_secret`` is read from ``body``; ``None`` / empty string
-    clears the column.  No-op when the field is absent or ``auth_type``
-    is not ``oauth_user`` — ``(None, None)`` is returned in that case.
-
-    On success returns ``(True, None)`` for a set or ``(False, None)``
-    for a clear.  Returns ``(None, error_response)`` only when
-    ``_require_token_store_for_oauth_secret`` refuses the body field
-    (callers must invoke it BEFORE the storage write to avoid a
-    partial-write hazard; this helper runs it again in case lifespan
-    state changed mid-request).
+    ``oauth_client_secret`` is read from ``body``; ``None`` or an empty string clears the column.
+    Returns ``MCP_SECRET_UNCHANGED`` when the field is absent or ``auth_type`` is not
+    ``oauth_user``, and ``(None, error_response)`` when no encryption key is configured.
+    Encryption stays in ``MCPTokenStore``; the write itself commits with the change.
     """
     if "oauth_client_secret" not in body or auth_type != "oauth_user":
-        return None, None
+        return MCP_SECRET_UNCHANGED, None
     err = _require_token_store_for_oauth_secret(request, body, auth_type=auth_type)
     if err is not None:
         return None, err
-    secret_input = body.get("oauth_client_secret")
     token_store = cast("MCPTokenStore | None", oauth_context(request.app.state).token_store)
     if token_store is None:
         return None, JSONResponse({"error": _OAUTH_TOKEN_STORE_503_MSG}, status_code=503)
-    secret_text = (secret_input or "").strip()
-    secret_value: str | None = secret_text or None
-    token_store.set_oauth_client_secret(server_id, secret_value)
-    cleared = secret_value is None
+    secret_text = (body.get("oauth_client_secret") or "").strip()
+    return (token_store.encrypt_oauth_client_secret(secret_text) if secret_text else None), None
+
+
+def _audit_client_secret_write(
+    request: Request, storage: Any, audit_uid: str, server_id: str, secret_ct: Any, ip: str
+) -> None:
+    """Audit a client-secret set or clear that committed with the server row."""
+    if secret_ct is MCP_SECRET_UNCHANGED:
+        return
+    token_store = cast("MCPTokenStore | None", oauth_context(request.app.state).token_store)
     _audit_oauth_client_secret_set(
         storage,
         audit_uid,
         server_id,
-        cleared=cleared,
-        cipher=token_store.cipher,
+        cleared=secret_ct is None,
+        cipher=token_store.cipher if token_store is not None else None,
         ip=ip,
     )
-    return (not cleared), None
 
 
 def _mask_mcp_secrets(server: dict[str, Any], reveal: bool = False) -> dict[str, Any]:
@@ -12138,49 +12199,53 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     # flip. ``oauth_as_issuer_cached`` (nulled by the cleared set for a
     # non-oauth_user type) IS a valid create parameter, so it passes through
     # to ``create_mcp_server`` as its default None.
+    registration_mode, err_resp = _parse_registration_mode(body.get("oauth_registration_mode"))
+    if err_resp is not None:
+        return err_resp
     oauth_cols: dict[str, Any] = {
         "oauth_client_id": _clean_oauth_text(body.get("oauth_client_id")),
         "oauth_scopes": clean_scopes,
         "oauth_audience": clean_audience,
-        "oauth_registration_mode": _clean_oauth_text(body.get("oauth_registration_mode")),
+        "oauth_registration_mode": registration_mode,
         "oauth_authorization_server_url": _clean_oauth_text(
             body.get("oauth_authorization_server_url"), max_length=2048
         ),
     }
     oauth_cols.update(_oauth_columns_to_clear(auth_type))
 
-    created = storage.create_mcp_server(
-        server_id=server_id,
-        name=name,
-        transport=transport,
-        command=str(body.get("command", "")).strip(),
-        args=json.dumps(args_list) if isinstance(args_list, list) else "[]",
-        url=server_url,
-        headers=json.dumps(headers_dict) if isinstance(headers_dict, dict) else "{}",
-        env=json.dumps(env_dict) if isinstance(env_dict, dict) else "{}",
-        auto_approve=auto_approve,
-        enabled=enabled,
-        tls_skip_verify=tls_skip_verify,
-        created_by=audit_uid,
-        auth_type=auth_type,
-        **oauth_cols,
-    )
+    secret_ct, err_resp = _client_secret_write(request, body, auth_type=auth_type)
+    if err_resp is not None:
+        return err_resp
+    if secret_ct is not MCP_SECRET_UNCHANGED:
+        oauth_cols["oauth_client_secret_ct"] = secret_ct
+    try:
+        created = storage.create_mcp_server(
+            server_id=server_id,
+            name=name,
+            transport=transport,
+            command=str(body.get("command", "")).strip(),
+            args=json.dumps(args_list) if isinstance(args_list, list) else "[]",
+            url=server_url,
+            headers=json.dumps(headers_dict) if isinstance(headers_dict, dict) else "{}",
+            env=json.dumps(env_dict) if isinstance(env_dict, dict) else "{}",
+            auto_approve=auto_approve,
+            enabled=enabled,
+            tls_skip_verify=tls_skip_verify,
+            created_by=audit_uid,
+            auth_type=auth_type,
+            **oauth_cols,
+        )
+    except storage_errors():
+        log.warning("admin.mcp.create_failed name=%s", name, exc_info=True)
+        # The id is this request's own, so a row under it is this create.
+        in_doubt = _mcp_write_in_doubt(storage, server_id, lambda row: row is not None)
+        if in_doubt is not None:
+            return in_doubt
+        created = True
     if not created:  # another request took the name since the check above
         return JSONResponse({"error": f"Server '{name}' already exists"}, status_code=409)
 
-    # Encrypt + persist the operator-supplied client secret via the dedicated
-    # writer.  Pre-checked above; the helper re-checks defensively.
-    secret_set_state, err_resp = _apply_oauth_client_secret(
-        request,
-        server_id=server_id,
-        body=body,
-        auth_type=auth_type,
-        audit_uid=audit_uid,
-        storage=storage,
-        ip=ip,
-    )
-    if err_resp is not None:
-        return err_resp
+    _audit_client_secret_write(request, storage, audit_uid, server_id, secret_ct, ip)
 
     audit_detail: dict[str, Any] = {"name": name, "auth_type": auth_type}
     if tls_skip_verify:
@@ -12190,8 +12255,8 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         audit_detail["header_references"] = header_refs
     if "oauth_client_secret" in body:
         audit_detail["oauth_client_secret"] = "(redacted)"
-        if secret_set_state is not None:
-            audit_detail["oauth_client_secret_set"] = secret_set_state
+        if secret_ct is not MCP_SECRET_UNCHANGED:
+            audit_detail["oauth_client_secret_set"] = secret_ct is not None
     if transport == "streamable-http":
         # Where the server points, never its path or query, which can carry a credential. Last,
         # so a header reference or client-secret marker keeps its place among those three keys.
@@ -12327,10 +12392,19 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     for _oauth_key in (
         "oauth_client_id",
         "oauth_scopes",
-        "oauth_registration_mode",
     ):
         if _oauth_key in body:
             updates[_oauth_key] = _clean_oauth_text(body[_oauth_key])
+    # A stored mode sent back unchanged (a client writing the row back) is kept, whatever it is,
+    # as an unchanged URL or header is; only a change is checked.
+    if "oauth_registration_mode" in body and _clean_oauth_text(body["oauth_registration_mode"]) != (
+        existing.get("oauth_registration_mode") or None
+    ):
+        updates["oauth_registration_mode"], err_resp = _parse_registration_mode(
+            body["oauth_registration_mode"]
+        )
+        if err_resp is not None:
+            return err_resp
     for _oauth_url_key in (
         "oauth_audience",
         "oauth_authorization_server_url",
@@ -12469,17 +12543,23 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     # Pointing a row at a different authorization server is a token-binding
     # change like a URL change: the stored refresh tokens were issued by the
     # OLD authorization server, and the next refresh would present them to the
-    # new one. A dynamically registered client_id has the same problem — it
-    # was issued by the old server and means nothing at the new one — so it is
-    # cleared too, letting registration run again. A pre-registered client_id
-    # is the operator's own value and is left alone.
+    # new one.
     as_url_purge = as_url_changing and is_user_scoped_auth(old_auth)
-    if as_url_purge:
-        registration_mode = str(
-            updates.get("oauth_registration_mode", existing.get("oauth_registration_mode")) or ""
-        )
-        if registration_mode == "dynamic":
-            updates["oauth_client_id"] = None
+    # A dynamically registered client, id and secret alike, was issued by the authorization
+    # server the row pointed at. On either event that drops the cached issuer it goes, and
+    # registration runs again wherever the row points now. Either mode counts: one save can
+    # switch out of dynamic registration or into it. An id this request sets is the operator's
+    # and stays; one that only repeats the stored id is cleared. A pre-registered row keeps both.
+    stored_mode = existing.get("oauth_registration_mode") or None
+    mode_after = updates.get("oauth_registration_mode", stored_mode)
+    clear_dcr_client = (url_changing or as_url_changing) and (
+        registers_a_client(stored_mode) or registers_a_client(mode_after)
+    )
+    if clear_dcr_client and (updates.get("oauth_client_id") or None) in (
+        None,
+        existing.get("oauth_client_id") or None,
+    ):
+        updates["oauth_client_id"] = None
     # Changing oauth_audience on a pool-backed row is a token-binding change too:
     # minted obo bearers (and oauth_user tokens) are audience-scoped, so cached
     # rows for the OLD audience must be purged or a privilege reduction silently
@@ -12514,6 +12594,13 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     err_resp = _require_token_store_for_oauth_secret(request, body, auth_type=auth_type_now)
     if err_resp is not None:
         return err_resp
+    # The client secret commits with the change. A secret this request sets is written; leaving
+    # oauth_user, or a dynamically registered client being dropped, clears it.
+    secret_ct, err_resp = _client_secret_write(request, body, auth_type=auth_type_now)
+    if err_resp is not None:
+        return err_resp
+    if secret_ct is MCP_SECRET_UNCHANGED and (leaving_oauth_user or clear_dcr_client):
+        secret_ct = None
 
     # sec-1: enforce https:// for the post-update url+auth_type combination,
     # using the new url if present in updates, else the existing row's url.
@@ -12546,11 +12633,35 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     if err_resp is not None:
         return err_resp
 
+    # Purge per-user tokens + pending OAuth states keyed on the row's name on
+    # rename, on any pool-backed auth_type transition, on URL change, or on an
+    # audience / obo-scope change for a pool-backed row. All cases would
+    # otherwise leave tokens orphaned-and-rebindable or bound to a superseded
+    # URL/audience/scope set (the OAuth tables key on the mutable
+    # ``server_name`` and tokens are bound to the URL + audience + scopes
+    # active at mint/consent time). The purge and the change commit in one
+    # transaction, so neither lands without the other.
+    purge_oauth_rows = (
+        name_changing
+        or auth_type_purge
+        or url_changing
+        or as_url_purge
+        or audience_changing
+        or scopes_changing
+    )
     # Written even when *updates* is empty (it then stamps only ``updated``): the write is what
     # says whether the row still exists, so a server deleted since the read above answers 404
-    # before any purge, secret write, audit event or reload.
+    # before any secret write, audit event or reload.
     try:
-        found = storage.update_mcp_server(server_id, **updates)
+        found = storage.update_mcp_server(
+            server_id,
+            purge_oauth_rows=purge_oauth_rows,
+            oauth_client_secret_ct=secret_ct,
+            # Every decision above was taken from the row read before the body: the write applies
+            # only while the row still holds those values.
+            expected={column: existing.get(column) for column in _MCP_BINDING_COLUMNS},
+            **updates,
+        )
     except StorageConflictError:
         if not name_changing:
             raise
@@ -12558,80 +12669,53 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         return JSONResponse(
             {"error": f"Server '{updates['name']}' already exists"}, status_code=409
         )
-    if not found:  # another request deleted the server since the read above
-        return JSONResponse({"error": "MCP server not found"}, status_code=404)
+    except storage_errors():
+        log.warning("admin.mcp.update_failed server_id=%s", server_id, exc_info=True)
+        # The row shows this write by what the request set. The clears the update derives (the
+        # cached issuer, a dynamically registered client's id and secret) go with a URL,
+        # authorization-server or auth-type change the other columns show, and discovery or a
+        # registration may have set them again before this read.
+        written = {
+            k: v
+            for k, v in updates.items()
+            if k != "oauth_as_issuer_cached" and not (k == "oauth_client_id" and clear_dcr_client)
+        }
+        if (
+            secret_ct is not MCP_SECRET_UNCHANGED
+            and "oauth_client_secret" in body
+            and not clear_dcr_client
+        ):
+            written["oauth_client_secret_ct"] = secret_ct
+        in_doubt = _mcp_write_in_doubt(
+            storage,
+            server_id,
+            lambda row: row is not None and all(row.get(k) == v for k, v in written.items()),
+        )
+        if in_doubt is not None:
+            return in_doubt
+        found = True
+    if not found:
+        # Deleted since the read above, or changed by another request: either way nothing was
+        # written, and the decisions above may not hold for the row as it is now.
+        try:
+            gone = storage.get_mcp_server(server_id) is None
+        except storage_errors():
+            return _admin_change_not_saved()
+        if gone:
+            return JSONResponse({"error": "MCP server not found"}, status_code=404)
+        return JSONResponse({"error": _MCP_SERVER_CHANGED_MEANWHILE}, status_code=409)
 
     audit_uid, ip = _audit_context(request)
 
-    # Purge per-user tokens + pending OAuth states keyed on the OLD name on
-    # rename, on any pool-backed auth_type transition, on URL change, or on an
-    # audience / obo-scope change for a pool-backed row. All cases would
-    # otherwise leave tokens orphaned-and-rebindable or bound to a superseded
-    # URL/audience/scope set (the OAuth tables key on the mutable
-    # ``server_name`` and tokens are bound to the URL + audience + scopes
-    # active at mint/consent time).
+    # sec-2: leaving ``oauth_user`` cleared the encrypted client secret in the write above, as
+    # "disable OAuth" should: stale ciphertext would resurface if the row were flipped back. A
+    # clear is audited when it removed a secret or the request asked for one.
     if (
-        name_changing
-        or auth_type_purge
-        or url_changing
-        or as_url_purge
-        or audience_changing
-        or scopes_changing
+        secret_ct is not None
+        or "oauth_client_secret" in body
+        or existing.get("oauth_client_secret_ct") is not None
     ):
-        purge_target = existing.get("name", "")
-        if purge_target:
-            try:
-                storage.delete_mcp_oauth_rows_by_server_name(purge_target)
-            except Exception:
-                log.warning(
-                    "admin.mcp.purge_oauth_rows_failed server_id=%s",
-                    server_id,
-                    exc_info=True,
-                )
-
-    # sec-2: when the row is leaving ``oauth_user`` (to static/none or to
-    # oauth_obo), also clear the encrypted client secret column.  Operators
-    # expect "disable OAuth" to revoke credentials; leaving stale ciphertext
-    # that resurfaces if the row is flipped back is surprising and a footgun.
-    if leaving_oauth_user:
-        token_store = cast("MCPTokenStore | None", oauth_context(request.app.state).token_store)
-        if token_store is not None:
-            token_store.set_oauth_client_secret(server_id, None)
-            _audit_oauth_client_secret_set(
-                storage,
-                audit_uid,
-                server_id,
-                cleared=True,
-                cipher=token_store.cipher,
-                ip=ip,
-            )
-        else:
-            # No encryption key configured — clear the column directly so the
-            # operator's mental model holds.  No cipher fingerprint to audit.
-            storage.set_mcp_oauth_client_secret_ct(server_id, None)
-            _audit_oauth_client_secret_set(
-                storage,
-                audit_uid,
-                server_id,
-                cleared=True,
-                cipher=None,
-                ip=ip,
-            )
-
-    # Encrypt + persist the operator-supplied client secret via the dedicated
-    # writer.  Skip when the post-update auth_type is not oauth_user (the
-    # generic update above also clears OAuth columns in that case).
-    secret_set_state, err_resp = _apply_oauth_client_secret(
-        request,
-        server_id=server_id,
-        body=body,
-        auth_type=auth_type_now,
-        audit_uid=audit_uid,
-        storage=storage,
-        ip=ip,
-    )
-    if err_resp is not None:
-        return err_resp
+        _audit_client_secret_write(request, storage, audit_uid, server_id, secret_ct, ip)
 
     audit_detail = dict(updates)
     # Values that can carry a credential: a stdio server's arguments (--api-key ...) as much as
@@ -12665,8 +12749,8 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         audit_detail["header_references"] = header_refs
     if "oauth_client_secret" in body:
         audit_detail["oauth_client_secret"] = "(redacted)"
-        if secret_set_state is not None:
-            audit_detail["oauth_client_secret_set"] = secret_set_state
+        if secret_ct is not MCP_SECRET_UNCHANGED and auth_type_now == "oauth_user":
+            audit_detail["oauth_client_secret_set"] = secret_ct is not None
     record_audit(
         storage,
         audit_uid,
@@ -12705,25 +12789,21 @@ async def admin_delete_mcp_server(request: Request) -> JSONResponse:
     if existing is None:
         return JSONResponse({"error": "MCP server not found"}, status_code=404)
 
-    # Purge per-user tokens + pending OAuth states keyed on this name
-    # before the row goes away. The OAuth tables are keyed on the
-    # mutable ``server_name``; without this purge, a future server with
-    # the same name (and an attacker-controlled URL) would silently
-    # rebind those tokens. A future schema migration will replace this
-    # with a server_id FK + ON DELETE CASCADE; until then, explicit
-    # purge is the only safe path.
+    # The per-user tokens + pending OAuth states keyed on this name go in the
+    # same transaction as the row. The OAuth tables are keyed on the mutable
+    # ``server_name``; left behind, they would be rebound by a future server
+    # with the same name (and an attacker-controlled URL).
     existing_name = existing.get("name", "")
-    if existing_name:
-        try:
-            storage.delete_mcp_oauth_rows_by_server_name(existing_name)
-        except Exception:
-            log.warning(
-                "admin.mcp.purge_oauth_rows_failed server_id=%s",
-                server_id,
-                exc_info=True,
-            )
-
-    storage.delete_mcp_server(server_id)
+    try:
+        deleted = storage.delete_mcp_server(server_id)
+    except storage_errors():
+        log.warning("admin.mcp.delete_failed server_id=%s", server_id, exc_info=True)
+        in_doubt = _mcp_write_in_doubt(storage, server_id, lambda row: row is None)
+        if in_doubt is not None:
+            return in_doubt
+        deleted = True
+    if not deleted:  # another request deleted the server since the read above
+        return JSONResponse({"error": "MCP server not found"}, status_code=404)
 
     audit_uid, ip = _audit_context(request)
     record_audit(
@@ -13505,6 +13585,10 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
                 tls_skip_verify=tls_skip_verify,
                 created_by=audit_uid,
             )
+        except storage_errors():
+            log.warning("admin.mcp.import_failed name=%s", srv_name, exc_info=True)
+            errors.append(f"{srv_name}: could not be saved; nothing was changed")
+            continue
         except Exception as exc:
             errors.append(f"{srv_name}: {exc}")
             continue

@@ -1775,6 +1775,79 @@ class TestUpdateMcpServer:
 # ---------------------------------------------------------------------------
 
 
+def _plant_grant(storage: Any, name: str) -> None:
+    """A user token and a pending OAuth flow keyed by *name*, as a consent leaves them."""
+    import sqlalchemy as sa
+
+    from turnstone.core.storage._schema import oauth_tokens
+
+    with storage._engine.connect() as conn:
+        conn.execute(
+            sa.insert(oauth_tokens),
+            {
+                "user_id": "u1",
+                "token_key": name,
+                "access_token_ct": b"\x00ciphertext-a",
+                "refresh_token_ct": b"\x00ciphertext-r",
+                "expires_at": "2026-12-31T00:00:00",
+                "scopes": "openid",
+                "as_issuer": "https://as.example.com",
+                "audience": "https://orig.example.com",
+                "created": "2026-05-04T11:00:00",
+                "last_refreshed": None,
+            },
+        )
+        conn.commit()
+    storage.create_mcp_oauth_pending_state(
+        f"state-{name}",
+        "u1",
+        name,
+        "verifier",
+        "/",
+        as_issuer="https://as.example.com",
+        iss_parameter_supported=False,
+        server_id="",
+        server_url="https://orig.example.com/sse",
+        audience="https://orig.example.com",
+    )
+
+
+def _grant_survives(storage: Any, name: str) -> tuple[bool, bool]:
+    """Whether the token row and the pending flow planted under *name* are still there."""
+    import sqlalchemy as sa
+
+    from turnstone.core.storage._schema import mcp_oauth_pending
+
+    with storage._engine.connect() as conn:
+        pending = conn.execute(
+            sa.select(mcp_oauth_pending.c.state).where(mcp_oauth_pending.c.server_name == name)
+        ).fetchone()
+    return storage.get_oauth_token("u1", name) is not None, pending is not None
+
+
+def _failing_statement(storage: Any, prefix: str) -> Any:
+    """Make every statement starting with *prefix* fail as a dropped database connection does."""
+    import contextlib
+
+    import sqlalchemy as sa
+
+    def listener(
+        conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool
+    ) -> None:
+        if statement.startswith(prefix):
+            raise sa.exc.OperationalError(statement, {}, Exception("server closed the connection"))
+
+    @contextlib.contextmanager
+    def failing() -> Any:
+        sa.event.listen(storage._engine, "before_cursor_execute", listener)
+        try:
+            yield
+        finally:
+            sa.event.remove(storage._engine, "before_cursor_execute", listener)
+
+    return failing()
+
+
 class TestOAuthUrlCanonicalization:
     """User-scoped rows store the canonical RFC 8707 resource identifier.
 
@@ -1819,82 +1892,62 @@ class TestOAuthUrlCanonicalization:
         assert storage.get_mcp_server(r.json()["server_id"])["url"] == "https://MCP.Example.com/"
 
     def test_spelling_only_update_neither_purges_nor_clears_cache(self, client, storage):
-        from unittest.mock import patch
-
         r = self._create(client, "canon-spell", "https://orig.example.com/sse")
         assert r.status_code == 200, r.text
         sid = r.json()["server_id"]
         storage.update_mcp_server(sid, oauth_as_issuer_cached="https://as.example.com")
+        _plant_grant(storage, "canon-spell")
 
-        with patch.object(
-            storage,
-            "delete_mcp_oauth_rows_by_server_name",
-            wraps=storage.delete_mcp_oauth_rows_by_server_name,
-        ) as purge:
-            r2 = client.put(
-                f"/v1/api/admin/mcp-servers/{sid}",
-                json={"url": "https://ORIG.example.com:443/sse"},
-            )
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"url": "https://ORIG.example.com:443/sse"},
+        )
         assert r2.status_code == 200, r2.text
         row = storage.get_mcp_server(sid)
         assert row["url"] == "https://orig.example.com/sse"
         assert row["oauth_as_issuer_cached"] == "https://as.example.com"
-        purge.assert_not_called()
+        assert _grant_survives(storage, "canon-spell") == (True, True)
 
     def test_url_change_purges_and_clears_cached_issuer(self, client, storage):
-        from unittest.mock import patch
-
         r = self._create(client, "canon-move", "https://orig.example.com/sse")
         assert r.status_code == 200, r.text
         sid = r.json()["server_id"]
         storage.update_mcp_server(sid, oauth_as_issuer_cached="https://as.example.com")
+        _plant_grant(storage, "canon-move")
 
-        with patch.object(
-            storage,
-            "delete_mcp_oauth_rows_by_server_name",
-            wraps=storage.delete_mcp_oauth_rows_by_server_name,
-        ) as purge:
-            r2 = client.put(
-                f"/v1/api/admin/mcp-servers/{sid}",
-                json={"url": "https://orig.example.com/mcp"},
-            )
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"url": "https://orig.example.com/mcp"},
+        )
         assert r2.status_code == 200, r2.text
         row = storage.get_mcp_server(sid)
         assert row["url"] == "https://orig.example.com/mcp"
         assert row["oauth_as_issuer_cached"] is None
-        purge.assert_called_once_with("canon-move")
+        assert _grant_survives(storage, "canon-move") == (False, False)
 
     def test_as_override_change_purges_and_clears_cached_issuer(self, client, storage):
         # Pointing a row at a different authorization server is a
         # token-binding change: the stored refresh tokens were issued by the
         # old one, and the next refresh would present them to the new one.
-        from unittest.mock import patch
-
         r = self._create(client, "canon-as", "https://orig.example.com/sse")
         assert r.status_code == 200, r.text
         sid = r.json()["server_id"]
         storage.update_mcp_server(sid, oauth_as_issuer_cached="https://as.example.com")
+        _plant_grant(storage, "canon-as")
 
-        with patch.object(
-            storage,
-            "delete_mcp_oauth_rows_by_server_name",
-            wraps=storage.delete_mcp_oauth_rows_by_server_name,
-        ) as purge:
-            r2 = client.put(
-                f"/v1/api/admin/mcp-servers/{sid}",
-                json={"oauth_authorization_server_url": "https://as2.example.com"},
-            )
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_authorization_server_url": "https://as2.example.com"},
+        )
         assert r2.status_code == 200, r2.text
         row = storage.get_mcp_server(sid)
         assert row["oauth_authorization_server_url"] == "https://as2.example.com"
         assert row["oauth_as_issuer_cached"] is None
-        purge.assert_called_once_with("canon-as")
+        assert _grant_survives(storage, "canon-as") == (False, False)
 
     def test_as_override_resent_unchanged_does_not_purge(self, client, storage):
         # The admin form re-sends every pre-filled field, so an unrelated
         # save must not read as an authorization-server change.
-        from unittest.mock import patch
-
         r = client.post(
             "/v1/api/admin/mcp-servers",
             json={
@@ -1908,28 +1961,24 @@ class TestOAuthUrlCanonicalization:
         )
         assert r.status_code == 200, r.text
         sid = r.json()["server_id"]
+        _plant_grant(storage, "canon-as-noop")
 
-        with patch.object(
-            storage,
-            "delete_mcp_oauth_rows_by_server_name",
-            wraps=storage.delete_mcp_oauth_rows_by_server_name,
-        ) as purge:
-            r2 = client.put(
-                f"/v1/api/admin/mcp-servers/{sid}",
-                json={
-                    "oauth_authorization_server_url": "https://as.example.com",
-                    "enabled": False,
-                },
-            )
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "oauth_authorization_server_url": "https://as.example.com",
+                "enabled": False,
+            },
+        )
         assert r2.status_code == 200, r2.text
-        purge.assert_not_called()
+        assert _grant_survives(storage, "canon-as-noop") == (True, True)
 
-    def test_as_override_change_clears_a_dynamic_client_id(self, client, storage):
-        # A dynamically registered client_id was issued BY the old
-        # authorization server and means nothing at the new one; clearing it
-        # lets registration run again. A pre-registered id is the operator's
-        # own value and is left alone.
-        for mode, expected in (("dynamic", None), ("preregistered", "cli_seed")):
+    def test_as_override_change_clears_a_dcr_client_id(self, client, storage):
+        # A client_id registered by DCR was issued BY the old authorization
+        # server and means nothing at the new one; clearing it lets
+        # registration run again. A pre-registered id is the operator's own
+        # value and is left alone.
+        for mode, expected in (("dcr", None), ("preregistered", "cli_seed")):
             r = client.post(
                 "/v1/api/admin/mcp-servers",
                 json={
@@ -1950,6 +1999,256 @@ class TestOAuthUrlCanonicalization:
             )
             assert r2.status_code == 200, r2.text
             assert storage.get_mcp_server(sid)["oauth_client_id"] == expected, mode
+
+    def test_a_registration_mode_no_flow_runs_is_refused(self, client, storage):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "canon-mode",
+                "transport": "streamable-http",
+                "url": "https://orig.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_seed",
+                "oauth_registration_mode": "dynamic",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert storage.get_mcp_server_by_name("canon-mode") is None
+
+        r = self._create(client, "canon-mode", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}", json={"oauth_registration_mode": "dynamic"}
+        )
+        assert r2.status_code == 400, r2.text
+        assert storage.get_mcp_server(sid)["oauth_registration_mode"] is None
+
+    def test_a_rename_purges_the_old_names_grants(self, client, storage):
+        r = self._create(client, "canon-rename", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        _plant_grant(storage, "canon-rename")
+
+        r2 = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"name": "canon-renamed"})
+
+        assert r2.status_code == 200, r2.text
+        assert _grant_survives(storage, "canon-rename") == (False, False)
+
+    def test_a_delete_purges_its_grants(self, client, storage):
+        r = self._create(client, "canon-delete", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        _plant_grant(storage, "canon-delete")
+
+        r2 = client.delete(f"/v1/api/admin/mcp-servers/{sid}")
+
+        assert r2.status_code == 200, r2.text
+        assert _grant_survives(storage, "canon-delete") == (False, False)
+
+    def test_a_new_server_never_inherits_grants_left_under_its_name(self, client, storage):
+        _plant_grant(storage, "canon-reuse")
+
+        r = self._create(client, "canon-reuse", "https://elsewhere.example.com/sse")
+
+        assert r.status_code == 200, r.text
+        assert _grant_survives(storage, "canon-reuse") == (False, False)
+
+    def test_an_update_storage_cannot_finish_changes_nothing(self, client, storage):
+        r = self._create(client, "canon-fail", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        _plant_grant(storage, "canon-fail")
+
+        with (
+            _failing_statement(storage, "DELETE FROM mcp_oauth_pending"),
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as notify,
+        ):
+            r2 = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}",
+                json={"url": "https://orig.example.com/mcp"},
+            )
+        notify.assert_not_awaited()
+
+        assert r2.status_code == 503, r2.text
+        assert r2.json()["error"] == (
+            "The change could not be saved, and nothing was changed. Try again."
+        )
+        assert storage.get_mcp_server(sid)["url"] == "https://orig.example.com/sse"
+        assert _grant_survives(storage, "canon-fail") == (True, True)
+        assert storage.list_audit_events(action="mcp_server.update") == []
+
+    def test_a_delete_storage_cannot_finish_changes_nothing(self, client, storage):
+        r = self._create(client, "canon-fail-delete", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        _plant_grant(storage, "canon-fail-delete")
+
+        with (
+            _failing_statement(storage, "DELETE FROM mcp_servers"),
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as notify,
+        ):
+            r2 = client.delete(f"/v1/api/admin/mcp-servers/{sid}")
+        notify.assert_not_awaited()
+
+        assert r2.status_code == 503, r2.text
+        assert storage.get_mcp_server(sid) is not None
+        assert _grant_survives(storage, "canon-fail-delete") == (True, True)
+        assert storage.list_audit_events(action="mcp_server.delete") == []
+
+    _WRITERS = {
+        "create": "create_mcp_server",
+        "update": "update_mcp_server",
+        "delete": "delete_mcp_server",
+    }
+
+    def _send(self, client, action: str, sid: str | None):
+        if action == "create":
+            return self._create(client, "canon-in-doubt", "https://orig.example.com/sse")
+        if action == "update":
+            return client.put(
+                f"/v1/api/admin/mcp-servers/{sid}", json={"url": "https://orig.example.com/mcp"}
+            )
+        return client.delete(f"/v1/api/admin/mcp-servers/{sid}")
+
+    @pytest.mark.parametrize("action", ["create", "update", "delete"])
+    def test_a_write_whose_commit_landed_but_was_cut_off_completes(self, client, storage, action):
+        """The acknowledgement of the commit was lost: the row is read again, and the change is
+        audited and reloaded as after a success."""
+        import sqlalchemy as sa
+
+        sid = None
+        if action != "create":
+            r = self._create(client, "canon-in-doubt", "https://orig.example.com/sse")
+            assert r.status_code == 200, r.text
+            sid = r.json()["server_id"]
+        real = getattr(storage, self._WRITERS[action])
+
+        def _lost_acknowledgement(*args, **kwargs):
+            real(*args, **kwargs)
+            raise sa.exc.OperationalError("COMMIT", {}, Exception("connection lost"))
+
+        with (
+            patch.object(storage, self._WRITERS[action], side_effect=_lost_acknowledgement),
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as notify,
+        ):
+            r2 = self._send(client, action, sid)
+
+        assert r2.status_code == 200, r2.text
+        notify.assert_awaited()
+        assert len(storage.list_audit_events(action=f"mcp_server.{action}")) == 1
+
+    def test_a_cut_off_update_reads_as_landed_through_a_pin_set_since(self, client, storage):
+        """Discovery may pin the new issuer before the row is read again: the update still reads
+        as landed, since the cleared pin is not what the request set."""
+        import sqlalchemy as sa
+
+        r = self._create(client, "canon-in-doubt", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        real = storage.update_mcp_server
+
+        def _lost_acknowledgement(*args, **kwargs):
+            real(*args, **kwargs)
+            real(sid, oauth_as_issuer_cached="https://as.example.com")
+            raise sa.exc.OperationalError("COMMIT", {}, Exception("connection lost"))
+
+        with (
+            patch.object(storage, "update_mcp_server", side_effect=_lost_acknowledgement),
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as notify,
+        ):
+            r2 = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}", json={"url": "https://orig.example.com/mcp"}
+            )
+
+        assert r2.status_code == 200, r2.text
+        notify.assert_awaited()
+        assert len(storage.list_audit_events(action="mcp_server.update")) == 1
+
+    @pytest.mark.parametrize("action", ["create", "update", "delete"])
+    def test_an_in_doubt_write_that_cannot_be_read_again_may_have_been_saved(
+        self, client, storage, action
+    ):
+        import sqlalchemy as sa
+
+        sid = None
+        if action != "create":
+            r = self._create(client, "canon-in-doubt", "https://orig.example.com/sse")
+            assert r.status_code == 200, r.text
+            sid = r.json()["server_id"]
+        real_read = storage.get_mcp_server
+        attempted: list[bool] = []
+
+        def _write_fails(*args, **kwargs):
+            attempted.append(True)
+            raise sa.exc.OperationalError("COMMIT", {}, Exception("connection lost"))
+
+        def _read(server_id):
+            if attempted:
+                raise sa.exc.OperationalError("SELECT", {}, Exception("connection lost"))
+            return real_read(server_id)
+
+        with (
+            patch.object(storage, self._WRITERS[action], side_effect=_write_fails),
+            patch.object(storage, "get_mcp_server", side_effect=_read),
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as notify,
+        ):
+            r2 = self._send(client, action, sid)
+
+        assert r2.status_code == 503, r2.text
+        assert (
+            r2.json()["error"] == "The change may not have been saved. Check before trying again."
+        )
+        notify.assert_not_awaited()
+        assert storage.list_audit_events(action=f"mcp_server.{action}") == []
+
+    @pytest.mark.parametrize("secret_stored", [False, True], ids=["public-client", "with-secret"])
+    def test_dropping_a_registered_client_audits_only_a_secret_it_removed(
+        self, client, storage, secret_stored
+    ):
+        body = {
+            "name": "canon-dcr",
+            "transport": "streamable-http",
+            "url": "https://orig.example.com/sse",
+            "auth_type": "oauth_user",
+            "oauth_registration_mode": "dcr",
+        }
+        if secret_stored:
+            body["oauth_client_secret"] = "registered-secret"
+        r = client.post("/v1/api/admin/mcp-servers", json=body)
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        before = len(storage.list_audit_events(action="mcp_server.oauth.client_secret_set"))
+
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_authorization_server_url": "https://new-as.example.net"},
+        )
+
+        assert r2.status_code == 200, r2.text
+        assert storage.get_mcp_oauth_client_secret_ct(sid) is None
+        after = len(storage.list_audit_events(action="mcp_server.oauth.client_secret_set"))
+        assert after - before == (1 if secret_stored else 0)
 
     def test_update_rejects_fragment(self, client, storage):
         r = self._create(client, "canon-upd-reject", "https://orig.example.com/sse")
@@ -3095,24 +3394,19 @@ class TestOauthClientSecretLength:
         assert r.status_code == 200, r.text
 
     def test_the_writer_refuses_it_on_its_own(self, client, storage):
-        # The handlers refuse it before the row is written; the writer checks it again.
-        from turnstone.console.server import _apply_oauth_client_secret
+        # The handlers refuse it before the row is written; the step that prepares the stored
+        # value checks it again.
+        from turnstone.console.server import _client_secret_write
 
         sid = client.post("/v1/api/admin/mcp-servers", json=self._OAUTH).json()["server_id"]
         request = MagicMock()
         request.app = client.app
 
-        state, err = _apply_oauth_client_secret(
-            request,
-            server_id=sid,
-            body={"oauth_client_secret": "A" * 1025},
-            auth_type="oauth_user",
-            audit_uid="admin",
-            storage=storage,
-            ip="",
+        secret_ct, err = _client_secret_write(
+            request, {"oauth_client_secret": "A" * 1025}, auth_type="oauth_user"
         )
 
-        assert state is None
+        assert secret_ct is None
         assert err is not None
         assert json.loads(err.body) == {"error": self._TOO_LONG}
         stored = storage.get_mcp_server(sid)
@@ -4966,3 +5260,345 @@ class TestEnsureConsoleMcpClient:
         assert len(constructed) == 1, "double-construct: the ensure lock failed"
         assert app.state.mcp_client is constructed[0]
         assert all(r == {"added": [], "removed": [], "updated": []} for r in results)
+
+
+# ---------------------------------------------------------------------------
+# A dynamically registered client follows the authorization server
+# ---------------------------------------------------------------------------
+
+
+class TestDcrClientFollowsTheAuthorizationServer:
+    """When the server moves to another authorization server, a dynamically registered client
+    goes, id and secret alike, so its secret is never sent to the new one."""
+
+    @staticmethod
+    def _dcr_row(
+        client: Any,
+        storage: Any,
+        name: str,
+        *,
+        override: str | None = "https://as1.example.com",
+        mode: str = "dcr",
+    ) -> tuple[str, Any]:
+        body: dict[str, Any] = {
+            "name": name,
+            "transport": "streamable-http",
+            "url": "https://mcp.example.com/sse",
+            "auth_type": "oauth_user",
+            "oauth_registration_mode": mode,
+        }
+        if override:
+            body["oauth_authorization_server_url"] = override
+        r = client.post("/v1/api/admin/mcp-servers", json=body)
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        token_store = oauth_context(client.app.state).token_store
+        storage.update_mcp_server(sid, oauth_client_id="client-from-as1")
+        token_store.set_oauth_client_secret(sid, "secret-from-as1")
+        return sid, token_store
+
+    @staticmethod
+    def _state(storage: Any, token_store: Any, sid: str) -> tuple[Any, Any, Any]:
+        row = storage.get_mcp_server(sid)
+        return (
+            row["oauth_registration_mode"],
+            row["oauth_client_id"],
+            token_store.get_oauth_client_secret(sid),
+        )
+
+    def test_a_move_to_another_authorization_server_drops_the_client(self, client, storage):
+        sid, store = self._dcr_row(client, storage, "dcr-move")
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_authorization_server_url": "https://as2.example.com"},
+        )
+        assert r.status_code == 200, r.text
+        assert self._state(storage, store, sid) == ("dcr", None, None)
+        # A client id typed afterwards for the new server pairs with no old secret.
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_registration_mode": "preregistered", "oauth_client_id": "typed-for-as2"},
+        )
+        assert r.status_code == 200, r.text
+        assert self._state(storage, store, sid) == ("preregistered", "typed-for-as2", None)
+        assert len(storage.list_audit_events(action="mcp_server.oauth.client_secret_set")) == 1
+
+    @pytest.mark.parametrize(
+        ("client_id", "expected_id"),
+        [("client-from-as1", None), ("typed-for-as2", "typed-for-as2")],
+        ids=["the-stored-id-sent-back", "a-new-id"],
+    )
+    def test_one_save_that_moves_and_switches_to_preregistered(
+        self, client, storage, client_id: str, expected_id: str | None
+    ):
+        sid, store = self._dcr_row(client, storage, "dcr-switch")
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "oauth_authorization_server_url": "https://as2.example.com",
+                "oauth_registration_mode": "preregistered",
+                "oauth_client_id": client_id,
+            },
+        )
+
+        assert r.status_code == 200, r.text
+        assert self._state(storage, store, sid) == ("preregistered", expected_id, None)
+
+    def test_a_server_url_change_that_rediscovers_drops_the_client(self, client, storage):
+        sid, store = self._dcr_row(client, storage, "dcr-url", override=None)
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}", json={"url": "https://mcp-b.example.com/mcp"}
+        )
+
+        assert r.status_code == 200, r.text
+        assert self._state(storage, store, sid) == ("dcr", None, None)
+
+    def test_a_secret_typed_with_the_move_is_kept(self, client, storage):
+        sid, store = self._dcr_row(client, storage, "dcr-typed")
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "oauth_authorization_server_url": "https://as2.example.com",
+                "oauth_registration_mode": "preregistered",
+                "oauth_client_id": "typed-for-as2",
+                "oauth_client_secret": "typed-secret",
+            },
+        )
+
+        assert r.status_code == 200, r.text
+        assert self._state(storage, store, sid) == (
+            "preregistered",
+            "typed-for-as2",
+            "typed-secret",
+        )
+
+    def test_a_save_that_moves_nothing_keeps_the_client(self, client, storage):
+        sid, store = self._dcr_row(client, storage, "dcr-same")
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "oauth_authorization_server_url": "https://as1.example.com",
+                "oauth_registration_mode": "dcr",
+                "oauth_client_id": "client-from-as1",
+                "url": "https://mcp.example.com/sse",
+                "enabled": False,
+            },
+        )
+
+        assert r.status_code == 200, r.text
+        assert self._state(storage, store, sid) == ("dcr", "client-from-as1", "secret-from-as1")
+
+    def test_a_preregistered_client_is_the_operators_and_stays(self, client, storage):
+        sid, store = self._dcr_row(client, storage, "dcr-prereg", mode="preregistered")
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_authorization_server_url": "https://as2.example.com"},
+        )
+
+        assert r.status_code == 200, r.text
+        assert self._state(storage, store, sid) == (
+            "preregistered",
+            "client-from-as1",
+            "secret-from-as1",
+        )
+
+    def test_a_switch_into_dynamic_registration_with_a_move_drops_the_old_client(
+        self, client, storage
+    ):
+        sid, store = self._dcr_row(client, storage, "dcr-into", mode="preregistered")
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "oauth_authorization_server_url": "https://as2.example.com",
+                "oauth_registration_mode": "dcr",
+                "oauth_client_id": "client-from-as1",
+            },
+        )
+
+        assert r.status_code == 200, r.text
+        assert self._state(storage, store, sid) == ("dcr", None, None)
+
+
+# ---------------------------------------------------------------------------
+# An update decides from the row it writes
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateDecidesFromTheRowItWrites:
+    """The purge and the client decisions come from the row read before the body; the write
+    applies only while the row still holds those values."""
+
+    @staticmethod
+    def _oauth_server(client: Any, name: str) -> str:
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": name,
+                "transport": "streamable-http",
+                "url": "https://legit.example.com/mcp",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli",
+            },
+        )
+        assert r.status_code == 200, r.text
+        return str(r.json()["server_id"])
+
+    def test_a_binding_changed_by_another_request_meanwhile_answers_409(self, client, storage):
+        sid = self._oauth_server(client, "cas-race")
+        _plant_grant(storage, "cas-race")
+
+        async def _other_request_lands(*_args: Any, **_kwargs: Any) -> None:
+            # Another admin points the server elsewhere while this request awaits its checks.
+            storage.update_mcp_server(
+                sid, url="https://elsewhere.example.com/mcp", purge_oauth_rows=True
+            )
+            _plant_grant(storage, "cas-race")
+
+        with (
+            patch(
+                "turnstone.console.server._check_mcp_secret_fields",
+                side_effect=_other_request_lands,
+            ),
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as notify,
+        ):
+            r = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}",
+                json={"url": "https://legit.example.com/mcp", "enabled": False},
+            )
+
+        assert r.status_code == 409, r.text
+        row = storage.get_mcp_server(sid)
+        assert row["url"] == "https://elsewhere.example.com/mcp"
+        assert row["enabled"] is True
+        assert storage.list_audit_events(action="mcp_server.update") == []
+        notify.assert_not_awaited()
+
+    def test_a_server_deleted_meanwhile_answers_404(self, client, storage):
+        sid = self._oauth_server(client, "cas-gone")
+
+        async def _deleted(*_args: Any, **_kwargs: Any) -> None:
+            storage.delete_mcp_server(sid)
+
+        with patch("turnstone.console.server._check_mcp_secret_fields", side_effect=_deleted):
+            r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"enabled": False})
+
+        assert r.status_code == 404, r.text
+
+    def test_a_stored_registration_mode_sent_back_unchanged_is_kept(self, client, storage):
+        """A row saved with the old 'dynamic' value stays editable by a client that writes the
+        row back; only a change of the value is checked."""
+        sid = self._oauth_server(client, "cas-dynamic")
+        storage.update_mcp_server(sid, oauth_registration_mode="dynamic")
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"enabled": False, "oauth_registration_mode": "dynamic"},
+        )
+
+        assert r.status_code == 200, r.text
+        row = storage.get_mcp_server(sid)
+        assert (row["enabled"], row["oauth_registration_mode"]) == (False, "dynamic")
+
+
+# ---------------------------------------------------------------------------
+# Writes storage cannot finish
+# ---------------------------------------------------------------------------
+
+
+class TestServerWritesStorageCannotFinish:
+    @staticmethod
+    def _quiet_reload() -> Any:
+        return patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        )
+
+    def test_a_create_storage_cannot_finish_changes_nothing(self, client, storage):
+        with (
+            _failing_statement(storage, "DELETE FROM oauth_tokens"),
+            self._quiet_reload() as notify,
+        ):
+            r = client.post(
+                "/v1/api/admin/mcp-servers",
+                json={
+                    "name": "create-fail",
+                    "transport": "streamable-http",
+                    "url": "https://mcp.example.com/mcp",
+                },
+            )
+
+        assert r.status_code == 503, r.text
+        assert r.json()["error"] == (
+            "The change could not be saved, and nothing was changed. Try again."
+        )
+        assert storage.get_mcp_server_by_name("create-fail") is None
+        assert storage.list_audit_events(action="mcp_server.create") == []
+        notify.assert_not_awaited()
+
+    def test_a_delete_of_a_server_gone_meanwhile_answers_404(self, client, storage):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "gone", "transport": "streamable-http", "url": "https://m.example.com"},
+        )
+        sid = r.json()["server_id"]
+        row = storage.get_mcp_server(sid)
+        storage.delete_mcp_server(sid)
+
+        with (
+            patch.object(storage, "get_mcp_server", return_value=row),
+            self._quiet_reload() as notify,
+        ):
+            r2 = client.delete(f"/v1/api/admin/mcp-servers/{sid}")
+
+        assert r2.status_code == 404, r2.text
+        assert storage.list_audit_events(action="mcp_server.delete") == []
+        notify.assert_not_awaited()
+
+    def test_a_secret_sent_with_an_update_storage_cannot_finish_is_not_stored(
+        self, client, storage
+    ):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "secret-fail",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/mcp",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli",
+            },
+        )
+        sid = r.json()["server_id"]
+
+        with _failing_statement(storage, "UPDATE mcp_servers"), self._quiet_reload() as notify:
+            r2 = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}", json={"oauth_client_secret": "new-secret"}
+            )
+
+        assert r2.status_code == 503, r2.text
+        assert storage.get_mcp_oauth_client_secret_ct(sid) is None
+        notify.assert_not_awaited()
+
+    def test_an_import_storage_cannot_finish_reports_a_fixed_error(self, client, storage):
+        config = {"mcpServers": {"kept-out": {"url": "https://mcp.example.com/mcp"}}}
+
+        with (
+            _failing_statement(storage, "INSERT OR IGNORE INTO mcp_servers"),
+            self._quiet_reload(),
+        ):
+            r = client.post("/v1/api/admin/mcp-servers/import", json={"config": config})
+
+        assert r.status_code == 200, r.text
+        assert r.json()["errors"] == ["kept-out: could not be saved; nothing was changed"]
+        assert storage.get_mcp_server_by_name("kept-out") is None
