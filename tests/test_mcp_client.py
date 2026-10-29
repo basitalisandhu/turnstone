@@ -1390,6 +1390,40 @@ class TestLastRefreshTracking:
         assert status["last_refresh_at"] == 12345.5
         assert status["last_refresh_outcome"] == "ok"
 
+    @pytest.mark.parametrize(
+        ("cfg", "transport", "command", "url"),
+        [
+            (
+                {"url": "https://docs.example.com/mcp"},
+                "streamable-http",
+                "",
+                "https://docs.example.com/mcp",
+            ),
+            (
+                {"type": "stdio", "url": "https://docs.example.com/mcp"},
+                "streamable-http",
+                "",
+                "https://docs.example.com/mcp",
+            ),
+            (
+                {"type": "http", "url": "https://h.example.com/mcp"},
+                "http",
+                "",
+                "https://h.example.com/mcp",
+            ),
+            ({"command": "uvx", "args": ["srv"]}, "stdio", "uvx", ""),
+        ],
+    )
+    def test_get_server_status_reports_the_transport_it_connects_with(
+        self, cfg: dict[str, Any], transport: str, command: str, url: str
+    ) -> None:
+        """An entry with a ``url`` and no ``type`` connects over Streamable HTTP, so its status
+        reports that transport and the URL, not ``stdio`` with an empty command (#1494)."""
+        mgr = MCPClientManager({})
+        mgr._server_configs["srv"] = cfg
+        status = mgr.get_server_status("srv")
+        assert (status["transport"], status["command"], status["url"]) == (transport, command, url)
+
 
 class TestListeners:
     def test_add_and_notify(self):

@@ -650,6 +650,15 @@ def _is_followed_post_redirect(response: httpx2.Response) -> bool:
     return _within_origin(sent_url, target)
 
 
+def _connects_over_http(cfg: dict[str, Any]) -> bool:
+    """Whether a server entry connects over Streamable HTTP.
+
+    An entry with a ``url`` connects over HTTP even when it names no ``type`` (or names ``stdio``),
+    so the connect paths and the status report decide by this one rule.
+    """
+    return cfg.get("type", "stdio") in ("http", "streamable-http") or "url" in cfg
+
+
 def _tls_skip_verify(cfg: dict[str, Any]) -> bool:
     """Whether a static server's *cfg* turns certificate verification off.
 
@@ -3854,8 +3863,7 @@ class MCPClientManager:
         state.relisten_requested = relisten_requested
         try:
             async with AsyncExitStack() as stack:
-                transport = cfg.get("type", "stdio")
-                if transport in ("http", "streamable-http") or "url" in cfg:
+                if _connects_over_http(cfg):
                     async with asyncio.timeout(self._CONNECT_TIMEOUT):
                         http_client = await stack.enter_async_context(
                             _make_capturing_http_client(
@@ -3998,8 +4006,7 @@ class MCPClientManager:
         # pre-flight's) is worded with none, never with the last connection's.
         state.http_capture = None
 
-        transport = cfg.get("type", "stdio")
-        is_http = transport in ("http", "streamable-http") or "url" in cfg
+        is_http = _connects_over_http(cfg)
         if is_http:
             # Pre-flight TCP check: fail fast before spawning an owner and
             # entering the SDK's anyio task group at all (an ECONNREFUSED
@@ -8142,6 +8149,9 @@ class MCPClientManager:
         connected = state is not None and state.session is not None
         cfg = self._server_configs.get(name, {})
         transport = cfg.get("type", "stdio")
+        if _connects_over_http(cfg) and transport not in ("http", "streamable-http"):
+            # An untyped entry with a url connects over HTTP; report what it connects with.
+            transport = "streamable-http"
         cb_deadline = self._circuit_open_until.get(name)
         cb_open = cb_deadline is not None and time.monotonic() < cb_deadline
         last_refresh = self._last_refresh.get(name)
