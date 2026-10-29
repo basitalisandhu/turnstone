@@ -115,7 +115,7 @@ note right
   - MCP template exists? → update
   - New? → create (origin="mcp",
     readonly=True)
-  Removed prompts → delete
+  Removed prompts → delete unless disabled
   Protected by _sync_lock
 end note
 

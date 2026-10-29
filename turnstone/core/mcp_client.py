@@ -6491,17 +6491,17 @@ class MCPClientManager:
         pill) so they render consistently off ONE source of truth.
 
         Each server's refresh runs with ``sync_unchanged=False``: a server
-        whose prompt catalog changed syncs the governance templates at
-        once, and the pass syncs them once more after its last server,
-        whether each server succeeded, failed or was skipped, so a pass
-        that changes nothing syncs once. That final sync is the pass's
-        repair step: it retries a save that failed after a catalog changed,
-        removes rows no catalog lists (such as those of a catalog withdrawn
-        without a save, or another writer's), resets promoted defaults and
-        refreshes timestamps. A pass that is cancelled or abandoned skips
-        only that: every catalog it changed was saved when it changed, and
-        a gap left before the pass waits for the next save. A server
-        reconnected here syncs on its own, as every connect does.
+        whose prompt catalog changed syncs the governance templates at once,
+        and the pass syncs them once more after its last server, whether each
+        server succeeded, failed or was skipped, so a pass that changes
+        nothing syncs once. That final sync is the pass's repair step: it
+        retries a save that failed after a catalog changed, removes enabled
+        rows no catalog lists (such as those of a catalog withdrawn without a
+        save, or another writer's), resets promoted defaults and refreshes
+        timestamps. A pass that is cancelled or abandoned skips only that:
+        every catalog it changed was saved when it changed, and a gap left
+        before the pass waits for the next save. A server reconnected here
+        syncs on its own, as every connect does.
 
         When garbage collection closes a pass that a stopped loop abandoned,
         on whatever thread collects, the pass must refresh no further server
@@ -7282,7 +7282,7 @@ class MCPClientManager:
         between ``set_storage()`` (main thread) and MCP background thread.
 
         Does nothing once :meth:`shutdown` has begun clearing state: it
-        empties the catalog, and syncing that would delete every MCP
+        empties the catalog, and syncing that would delete every enabled MCP
         template. Shutdown closes syncs before it empties the catalog,
         without this lock, so the check comes after the catalog is
         copied: a copy taken after the catalog was emptied always sees
@@ -7366,11 +7366,20 @@ class MCPClientManager:
                 )
                 added.append(name)
 
-        # Remove MCP templates whose prompts no longer exist
+        # Remove MCP templates whose prompts no longer exist here. A row an admin disabled stays,
+        # and the prompt listed again under that name returns to it, still disabled and with the
+        # admin's settings, never as a new, enabled row. The delete is conditional on the row
+        # still being enabled, so a disable that commits after this listing also keeps it.
         existing_mcp = storage.list_prompt_templates_by_origin("mcp")
         for tpl in existing_mcp:
-            if tpl["name"] not in current_names:
-                storage.delete_prompt_template(tpl["template_id"])
+            if (
+                tpl["name"] not in current_names
+                # A row this listing already shows disabled is not even tried, so a kept row
+                # costs no write on every sync; one listed enabled goes through the conditional
+                # delete, which spares it if a disable commits meanwhile.
+                and tpl.get("enabled", True)
+                and storage.delete_prompt_template_if_enabled(tpl["template_id"])
+            ):
                 removed.append(tpl["name"])
 
         if added or removed:
@@ -8058,8 +8067,8 @@ class MCPClientManager:
         breaker to stop them, calls to its tools, resources and prompts (each a model tool) would
         otherwise rerun the whole connect every time. Withdrawn prompts are synced to the
         governance templates at once, like any other catalog change: the sync is global, so the
-        next one anywhere would delete the server's rows anyway, at a time set by unrelated events.
-        The rows come back when the server does.
+        next one anywhere would delete the server's enabled rows anyway, at a time set by unrelated
+        events. A row an admin disabled stays. The rows come back when the server does.
         """
         text = self._connect_failure_text(name, exc)
         self._set_error(name, text)

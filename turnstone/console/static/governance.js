@@ -1603,9 +1603,14 @@ function _renderSkillShelfProvenance(tmpl, isReadonly, isUnlockedInstall) {
     if (tmpl.source_url || (tmpl.origin && tmpl.origin !== "manual")) {
       chipText = "installed";
     }
-    rest = tmpl.source_url
-      ? tmpl.source_url + " · locked — unlock to edit"
-      : "locked — unlock to edit";
+    if (tmpl.origin === "mcp") {
+      // A mirrored MCP prompt follows its server and never unlocks.
+      rest = "from MCP server " + (tmpl.mcp_server || "") + " · locked";
+    } else {
+      rest = tmpl.source_url
+        ? tmpl.source_url + " · locked — unlock to edit"
+        : "locked — unlock to edit";
+    }
   } else if (isUnlockedInstall) {
     chipText = "customized";
     rest = "from " + (tmpl.source_url || "upstream");
@@ -2049,7 +2054,8 @@ function showEditTemplateModal(tmplId) {
   // Origin + locked-state provenance renders in the foot meta lane.
   _renderSkillShelfProvenance(tmpl, isReadonly, isUnlockedInstall);
   const lockBtn = document.getElementById("skl-lock");
-  lockBtn.hidden = !isReadonly;
+  // The server refuses to unlock a mirrored MCP prompt, so it gets no unlock button.
+  lockBtn.hidden = !isReadonly || tmpl.origin === "mcp";
   lockBtn.dataset.skillId = tmplId;
   lockBtn.dataset.skillName = tmpl.name || "";
   document.getElementById("skl-submit").textContent = "Save";
@@ -2102,11 +2108,14 @@ function showEditTemplateModal(tmplId) {
     // Focus management — only on the initial open. For readonly skills,
     // prefer the head lock button so keyboard users land on the unlock
     // affordance instead of having to Tab past every disabled spec field
-    // to reach it.
-    if (isReadonly) {
-      lockBtn.focus();
-    } else {
+    // to reach it. A mirrored MCP prompt has none; its enabled switch is
+    // the first control that applies.
+    if (!isReadonly) {
       document.getElementById("skl-name").focus();
+    } else if (lockBtn.hidden) {
+      document.getElementById("sklc-enabled").focus();
+    } else {
+      lockBtn.focus();
     }
   }
 }

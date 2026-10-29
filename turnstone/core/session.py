@@ -23735,7 +23735,9 @@ class ChatSession:
         # that the prepare-time filter would no longer accept.  If it
         # went unreadonly, the prepare-time filter was too restrictive
         # but no harm — proceed with whatever fields survived prepare.
-        current_row = storage.get_prompt_template(template_id) or {}
+        current_row = storage.get_prompt_template(template_id)
+        if current_row is None:
+            return self._refuse_deleted_skill(call_id, "update", name)
         if bool(current_row.get("readonly")) and not item.get("readonly"):
             allowed = self._SKILLS_READONLY_FIELDS
             filtered = {k: v for k, v in item["updates"].items() if k in allowed}
@@ -23771,17 +23773,19 @@ class ChatSession:
             storage.create_skill_version(
                 skill_id=template_id,
                 version=next_version,
-                snapshot=json.dumps(storage.get_prompt_template(template_id) or {}, default=str),
+                snapshot=json.dumps(current_row, default=str),
                 changed_by=self._user_id,
             )
         except Exception:
             log.warning("skills.update.snapshot_failed name=%s", name, exc_info=True)
         try:
-            storage.update_prompt_template(template_id, **item["updates"])
+            found = storage.update_prompt_template(template_id, **item["updates"])
         except Exception as e:
             msg = f"Error: skills update failed: {e}"
             self._report_tool_result(call_id, "skills", msg, is_error=True)
             return call_id, msg
+        if not found:
+            return self._refuse_deleted_skill(call_id, "update", name)
         action = "skill.update.config" if item.get("readonly") else "skill.update"
         self._audit_skill_action(
             storage,
@@ -23905,11 +23909,13 @@ class ChatSession:
             return call_id, err
         storage = get_storage()
         try:
-            storage.update_prompt_template(template_id, enabled=enable)
+            found = storage.update_prompt_template(template_id, enabled=enable)
         except Exception as e:
             msg = f"Error: skills {verb} failed: {e}"
             self._report_tool_result(call_id, "skills", msg, is_error=True)
             return call_id, msg
+        if not found:
+            return self._refuse_deleted_skill(call_id, verb, name)
         self._audit_skill_action(
             storage,
             f"skill.{verb}",
@@ -23924,6 +23930,24 @@ class ChatSession:
         return call_id, output
 
     # -- shared dispatch + helpers -------------------------------------------
+
+    def _refuse_deleted_skill(self, call_id: str, verb: str, name: str) -> tuple[str, str]:
+        """Refuse a skills write whose row was deleted after it was approved; the skill itself is
+        not changed (an update may already have written its history snapshot).
+
+        An MCP prompt's row goes when its server stops listing the prompt, and a prompt listed
+        again comes back as a new row, which needs an approval of its own.
+        """
+        msg = self._skill_hint(
+            f"{verb}: skill '{name}' no longer exists; nothing was changed",
+            system_reminder=(
+                "Use skills(action='find', enabled_only=false) "
+                "to list every skill including currently-disabled "
+                "ones."
+            ),
+        )
+        self._report_tool_result(call_id, "skills", msg, is_error=True)
+        return call_id, msg
 
     def _exec_skills(self, item: dict[str, Any]) -> tuple[str, str]:
         action = item["action"]

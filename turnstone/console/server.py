@@ -9107,6 +9107,24 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     return JSONResponse(_skill_to_response(skill))
 
 
+# Optional skill fields a PUT may send as null to mean "leave unchanged". ``description`` refuses
+# null on purpose, and the session config fields keep their own null rules.
+_SKILL_NULL_MEANS_UNCHANGED = frozenset(
+    {
+        "name",
+        "content",
+        "category",
+        "variables",
+        "author",
+        "version",
+        "license",
+        "compatibility",
+        "tags",
+        "priority",
+    }
+)
+
+
 async def admin_update_skill(request: Request) -> JSONResponse:
     """PUT /v1/api/admin/skills/{skill_id} — update a skill."""
     import json as _json
@@ -9131,6 +9149,14 @@ async def admin_update_skill(request: Request) -> JSONResponse:
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
+    if is_readonly:
+        # A locked row changes only its runtime config. Every other field is dropped before any is
+        # parsed or compared: the skill editor sends them all back, and a value that would not be
+        # written (a mirrored prompt's name the editor trimmed, say) must not refuse the save, a
+        # disable included.
+        body = {k: v for k, v in body.items() if k in _SKILL_RUNTIME_CONFIG_FIELDS}
+    # A null optional field is left unchanged, as an absent one is; the request schema allows it.
+    body = {k: v for k, v in body.items() if v is not None or k not in _SKILL_NULL_MEANS_UNCHANGED}
 
     # Session config fields via shared helper
     session_fields, session_err = _parse_skill_session_config(body)
@@ -9140,6 +9166,13 @@ async def admin_update_skill(request: Request) -> JSONResponse:
     updates: dict[str, Any] = dict(session_fields)
     if "name" in body:
         updates["name"] = str(body["name"]).strip()[:256]
+        if existing.get("origin") == "mcp" and updates["name"] != existing.get("name"):
+            # The sync finds a mirrored prompt by the name its server gives it: a renamed row
+            # would be left behind while the prompt came back under that name as a new skill.
+            return JSONResponse(
+                {"error": "A skill mirrored from an MCP server cannot be renamed"},
+                status_code=400,
+            )
         existing_by_name = storage.get_prompt_template_by_name(updates["name"])
         if existing_by_name and existing_by_name["template_id"] != skill_id:
             return JSONResponse({"error": "Skill name already exists"}, status_code=409)
@@ -9233,7 +9266,10 @@ async def admin_update_skill(request: Request) -> JSONResponse:
         changed_by=audit_uid_pre,
     )
 
-    storage.update_prompt_template(skill_id, **updates)
+    if not storage.update_prompt_template(skill_id, **updates):
+        # Deleted since it was read (by another host's MCP prompt sync, for one): nothing
+        # changed, so nothing is audited as done.
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
 
     audit_uid, ip = _audit_context(request)
     record_audit(
@@ -9247,6 +9283,8 @@ async def admin_update_skill(request: Request) -> JSONResponse:
     )
 
     updated_skill = storage.get_prompt_template(skill_id)
+    if updated_skill is None:
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
     rc_map = storage.count_skill_resources_bulk([skill_id])
     return JSONResponse(_skill_to_response(updated_skill, resource_count=rc_map.get(skill_id, 0)))
 
@@ -9526,12 +9564,13 @@ async def admin_rescan_skill(request: Request) -> JSONResponse:
     content = skill.get("content", "")
     allowed_tools = skill.get("allowed_tools", "[]")
     risk_level, scan_report, scan_version = scan_skill_content(content, allowed_tools)
-    storage.update_prompt_template(
+    if not storage.update_prompt_template(
         skill_id,
         risk_level=risk_level,
         scan_report=scan_report,
         scan_version=scan_version,
-    )
+    ):
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
     return JSONResponse(
         {
             "risk_level": risk_level,
@@ -9567,6 +9606,11 @@ async def admin_unlock_skill(request: Request) -> JSONResponse:
     existing = storage.get_prompt_template(skill_id)
     if existing is None:
         return JSONResponse({"error": "Skill not found"}, status_code=404)
+    if existing.get("origin") == "mcp":
+        # Its server owns the text, and the sync keeps the row in step with it.
+        return JSONResponse(
+            {"error": "A skill mirrored from an MCP server cannot be unlocked"}, status_code=400
+        )
     if not existing.get("readonly"):
         return JSONResponse({"error": "Skill is already unlocked"}, status_code=400)
 

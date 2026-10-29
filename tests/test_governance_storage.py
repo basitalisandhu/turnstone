@@ -475,6 +475,20 @@ class TestPromptTemplateCRUD:
     def test_update_prompt_template_nonexistent(self, db):
         assert db.update_prompt_template("missing", content="x") is False
 
+    def test_delete_prompt_template_if_enabled_spares_a_disabled_row(self, db):
+        db.create_prompt_template("on", "enabled-one", "general", "Hello!")
+        db.create_prompt_template("off", "disabled-one", "general", "Hello!")
+        db.update_prompt_template("off", enabled=False)
+
+        assert db.delete_prompt_template_if_enabled("on") is True
+        assert db.delete_prompt_template_if_enabled("off") is False
+        assert db.delete_prompt_template_if_enabled("missing") is False
+
+        assert db.get_prompt_template("on") is None
+        kept = db.get_prompt_template("off")
+        assert kept is not None
+        assert kept["enabled"] is False
+
     def test_delete_prompt_template(self, db):
         db.create_prompt_template("t1", "greeting", "general", "Hello!")
         ok = db.delete_prompt_template("t1")

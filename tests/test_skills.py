@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from typing import TYPE_CHECKING, Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from starlette.applications import Starlette
@@ -1081,6 +1081,96 @@ class TestSkillAPI:
         )
         resp = api_client.delete("/v1/api/admin/skills/s1")
         assert resp.status_code == 200
+
+    def test_unlock_refuses_a_skill_mirrored_from_an_mcp_server(self, api_client, api_storage):
+        _create_template(
+            api_storage,
+            "m1",
+            "mcp__srv__p",
+            "prompt text",
+            origin="mcp",
+            mcp_server="srv",
+            readonly=True,
+        )
+
+        resp = api_client.post("/v1/api/admin/skills/m1/unlock")
+
+        assert resp.status_code == 400
+        assert resp.json() == {"error": "A skill mirrored from an MCP server cannot be unlocked"}
+        row = api_storage.get_prompt_template("m1")
+        assert row is not None
+        assert row["readonly"] is True
+        assert api_storage.list_skill_versions("m1") == []
+
+    def test_a_mirrored_mcp_skill_keeps_its_name(self, api_client, api_storage):
+        """Even one unlocked before unlocking was refused for mirrored prompts."""
+        _create_template(
+            api_storage,
+            "m1",
+            "mcp__srv__p",
+            "prompt text",
+            origin="mcp",
+            mcp_server="srv",
+            readonly=False,
+        )
+
+        renamed = api_client.put("/v1/api/admin/skills/m1", json={"name": "my-copy"})
+        same_name = api_client.put(
+            "/v1/api/admin/skills/m1", json={"name": "mcp__srv__p", "enabled": False}
+        )
+
+        assert renamed.status_code == 400
+        assert renamed.json() == {"error": "A skill mirrored from an MCP server cannot be renamed"}
+        assert same_name.status_code == 200
+        row = api_storage.get_prompt_template("m1")
+        assert row is not None
+        assert row["name"] == "mcp__srv__p"
+        assert row["enabled"] is False
+
+    def test_an_update_to_a_skill_deleted_meanwhile_is_not_found_and_not_audited(
+        self, api_client, api_storage
+    ):
+        """Another host's sync deletes the row after the handler read it."""
+        _create_template(
+            api_storage,
+            "m1",
+            "mcp__srv__p",
+            "prompt text",
+            origin="mcp",
+            mcp_server="srv",
+            readonly=True,
+        )
+        real_update = api_storage.update_prompt_template
+
+        def _deleted_first(template_id, **fields):
+            api_storage.delete_prompt_template(template_id)
+            return real_update(template_id, **fields)
+
+        with patch.object(api_storage, "update_prompt_template", side_effect=_deleted_first):
+            resp = api_client.put("/v1/api/admin/skills/m1", json={"enabled": False})
+
+        assert resp.status_code == 404
+        assert api_storage.list_audit_events(resource_id="m1") == []
+
+    def test_an_update_whose_skill_is_deleted_right_after_answers_404(
+        self, api_client, api_storage
+    ):
+        _create_template(api_storage, "s1", "plain", "text", description="d")
+        real_update = api_storage.update_prompt_template
+
+        def _deleted_after(template_id, **fields):
+            found = real_update(template_id, **fields)
+            api_storage.delete_prompt_template(template_id)
+            return found
+
+        with patch.object(api_storage, "update_prompt_template", side_effect=_deleted_after):
+            resp = api_client.put("/v1/api/admin/skills/s1", json={"priority": 3})
+
+        assert resp.status_code == 404
+        # The update did happen before the delete, so it is audited.
+        assert [e["action"] for e in api_storage.list_audit_events(resource_id="s1")] == [
+            "skill.update"
+        ]
 
     def test_unlock_skill_flips_readonly(self, api_client, api_storage):
         """POST /unlock on a readonly skill flips readonly to False."""
@@ -2265,3 +2355,131 @@ class TestSkillBooleanFields:
             {"allowed_tools": stored},
             None,
         )
+
+
+class TestMirroredSkillSaves:
+    """The skill editor's Save of a locked mirrored prompt applies its runtime config, whatever
+    the editor did to the spec fields it sends back."""
+
+    @pytest.mark.parametrize(
+        ("stored_name", "stored_description"),
+        [
+            ("mcp__srv__p ", "a prompt"),
+            ("mcp__srv__p" + chr(0xA0), "a prompt"),
+            ("mcp__srv__p" + chr(0x1F), "a prompt"),
+            ("mcp__srv__p", chr(0xFEFF)),
+        ],
+        ids=["trailing-space", "nbsp", "unit-separator", "bom-description"],
+    )
+    def test_the_editors_disable_reaches_a_mirrored_prompt(
+        self, api_client, api_storage, stored_name: str, stored_description: str
+    ):
+        _create_template(
+            api_storage,
+            "m1",
+            stored_name,
+            "prompt text",
+            origin="mcp",
+            mcp_server="srv",
+            readonly=True,
+            description=stored_description,
+        )
+
+        # What the editor sends: every field, trimmed the way the browser trims them.
+        resp = api_client.put(
+            "/v1/api/admin/skills/m1",
+            json={
+                "name": stored_name.strip(),
+                "description": stored_description.strip(),
+                "content": "prompt text",
+                "category": "general",
+                "enabled": False,
+                "auto_approve": False,
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        row = api_storage.get_prompt_template("m1")
+        assert row is not None
+        assert row["enabled"] is False
+        assert row["name"] == stored_name
+
+    def test_a_null_optional_field_leaves_it_unchanged(self, api_client, api_storage):
+        _create_template(
+            api_storage,
+            "s1",
+            "plain",
+            "the text",
+            description="d",
+            category="cat",
+            tags='["t"]',
+            author="me",
+            priority=5,
+        )
+        before = api_storage.get_prompt_template("s1")
+
+        resp = api_client.put(
+            "/v1/api/admin/skills/s1",
+            json={
+                "name": None,
+                "content": None,
+                "category": None,
+                "tags": None,
+                "author": None,
+                "variables": None,
+                "version": None,
+                "license": None,
+                "compatibility": None,
+                "priority": None,
+                "auto_approve": True,
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        after = api_storage.get_prompt_template("s1")
+        assert after is not None and before is not None
+        for field in (
+            "name",
+            "content",
+            "category",
+            "tags",
+            "author",
+            "variables",
+            "version",
+            "license",
+            "compatibility",
+            "priority",
+        ):
+            assert after[field] == before[field], field
+        assert after["auto_approve"] is True
+
+    def test_a_rescan_of_a_skill_deleted_meanwhile_answers_404(self, api_storage):
+        from turnstone.console.server import admin_rescan_skill
+
+        _create_template(api_storage, "s1", "plain", "text", description="d")
+        app = Starlette(
+            routes=[
+                Mount(
+                    "/v1",
+                    routes=[
+                        Route(
+                            "/api/admin/skills/{skill_id}/rescan",
+                            admin_rescan_skill,
+                            methods=["POST"],
+                        )
+                    ],
+                )
+            ],
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = api_storage
+        real_update = api_storage.update_prompt_template
+
+        def _deleted_first(template_id, **fields):
+            api_storage.delete_prompt_template(template_id)
+            return real_update(template_id, **fields)
+
+        with patch.object(api_storage, "update_prompt_template", side_effect=_deleted_first):
+            resp = TestClient(app).post("/v1/api/admin/skills/s1/rescan")
+
+        assert resp.status_code == 404, resp.text

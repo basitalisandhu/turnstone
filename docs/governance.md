@@ -115,8 +115,9 @@ alias and the `tools.agent_max_turns` setting.
   array. Migration 010 adds `template` column to `scheduled_tasks`.
 - **MCP sync**: MCP server prompts auto-sync into the `prompt_templates` table
   with `origin="mcp"`, `mcp_server` set, and `readonly=True`. Manual skills take
-  precedence on name collision. Admin UI shows origin badge and disables
-  edit/delete for MCP-sourced skills.
+  precedence on name collision. MCP-sourced skills cannot be unlocked or
+  renamed, and one an admin has disabled stays when its server stops listing
+  the prompt. The admin UI shows an origin badge and opens them for viewing.
 - **Spec fields**: Skills support the full Agent Skills standard frontmatter:
   `name`, `description`, `license`, `compatibility`, `metadata` (author, version),
   `allowed-tools`. The `license` and `compatibility` fields are preserved on import

@@ -1235,13 +1235,17 @@ table (which stores skills) as first-class governed skills:
   `mcp_server` set to the server name. Manual skills have
   `origin="manual"`.
 - **Read-only**: MCP-sourced skills are `readonly=True`. The admin API
-  returns 403 on update/delete attempts. The admin UI disables edit/delete
-  buttons and shows an origin badge.
+  changes only their runtime config (enabled, approvals, allowed tools,
+  completion notification, priority, menu visibility), ignores any other field,
+  and refuses to unlock them. The admin UI opens them for viewing and shows an
+  origin badge.
 - **Precedence**: If a manual skill and MCP prompt share the same name,
   the manual skill wins and the MCP prompt is skipped (with a log
   warning).
 - **Lifecycle**: Skills are created on connect, updated on prompt list
   refresh, and removed when the MCP server no longer exposes the prompt.
+  A skill an admin has disabled is kept instead, still disabled, and the
+  prompt returns to it if the server lists it again.
   The sync runs automatically on connect, on `PromptListChangedNotification`,
   and on manual `/mcp refresh`.
 - **Schema**: Migration 009 adds `origin`, `mcp_server`, and `readonly`

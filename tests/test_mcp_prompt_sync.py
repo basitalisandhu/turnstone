@@ -33,6 +33,7 @@ def _make_storage() -> MagicMock:
     storage.create_prompt_template.return_value = None
     storage.update_prompt_template.return_value = True
     storage.delete_prompt_template.return_value = True
+    storage.delete_prompt_template_if_enabled.return_value = True
     return storage
 
 
@@ -194,7 +195,84 @@ class TestSyncPromptsToStorage:
         result = mgr.sync_prompts_to_storage()
 
         assert result["removed"] == ["mcp__test__old_prompt"]
-        storage.delete_prompt_template.assert_called_once_with("old-id")
+        storage.delete_prompt_template_if_enabled.assert_called_once_with("old-id")
+        storage.delete_prompt_template.assert_not_called()
+
+    def test_sync_does_not_try_a_row_listed_disabled(self, mgr: MCPClientManager) -> None:
+        """A kept, disabled row costs no write on every sync; the conditional delete is still
+        what spares a row that is disabled after the listing."""
+        storage = _make_storage()
+        storage.list_prompt_templates_by_origin.return_value = [
+            {"template_id": "off-id", "name": "mcp__test__off", "origin": "mcp", "enabled": False},
+            {"template_id": "on-id", "name": "mcp__test__on", "origin": "mcp", "enabled": True},
+        ]
+        mgr.set_storage(storage)
+        mgr._prompts = []
+
+        result = mgr.sync_prompts_to_storage()
+
+        assert result["removed"] == ["mcp__test__on"]
+        storage.delete_prompt_template_if_enabled.assert_called_once_with("on-id")
+
+
+class TestDisabledPromptsStay:
+    """A prompt an admin disabled keeps its row when its server stops listing it."""
+
+    def test_a_disabled_prompt_stays_and_an_enabled_one_goes(self, db: Any) -> None:
+        catalogs = {"srv0": ["disabled", "dropped", "kept"]}
+        mgr = _synced_manager(db, catalogs)
+        row = db.get_prompt_template_by_name("mcp__srv0__disabled")
+        assert row is not None
+        assert db.update_prompt_template(row["template_id"], enabled=False, priority=7)
+        catalogs["srv0"][:] = ["kept"]
+
+        asyncio.run(mgr._refresh_all())
+
+        assert _mcp_template_names(db) == ["mcp__srv0__disabled", "mcp__srv0__kept"]
+        kept = db.get_prompt_template_by_name("mcp__srv0__disabled")
+        assert kept is not None
+        assert kept["template_id"] == row["template_id"]
+        assert kept["enabled"] is False
+        assert kept["priority"] == 7
+
+    def test_a_prompt_listed_again_returns_to_its_disabled_row(self, db: Any) -> None:
+        catalogs = {"srv0": ["p", "other"]}
+        mgr = _synced_manager(db, catalogs)
+        row = db.get_prompt_template_by_name("mcp__srv0__p")
+        assert row is not None
+        db.update_prompt_template(row["template_id"], enabled=False)
+        catalogs["srv0"][:] = ["other"]
+        asyncio.run(mgr._refresh_all())
+        catalogs["srv0"][:] = ["p", "other"]
+
+        asyncio.run(mgr._refresh_all())
+
+        again = db.get_prompt_template_by_name("mcp__srv0__p")
+        assert again is not None
+        assert again["template_id"] == row["template_id"]
+        assert again["enabled"] is False
+
+    def test_a_disable_committed_after_the_sync_read_the_rows_keeps_the_row(self, db: Any) -> None:
+        """The sync listed the row while it was enabled; the admin's disable commits before the
+        delete runs."""
+        mgr = _synced_manager(db, {"srv0": ["p"]})
+        row = db.get_prompt_template_by_name("mcp__srv0__p")
+        assert row is not None
+        real_list = db.list_prompt_templates_by_origin
+
+        def _list_then_disable(origin: str) -> list[dict[str, Any]]:
+            rows = real_list(origin)
+            db.update_prompt_template(row["template_id"], enabled=False)
+            return rows
+
+        mgr._prompts = []
+        with patch.object(db, "list_prompt_templates_by_origin", side_effect=_list_then_disable):
+            result = mgr.sync_prompts_to_storage()
+
+        assert result["removed"] == []
+        kept = db.get_prompt_template(row["template_id"])
+        assert kept is not None
+        assert kept["enabled"] is False
 
 
 class TestSetStorageAutoSync:

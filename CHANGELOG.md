@@ -85,6 +85,11 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   and that user's next mint for the server or model waits 30 seconds. A
   sign-in in progress when its identity is unlinked no longer stores the
   credential again; it fails instead.
+- **A disabled MCP prompt stays disabled.** When its server stops listing a
+  prompt an admin has disabled, the skill is kept, still disabled, and the
+  prompt returns to it if the server lists it again. An update to a skill
+  deleted meanwhile answers `404` in the admin API, and the `skills` tool
+  reports it to the model; neither records the change as done.
 
 ### Changed
 
@@ -106,6 +111,13 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   unlink's counts `null`; when that can't be told, the reply is a `503` saying
   the change may have been saved. The unlink confirmation now says that the
   next OIDC sign-in creates a new user.
+- **Skills mirrored from an MCP server cannot be unlocked or renamed.**
+  Unlocking one answers `400`, and the skill editor no longer offers it. A
+  locked skill's update applies only its runtime config and ignores every other
+  field; renaming a mirrored skill unlocked before this release answers `400`.
+- **A skill update leaves an optional field sent as `null` unchanged.** It used
+  to store the text `None` in fields such as the name or content, clear the
+  tags, or reset the priority.
 
 ## [1.9.1]
 

@@ -2411,6 +2411,13 @@ class StorageBackend(Protocol):
         """Delete a prompt template. Returns True if found."""
         ...
 
+    def delete_prompt_template_if_enabled(self, template_id: str) -> bool:
+        """Delete a prompt template only while it is enabled. Returns True if deleted.
+
+        One statement, so an admin's disable that commits first always keeps the row.
+        """
+        ...
+
     def count_prompt_templates(self, org_id: str = "") -> int:
         """Count prompt templates, optionally filtered by org_id."""
         ...

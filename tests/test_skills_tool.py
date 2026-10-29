@@ -1315,6 +1315,49 @@ class TestExecSkillsUpdate:
             "readonly": False,
         }
 
+    def _approved_update(self, storage: MagicMock) -> tuple[Any, dict[str, Any]]:
+        session = _make_session()
+        storage.get_prompt_template_by_name.return_value = self._existing_row()
+        with (
+            patch("turnstone.core.auth.user_has_permission", return_value=True),
+            patch("turnstone.core.session.get_storage", return_value=storage),
+        ):
+            item = session._prepare_skills(
+                "c", {"action": "update", "name": "existing", "description": "new"}
+            )
+        assert "error" not in item, item
+        return session, item
+
+    def test_update_of_a_skill_deleted_after_approval_writes_nothing(self) -> None:
+        storage = MagicMock()
+        session, item = self._approved_update(storage)
+        storage.get_prompt_template.return_value = None
+        with (
+            patch("turnstone.core.auth.user_has_permission", return_value=True),
+            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch("turnstone.core.audit.record_audit") as audit,
+        ):
+            _, output = session._exec_skills(item)
+        assert output == "update: skill 'existing' no longer exists; nothing was changed"
+        storage.create_skill_version.assert_not_called()
+        storage.update_prompt_template.assert_not_called()
+        audit.assert_not_called()
+
+    def test_update_whose_skill_goes_before_the_write_is_refused(self) -> None:
+        storage = MagicMock()
+        session, item = self._approved_update(storage)
+        storage.get_prompt_template.return_value = self._existing_row()
+        storage.list_skill_versions.return_value = []
+        storage.update_prompt_template.return_value = False
+        with (
+            patch("turnstone.core.auth.user_has_permission", return_value=True),
+            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch("turnstone.core.audit.record_audit") as audit,
+        ):
+            _, output = session._exec_skills(item)
+        assert output == "update: skill 'existing' no longer exists; nothing was changed"
+        audit.assert_not_called()
+
     def test_update_auto_approve_warning_uses_final_state(self) -> None:
         """The auto_approve+allowed_tools self-escalation warning must fire
         against the *final* state (post-update), not the existing row alone.
@@ -1630,6 +1673,25 @@ class TestExecSkillsToggle:
         storage.update_prompt_template.assert_called_with("t1", enabled=False)
         assert recorded["action"] == "skill.disable"
         assert recorded["detail"]["actor_source"] == "model"
+
+    def test_disable_of_a_skill_deleted_after_approval_changes_nothing(self) -> None:
+        session = _make_session()
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = {
+            "template_id": "t1",
+            "name": "x",
+            "enabled": True,
+        }
+        storage.update_prompt_template.return_value = False
+        with (
+            patch("turnstone.core.auth.user_has_permission", return_value=True),
+            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch("turnstone.core.audit.record_audit") as audit,
+        ):
+            item = session._prepare_skills("c", {"action": "disable", "name": "x"})
+            _, output = session._exec_skills(item)
+        assert output == "disable: skill 'x' no longer exists; nothing was changed"
+        audit.assert_not_called()
 
     def test_disable_already_disabled_errors(self) -> None:
         session = _make_session()

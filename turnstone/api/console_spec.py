@@ -663,7 +663,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "Update a skill",
         request_model=UpdateSkillRequest,
         response_model=SkillInfo,
-        error_codes=[404],
+        error_codes=[400, 404, 409],
         tags=["Admin"],
     ),
     EndpointSpec(

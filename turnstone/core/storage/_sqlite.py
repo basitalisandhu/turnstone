@@ -4137,6 +4137,17 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             conn.commit()
             return result.rowcount > 0
 
+    def delete_prompt_template_if_enabled(self, template_id: str) -> bool:
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(prompt_templates).where(
+                    (prompt_templates.c.template_id == template_id)
+                    & (prompt_templates.c.enabled == 1)
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
     def list_skills_filtered(
         self,
         *,
