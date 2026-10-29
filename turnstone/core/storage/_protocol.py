@@ -28,6 +28,9 @@ if TYPE_CHECKING:
 #: application layer (via :mod:`turnstone.core.mcp_crypto`, which re-exports
 #: it) agree on ONE set that cannot drift.
 USER_SCOPED_AUTH_TYPES: frozenset[str] = frozenset({"oauth_user", "oauth_obo"})
+# The sign-in passthrough auth types: their token rows are mint caches of the user's captured
+# credential, which an OIDC unlink purges with the identity.
+OBO_AUTH_TYPES: frozenset[str] = frozenset({"oauth_obo"})
 
 # Internal durable-incarnation fence. New manager rows receive it at
 # registration; legacy rows receive one atomically when an exact delete/fork
@@ -259,6 +262,14 @@ class OIDCUserCredential(TypedDict):
     refresh_token_ct: bytes
     created: str
     last_refreshed: str
+
+
+class OIDCUnlinkResult(TypedDict):
+    """What :meth:`StorageBackend.unlink_oidc_identity` removed with the identity."""
+
+    user_id: str
+    credential_deleted: bool
+    delegated_token_rows_deleted: int
 
 
 class OIDCPendingState(TypedDict):
@@ -1748,8 +1759,17 @@ class StorageBackend(Protocol):
         """List all OIDC identities linked to a turnstone user."""
         ...
 
-    def delete_oidc_identity(self, issuer: str, subject: str) -> bool:
-        """Remove an OIDC identity link. Returns True if existed."""
+    def unlink_oidc_identity(
+        self, issuer: str, subject: str, *, model_token_prefix: str
+    ) -> OIDCUnlinkResult | None:
+        """Delete an OIDC identity and the delegated access it carried, in one transaction.
+
+        Under a lock on the identity row: the user's captured credential for *issuer*, then the
+        user's token rows for every ``oauth_obo`` MCP server and every key starting with
+        *model_token_prefix* (the delegated model caches), then the identity. Returns ``None``,
+        changing nothing, when the identity does not exist. ``oauth_user`` grants and every other
+        user's rows stay.
+        """
         ...
 
     # -- OIDC user credential (single-credential MCP minting, #551) -------------
@@ -1779,10 +1799,6 @@ class StorageBackend(Protocol):
         path MUST persist the newest token every time.  Returns True when
         a row was updated.
         """
-        ...
-
-    def delete_oidc_user_credential(self, user_id: str, issuer: str) -> bool:
-        """Remove the captured credential (logout-all / admin revoke). Returns True if existed."""
         ...
 
     # -- OIDC pending state ----------------------------------------------------

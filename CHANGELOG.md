@@ -67,6 +67,16 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   registers dynamically (before or after the save) drops the registered client's
   id and secret, so that secret never reaches another authorization server. A
   client secret now commits with the server change it comes with.
+- **Unlinking an OIDC identity takes its delegated access with it, in one
+  step.** The captured credential and the user's minted on-behalf-of MCP and
+  delegated model tokens are deleted in the same transaction as the identity;
+  when storage fails, the unlink answers `503`, changes nothing, and can be
+  retried. The console and every node registered within the last hour then
+  drop the user's cached model tokens from memory, where none is kept longer
+  than that hour, and a host that can't confirm it is named in the reply
+  (`status: "incomplete"`), the audit and the admin page, which also warns when
+  the reply can't be read. Deleting a user evicts the same way. An admin can no
+  longer unlink their own identity.
 
 ### Changed
 
@@ -77,6 +87,17 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   server meanwhile.** The update decides its purge and its client changes from
   the server as it read it, and now applies only while the server still holds
   those values; otherwise nothing is written.
+- **The OIDC unlink reply reports memory eviction per host.**
+  `model_memo_nodes_invalidated` and `model_memo_nodes_failed` give way to
+  `model_memo` (the console's result and the nodes evicted, failed and not
+  reached) and `model_memo_unconfirmed`; deleting a user replies the same way.
+  The unlink and the user deletion are audited as soon as they commit
+  (`oidc_identity.delete`, `user.delete`), and the eviction's outcome follows as
+  `oidc_identity.delete.memo_eviction` or `user.delete.memo_eviction`. A write
+  whose commit was cut off but which took effect answers `incomplete` with the
+  unlink's counts `null`; when that can't be told, the reply is a `503` saying
+  the change may have been saved. The unlink confirmation now says that the
+  next OIDC sign-in creates a new user.
 
 ## [1.9.1]
 

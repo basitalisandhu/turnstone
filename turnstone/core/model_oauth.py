@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
@@ -22,7 +22,11 @@ from turnstone.core.oauth import locking as oauth_locking
 from turnstone.core.oauth import tokens as oauth_tokens
 from turnstone.core.oauth.context import OAuthContext, oauth_context
 from turnstone.core.oauth.runtime import ensure_oauth_runtime
-from turnstone.core.oauth.work import OAuthUnavailableError, durable_write
+from turnstone.core.oauth.work import (
+    OAuthRuntimeRefusedError,
+    OAuthUnavailableError,
+    durable_write,
+)
 from turnstone.core.token_store import crypto as token_store_crypto
 from turnstone.core.token_store import store as token_store_store
 
@@ -248,6 +252,24 @@ def invalidate_model_mint_memo(
     return len(keys)
 
 
+# How far back an unlink looks for nodes to drop a user's memoized delegated tokens (the console
+# reads the registry, where a node records a heartbeat every 30 s), and so how long one may sit in
+# a memo: a node the unlink cannot reach serves an evicted token for at most this long. The margin
+# covers the heartbeat interval.
+MEMO_EVICTION_WINDOW_S = 3600
+_MEMO_MAX_AGE_S = MEMO_EVICTION_WINDOW_S - 60
+
+
+def _memo_expiry(expires_at: str | None) -> str:
+    """The expiry a memo entry carries: the token's own, or ``_MEMO_MAX_AGE_S`` from now if
+    sooner. The token's row keeps its own, so an entry that ages out is read from it again."""
+    cap = datetime.now(UTC) + timedelta(seconds=_MEMO_MAX_AGE_S)
+    own = oauth_tokens._parse_iso_to_utc(expires_at or "")
+    if expires_at and own is not None and own <= cap:
+        return expires_at
+    return cap.replace(tzinfo=None).isoformat(timespec="seconds")
+
+
 async def _serve_fresh_mint_cache(
     *,
     app_state: Any,
@@ -271,7 +293,7 @@ async def _serve_fresh_mint_cache(
         return None
     if not oauth_tokens._is_fresh_obo_cache_row(plain, audience, scopes) or plain is None:
         return None
-    memo[key] = plain
+    memo[key] = {**plain, "expires_at": _memo_expiry(plain.get("expires_at"))}
     return plain["access_token"]
 
 
@@ -293,7 +315,7 @@ def _memoize_minted_token(
         "token_key": cache_server,
         "access_token": access_token,
         "refresh_token": None,
-        "expires_at": expires_at,
+        "expires_at": _memo_expiry(expires_at),
         "scopes": scopes or None,
         "as_issuer": issuer,
         "audience": audience,
@@ -995,7 +1017,13 @@ class ModelTokenClient(Protocol):
 
     def invalidate_model_mint_memo_sync(
         self, *, user_id: str, server_prefix: str, timeout: float = 5.0
-    ) -> int: ...
+    ) -> int:
+        """Evict one user's memoized tokens under *server_prefix*; return how many were held.
+
+        Raises when the eviction cannot be confirmed, so a caller never reads a failure as
+        "nothing was held".
+        """
+        ...
 
 
 class OAuthModelTokenClient:
@@ -1071,6 +1099,7 @@ class OAuthModelTokenClient:
     ) -> int:
         runtime = self.context.runtime
         if runtime is None:
+            # Tokens are memoized only on the runtime's loop: with none, nothing was held.
             return 0
 
         async def invalidate() -> int:
@@ -1080,8 +1109,9 @@ class OAuthModelTokenClient:
 
         try:
             return runtime.call_sync(invalidate, timeout=timeout)
-        except Exception:
-            log.warning("model token memo invalidation failed user=%s", user_id, exc_info=True)
+        except OAuthRuntimeRefusedError:
+            # A runtime that never started, or has stopped, serves no memo: every read of it runs
+            # as an operation on that runtime. Nothing it holds can be served, so nothing is held.
             return 0
 
 

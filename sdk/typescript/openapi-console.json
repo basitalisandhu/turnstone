@@ -960,13 +960,33 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/StatusResponse"
+                  "$ref": "#/components/schemas/UserDeleteResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {
@@ -1312,7 +1332,14 @@
         ],
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OIDCUnlinkResponse"
+                }
+              }
+            }
           },
           "400": {
             "description": "Error 400",
@@ -1326,6 +1353,16 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {
@@ -16707,6 +16744,137 @@
           "avatar"
         ],
         "title": "UserAvatarResponse",
+        "type": "object"
+      },
+      "UserDeleteResponse": {
+        "description": "DELETE /v1/api/admin/users/{user_id} response.",
+        "properties": {
+          "status": {
+            "description": "``ok``, or ``incomplete`` when a process could not confirm it dropped the user's cached model tokens, or the outcome of the write is not fully known",
+            "examples": [
+              "ok"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "model_memo_unconfirmed": {
+            "description": "The processes that may still hold the user's cached model tokens until they expire",
+            "items": {
+              "type": "string"
+            },
+            "title": "Model Memo Unconfirmed",
+            "type": "array"
+          },
+          "model_memo": {
+            "$ref": "#/components/schemas/MemoEvictionReport"
+          }
+        },
+        "required": [
+          "status",
+          "model_memo"
+        ],
+        "title": "UserDeleteResponse",
+        "type": "object"
+      },
+      "MemoEvictionReport": {
+        "description": "Where a user's delegated model tokens were dropped from memory after an unlink or a\nuser deletion.",
+        "properties": {
+          "console": {
+            "description": "``evicted`` or ``failed``",
+            "examples": [
+              "evicted"
+            ],
+            "title": "Console",
+            "type": "string"
+          },
+          "node_list_read": {
+            "description": "False when the list of nodes could not be read; every node then counts as unconfirmed",
+            "title": "Node List Read",
+            "type": "boolean"
+          },
+          "nodes_evicted": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Nodes Evicted",
+            "type": "array"
+          },
+          "nodes_failed": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Nodes Failed",
+            "type": "array"
+          },
+          "nodes_not_reached": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Nodes Not Reached",
+            "type": "array"
+          }
+        },
+        "required": [
+          "console",
+          "node_list_read"
+        ],
+        "title": "MemoEvictionReport",
+        "type": "object"
+      },
+      "OIDCUnlinkResponse": {
+        "description": "DELETE /v1/api/admin/oidc-identities response.",
+        "properties": {
+          "status": {
+            "description": "``ok``, or ``incomplete`` when a process could not confirm it dropped the user's cached model tokens, or the outcome of the write is not fully known",
+            "examples": [
+              "ok"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "model_memo_unconfirmed": {
+            "description": "The processes that may still hold the user's cached model tokens until they expire",
+            "items": {
+              "type": "string"
+            },
+            "title": "Model Memo Unconfirmed",
+            "type": "array"
+          },
+          "model_memo": {
+            "$ref": "#/components/schemas/MemoEvictionReport"
+          },
+          "obo_credential_revoked": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Whether a captured sign-in credential was deleted; null when not known",
+            "title": "Obo Credential Revoked"
+          },
+          "obo_cache_rows_purged": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "How many delegated token rows were deleted; null when not known",
+            "title": "Obo Cache Rows Purged"
+          }
+        },
+        "required": [
+          "status",
+          "model_memo"
+        ],
+        "title": "OIDCUnlinkResponse",
         "type": "object"
       },
       "RoleEffectiveResponse": {

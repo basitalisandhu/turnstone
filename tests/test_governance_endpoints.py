@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -1074,3 +1075,87 @@ class TestUserSelfDeletion:
         resp = client.delete("/v1/api/admin/users/user-1")
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
+
+    def test_deleting_a_user_evicts_their_cached_model_tokens_and_names_holdouts(
+        self, client, storage
+    ):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        state = client.app.state
+        state.model_token_client = MagicMock()
+        state.model_token_client.invalidate_model_mint_memo_sync.return_value = 1
+        state.collector = MagicMock()
+        state.collector.get_all_nodes.return_value = [
+            {"node_id": "node-ok", "server_url": "https://node-ok.example.com"},
+            {"node_id": "node-503", "server_url": "https://node-503.example.com"},
+        ]
+        state.proxy_client = MagicMock()
+        state.proxy_client.post = AsyncMock(
+            side_effect=lambda url, **kw: SimpleNamespace(
+                status_code=503 if "node-503" in url else 200
+            )
+        )
+        state.proxy_token_mgr = SimpleNamespace(bearer_header={"Authorization": "Bearer s"})
+
+        resp = client.delete("/v1/api/admin/users/user-1")
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "incomplete"
+        assert resp.json()["model_memo_unconfirmed"] == ["node-503"]
+        state.model_token_client.invalidate_model_mint_memo_sync.assert_called_once_with(
+            user_id="user-1", server_prefix="__model_obo__:"
+        )
+        assert storage.get_user("user-1") is None
+
+    def test_a_storage_failure_changes_nothing(self, client, storage):
+        """The last statement of the deletion fails: the transaction rolls back whole."""
+        import sqlalchemy as sa
+
+        storage.create_oidc_identity("https://idp.example.com", "sub-1", "user-1", "u@example.com")
+
+        def _fail_the_user_delete(conn, cursor, statement, parameters, context, executemany):
+            if statement.startswith("DELETE FROM users"):
+                raise sa.exc.OperationalError(statement, {}, Exception("connection lost"))
+
+        sa.event.listen(storage._engine, "before_cursor_execute", _fail_the_user_delete)
+        try:
+            resp = client.delete("/v1/api/admin/users/user-1")
+        finally:
+            sa.event.remove(storage._engine, "before_cursor_execute", _fail_the_user_delete)
+
+        assert resp.status_code == 503
+        assert storage.get_user("user-1") is not None
+        assert storage.get_oidc_identity("https://idp.example.com", "sub-1") is not None
+
+    def test_a_deletion_that_committed_despite_an_error_is_reported_incomplete(
+        self, client, storage
+    ):
+        from unittest.mock import patch
+
+        import sqlalchemy as sa
+
+        real_delete = storage.delete_user
+
+        def _committed_then_lost(user_id):
+            real_delete(user_id)
+            raise sa.exc.OperationalError("COMMIT", {}, Exception("connection lost"))
+
+        with patch.object(storage, "delete_user", side_effect=_committed_then_lost):
+            resp = client.delete("/v1/api/admin/users/user-1")
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "incomplete"
+        assert storage.get_user("user-1") is None
+        assert len(storage.list_audit_events(action="user.delete")) == 1
+
+    def test_the_deletion_is_audited_before_the_eviction(self, client, storage):
+        resp = client.delete("/v1/api/admin/users/user-1")
+
+        assert resp.status_code == 200, resp.text
+        (deleted,) = storage.list_audit_events(action="user.delete")
+        (evicted,) = storage.list_audit_events(action="user.delete.memo_eviction")
+        assert deleted["timestamp"] <= evicted["timestamp"]
+        detail = deleted["detail"]
+        detail = json.loads(detail) if isinstance(detail, str) else detail
+        assert list(detail) == ["username"]

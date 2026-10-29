@@ -257,8 +257,9 @@ mint failures may use it by default; set `model.auth_fail_closed = true` to
 prohibit even that fallback.
 
 Dynamic token caches are encrypted in `oauth_tokens`, shared across nodes,
-and memoized on each host. Unlinking a user's OIDC identity purges their
-delegated-mode rows and memo entries. `entra_app` rows belong to the shared
+and memoized on each host. Unlinking a user's OIDC identity, or deleting the
+user, purges their delegated-mode rows and memo entries; a host that could not
+confirm the memo eviction is named in the reply. `entra_app` rows belong to the shared
 `__app__` identity and are not user-deprovisioned; after client-credential
 revocation, an already-minted app bearer remains usable until its recorded
 expiry.

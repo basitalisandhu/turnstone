@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING, Any
 from turnstone.core.log import get_logger
 from turnstone.core.oauth import http as oauth_http
 from turnstone.core.oauth.context import OAuthContext, oauth_context
-from turnstone.core.oauth.work import OAuthUnavailableError, OAuthWork, _active_work
+from turnstone.core.oauth.work import (
+    OAuthRuntimeRefusedError,
+    OAuthUnavailableError,
+    OAuthWork,
+    _active_work,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
@@ -110,7 +115,7 @@ class OAuthRuntime:
         with self._submissions:
             loop = self._loop
             if not self._accepting or loop is None or not loop.is_running() or loop.is_closed():
-                raise OAuthUnavailableError("OAuth runtime is unavailable")
+                raise OAuthRuntimeRefusedError("OAuth runtime is unavailable")
             operation = self._run(factory)
             try:
                 return asyncio.run_coroutine_threadsafe(operation, loop)

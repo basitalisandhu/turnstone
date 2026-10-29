@@ -25,6 +25,10 @@ class OAuthUnavailableError(Exception):
     """The runtime cannot complete a request within its caller's lifetime."""
 
 
+class OAuthRuntimeRefusedError(OAuthUnavailableError):
+    """The runtime is not accepting work (it failed to start, or has stopped): nothing ran."""
+
+
 class OAuthWork:
     """Worker futures, their owner-loop waiters and orphan drains owned by one OAuth runtime."""
 

@@ -4993,10 +4993,17 @@ async def internal_model_auth_cache_invalidate(request: Request) -> JSONResponse
 
     from turnstone.core.token_store.store import MODEL_OBO_CACHE_PREFIX
 
-    evicted = model_client.invalidate_model_mint_memo_sync(
-        user_id=user_id,
-        server_prefix=MODEL_OBO_CACHE_PREFIX,
-    )
+    # Off the event loop: the eviction waits on the OAuth runtime's loop. A failure answers
+    # non-200, so the console reports this node as not evicted rather than as holding nothing.
+    try:
+        evicted = await asyncio.to_thread(
+            model_client.invalidate_model_mint_memo_sync,
+            user_id=user_id,
+            server_prefix=MODEL_OBO_CACHE_PREFIX,
+        )
+    except Exception:
+        log.warning("model_auth_cache_invalidate.failed user=%s", user_id, exc_info=True)
+        return JSONResponse({"error": "The cached tokens could not be evicted"}, status_code=503)
     return JSONResponse({"status": "ok", "evicted": evicted})
 
 

@@ -1851,3 +1851,30 @@ class TestMintBridgeContractViolation:
             if r.levelno == logging.ERROR and "contract violation" in r.getMessage()
         ]
         assert errors, caplog.records
+
+
+def test_a_memo_eviction_that_cannot_be_confirmed_raises() -> None:
+    """A failed eviction must not read as "nothing was held"."""
+    from turnstone.core.model_oauth import OAuthModelTokenClient
+
+    context = MagicMock()
+    context.runtime.call_sync.side_effect = TimeoutError()
+
+    with pytest.raises(TimeoutError):
+        OAuthModelTokenClient(context).invalidate_model_mint_memo_sync(
+            user_id="user-x", server_prefix="__model_obo__:"
+        )
+
+
+def test_a_host_with_no_oauth_runtime_held_nothing() -> None:
+    from turnstone.core.model_oauth import OAuthModelTokenClient
+
+    context = MagicMock()
+    context.runtime = None
+
+    assert (
+        OAuthModelTokenClient(context).invalidate_model_mint_memo_sync(
+            user_id="user-x", server_prefix="__model_obo__:"
+        )
+        == 0
+    )

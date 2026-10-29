@@ -222,20 +222,14 @@ class TestOIDCIdentityCRUD:
         assert len(identities) == 1
         assert identities[0]["user_id"] == "u1"
 
-    def test_delete_oidc_identity(self, db):
-        db.create_oidc_identity("https://idp.example.com", "sub-123", "u1", "alice@example.com")
-        assert db.delete_oidc_identity("https://idp.example.com", "sub-123") is True
-        assert db.get_oidc_identity("https://idp.example.com", "sub-123") is None
-
-    def test_delete_oidc_identity_nonexistent(self, db):
-        assert db.delete_oidc_identity("https://idp.example.com", "sub-999") is False
-
-    def test_delete_oidc_identity_only_deletes_target(self, db):
-        """Deleting one identity does not affect others."""
+    def test_unlinking_one_identity_leaves_the_users_others(self, db):
+        """Identities go only through the unlink, which takes delegated access with them."""
         db.create_oidc_identity("https://idp.example.com", "sub-1", "u1", "a@example.com")
         db.create_oidc_identity("https://idp.example.com", "sub-2", "u1", "b@example.com")
 
-        db.delete_oidc_identity("https://idp.example.com", "sub-1")
+        db.unlink_oidc_identity(
+            "https://idp.example.com", "sub-1", model_token_prefix="__model_obo__:"
+        )
 
         assert db.get_oidc_identity("https://idp.example.com", "sub-1") is None
         assert db.get_oidc_identity("https://idp.example.com", "sub-2") is not None

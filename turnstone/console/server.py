@@ -32,7 +32,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx2
 from sse_starlette import EventSourceResponse
@@ -86,7 +86,7 @@ from turnstone.core.mcp_oauth import (
 )
 from turnstone.core.memory import get_workstream_display_names
 from turnstone.core.metacognition import field_str, sanitize_display
-from turnstone.core.model_oauth import get_model_token_client
+from turnstone.core.model_oauth import MEMO_EVICTION_WINDOW_S, get_model_token_client
 from turnstone.core.model_registry import (
     APP_IDENTITY_MODEL_AUTH_MODES,
     DYNAMIC_MODEL_AUTH_MODES,
@@ -6645,22 +6645,62 @@ async def admin_delete_user(request: Request) -> JSONResponse:
     if auth_result and auth_result.user_id == user_id:
         return JSONResponse({"error": "Cannot delete your own account"}, status_code=400)
     # Look up username for the audit trail before deleting
-    target_user = storage.get_user(user_id)
-    if storage.delete_user(user_id):
-        from turnstone.core.audit import record_audit
+    try:
+        target_user = await asyncio.to_thread(storage.get_user, user_id)
+    except storage_errors():
+        log.warning("admin.user.delete_read_failed user=%s", user_id, exc_info=True)
+        return _admin_change_not_saved()
+    if target_user is None:
+        return JSONResponse({"error": "User not found"}, status_code=404)
+    in_doubt = False
+    try:
+        deleted = await asyncio.to_thread(storage.delete_user, user_id)
+    except storage_errors():
+        log.warning("admin.user.delete_failed user=%s", user_id, exc_info=True)
+        # A failure as the commit was acknowledged may still have committed: read again.
+        try:
+            still_there = await asyncio.to_thread(storage.get_user, user_id) is not None
+        except storage_errors():
+            return JSONResponse({"error": _ADMIN_CHANGE_MAYBE_SAVED}, status_code=503)
+        if still_there:
+            return _admin_change_not_saved()
+        deleted = in_doubt = True
+    if not deleted:
+        return JSONResponse({"error": "User not found"}, status_code=404)
+    from turnstone.core.audit import record_audit
 
-        audit_uid, ip = _audit_context(request)
-        record_audit(
-            storage,
-            audit_uid,
-            "user.delete",
-            "user",
-            user_id,
-            {"username": target_user.get("username", "") if target_user else ""},
-            ip,
-        )
-        return JSONResponse({"status": "ok"})
-    return JSONResponse({"error": "User not found"}, status_code=404)
+    # The deletion is audited as soon as it commits, so it is on record even if the process
+    # stops during the eviction below.
+    audit_uid, ip = _audit_context(request)
+    await asyncio.to_thread(
+        record_audit,
+        storage,
+        audit_uid,
+        "user.delete",
+        "user",
+        user_id,
+        {"username": target_user.get("username", "")},
+        ip,
+    )
+    # The user's token rows went with the account; tokens a process memoized go now.
+    eviction = await _evict_delegated_model_memos(request, storage, user_id)
+    await asyncio.to_thread(
+        record_audit,
+        storage,
+        audit_uid,
+        "user.delete.memo_eviction",
+        "user",
+        user_id,
+        {"model_memo_unconfirmed": eviction.unconfirmed(), "model_memo": eviction.report()},
+        ip,
+    )
+    return JSONResponse(
+        {
+            "status": "ok" if eviction.complete and not in_doubt else "incomplete",
+            "model_memo_unconfirmed": eviction.unconfirmed(),
+            "model_memo": eviction.report(),
+        }
+    )
 
 
 async def admin_delete_user_avatar_picture(request: Request) -> JSONResponse:
@@ -6973,23 +7013,119 @@ async def admin_list_oidc_identities(request: Request) -> JSONResponse:
     return JSONResponse({"oidc_identities": identities})
 
 
-async def _invalidate_model_auth_memos_cluster(request: Request, user_id: str) -> tuple[int, int]:
-    """Best-effort eviction of one user's delegated model memo on every node."""
+@dataclass(frozen=True)
+class _MemoEviction:
+    """Where one user's delegated model tokens were confirmed dropped from memory.
+
+    Each process memoizes the tokens it minted, outside any database transaction, so eviction
+    runs after the database change commits. A process that did not confirm it keeps serving the
+    user's cached tokens until they expire.
+    """
+
+    console_evicted: bool
+    node_list_read: bool = True
+    nodes_evicted: tuple[str, ...] = ()
+    nodes_failed: tuple[str, ...] = ()
+    nodes_not_reached: tuple[str, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return not self.unconfirmed()
+
+    def unconfirmed(self) -> list[str]:
+        """The processes that may still hold the tokens, named for the admin."""
+        names = [] if self.console_evicted else ["console"]
+        names += [*self.nodes_failed, *self.nodes_not_reached]
+        if not self.node_list_read:
+            names.append("nodes (the node list could not be read)")
+        return names
+
+    def report(self) -> dict[str, Any]:
+        return {
+            "console": "evicted" if self.console_evicted else "failed",
+            "node_list_read": self.node_list_read,
+            "nodes_evicted": list(self.nodes_evicted),
+            "nodes_failed": list(self.nodes_failed),
+            "nodes_not_reached": list(self.nodes_not_reached),
+        }
+
+
+# The eviction asks every node registered within this window, not only those the collector lists
+# now, and names any that do not confirm. No memo entry outlives it (``MEMO_EVICTION_WINDOW_S``),
+# so a node outside it that still serves holds an evicted token at most that long.
+_MEMO_EVICTION_NODE_WINDOW_S = MEMO_EVICTION_WINDOW_S
+
+
+async def _evict_delegated_model_memos(
+    request: Request, storage: Any, user_id: str
+) -> _MemoEviction:
+    """Drop one user's delegated model tokens from the console's memo and every node's.
+
+    The nodes asked are the collector's and every node registered within
+    ``_MEMO_EVICTION_NODE_WINDOW_S``: one whose heartbeat writes fail keeps serving, and the
+    collector's list lags a new registration. Never raises: what it could not confirm is
+    reported, for the caller to answer and audit.
+    """
+    from turnstone.core.token_store.store import MODEL_OBO_CACHE_PREFIX
+
+    # Off the event loop: the eviction waits on the OAuth runtime's loop.
+    try:
+        await asyncio.to_thread(
+            get_model_token_client(request.app.state).invalidate_model_mint_memo_sync,
+            user_id=user_id,
+            server_prefix=MODEL_OBO_CACHE_PREFIX,
+        )
+        console_evicted = True
+    except Exception:
+        log.warning(
+            "admin.model_memo_invalidate_failed user=%s node=console", user_id, exc_info=True
+        )
+        console_evicted = False
+
+    # The console runtime is not in the node collector; every node is asked separately.
+    nodes: dict[str, str] = {}
+    node_list_read = True
     collector = getattr(request.app.state, "collector", None)
+    if collector is not None:
+        try:
+            for node in collector.get_all_nodes():
+                if node_id := str(node.get("node_id") or ""):
+                    nodes[node_id] = str(node.get("server_url") or "")
+        except Exception:
+            log.warning("admin.model_memo_node_list_failed user=%s", user_id, exc_info=True)
+            node_list_read = False
+    try:
+        registered = await asyncio.to_thread(
+            storage.list_services, "server", max_age_seconds=_MEMO_EVICTION_NODE_WINDOW_S
+        )
+        for service in registered:
+            if node_id := str(service.get("service_id") or ""):
+                nodes.setdefault(node_id, str(service.get("url") or ""))
+    except Exception:
+        log.warning("admin.model_memo_node_registry_failed user=%s", user_id, exc_info=True)
+        node_list_read = False
+    if not nodes:
+        return _MemoEviction(console_evicted, node_list_read=node_list_read)
+    node_ids = tuple(nodes)
     client = getattr(request.app.state, "proxy_client", None)
     token_mgr = getattr(request.app.state, "proxy_token_mgr", None)
-    if collector is None or client is None or token_mgr is None:
-        return 0, 0
+    if client is None or token_mgr is None:
+        return _MemoEviction(
+            console_evicted, node_list_read=node_list_read, nodes_not_reached=node_ids
+        )
+    try:
+        headers = dict(token_mgr.bearer_header)
+        sem = asyncio.Semaphore(_get_fan_out_limit(request))
+    except Exception:
+        log.warning("admin.model_memo_fan_out_unavailable user=%s", user_id, exc_info=True)
+        return _MemoEviction(
+            console_evicted, node_list_read=node_list_read, nodes_not_reached=node_ids
+        )
 
-    headers = dict(token_mgr.bearer_header)
-    nodes = collector.get_all_nodes()
-    sem = asyncio.Semaphore(_get_fan_out_limit(request))
-
-    async def _invalidate(node: dict[str, Any]) -> bool | None:
-        node_id = str(node.get("node_id") or "")
-        url = str(node.get("server_url") or "").rstrip("/")
+    async def _evict(node_id: str, url: str) -> Literal["evicted", "failed", "not_reached"]:
+        url = url.rstrip("/")
         if not url:
-            return None
+            return "not_reached"
         try:
             async with sem:
                 response = await client.post(
@@ -6998,25 +7134,38 @@ async def _invalidate_model_auth_memos_cluster(request: Request, user_id: str) -
                     json={"user_id": user_id},
                     timeout=5,
                 )
-            if response.status_code == 200:
-                return True
-            log.warning(
-                "admin.oidc_identity.model_memo_invalidate_rejected user=%s node=%s status=%s",
-                user_id,
-                node_id,
-                response.status_code,
-            )
         except Exception:
             log.warning(
-                "admin.oidc_identity.model_memo_invalidate_failed user=%s node=%s",
+                "admin.model_memo_invalidate_failed user=%s node=%s",
                 user_id,
                 node_id,
                 exc_info=True,
             )
-        return False
+            return "failed"
+        if response.status_code != 200:
+            log.warning(
+                "admin.model_memo_invalidate_rejected user=%s node=%s status=%s",
+                user_id,
+                node_id,
+                response.status_code,
+            )
+            return "failed"
+        return "evicted"
 
-    outcomes = await asyncio.gather(*(_invalidate(node) for node in nodes))
-    return outcomes.count(True), outcomes.count(False)
+    results = await asyncio.gather(*(_evict(node_id, url) for node_id, url in nodes.items()))
+    outcomes = list(zip(node_ids, results, strict=True))
+    return _MemoEviction(
+        console_evicted,
+        node_list_read=node_list_read,
+        nodes_evicted=tuple(node_id for node_id, outcome in outcomes if outcome == "evicted"),
+        nodes_not_reached=tuple(
+            node_id for node_id, outcome in outcomes if outcome == "not_reached"
+        ),
+        # Every other outcome counts as failed, so no node can drop out of the report.
+        nodes_failed=tuple(
+            node_id for node_id, outcome in outcomes if outcome not in ("evicted", "not_reached")
+        ),
+    )
 
 
 async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
@@ -7038,115 +7187,90 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
     if not issuer or not subject:
         return JSONResponse({"error": "issuer and subject required"}, status_code=400)
 
-    # Look up before delete so audit captures which user was affected
-    identity = storage.get_oidc_identity(issuer, subject)
+    try:
+        identity = await asyncio.to_thread(storage.get_oidc_identity, issuer, subject)
+    except storage_errors():
+        log.warning("admin.oidc_identity.unlink_read_failed issuer=%s", issuer, exc_info=True)
+        return _admin_change_not_saved()
     if not identity:
         return JSONResponse({"error": "Identity not found"}, status_code=404)
+    # As for deleting an account: an admin can't cut off their own sign-in.
+    auth_result = getattr(request.state, "auth_result", None)
+    if auth_result and auth_result.user_id == identity["user_id"]:
+        return JSONResponse({"error": "Cannot unlink your own OIDC identity"}, status_code=400)
 
-    storage.delete_oidc_identity(issuer, subject)
-
-    # #551: unlinking the identity must revoke the captured IdP refresh
-    # credential (keyed on (user_id, issuer)) AND purge the already-minted
-    # oauth_obo access-token cache rows — otherwise a deprovisioned user's
-    # scheduled/autonomous runs keep executing MCP tool calls with the still-fresh
-    # cached bearer until it expires (deleting only the credential stops FUTURE
-    # mints but not the live cache). Best-effort: a failure must not leave the
-    # identity un-deleted.
-    user_id = identity["user_id"]
-    credential_revoked = False
-    obo_cache_purged = 0
-    token_store = oauth_context(request.app.state).token_store
-    if token_store is not None:
+    # #551: unlinking the identity revokes the captured IdP refresh credential (keyed on
+    # (user_id, issuer)) and purges the minted oauth_obo and delegated model token rows, all in
+    # one transaction with the identity: otherwise a deprovisioned user's scheduled and
+    # autonomous runs keep calling MCP tools and models with a still-fresh cached bearer. When it
+    # fails, nothing has changed and the admin can retry.
+    user_id = str(identity["user_id"])
+    credential_revoked: bool | None = None
+    rows_purged: int | None = None
+    try:
+        unlinked = await asyncio.to_thread(
+            storage.unlink_oidc_identity, issuer, subject, model_token_prefix=MODEL_OBO_CACHE_PREFIX
+        )
+    except storage_errors():
+        log.warning("admin.oidc_identity.unlink_failed issuer=%s", issuer, exc_info=True)
+        # A failure as the commit was acknowledged may still have committed: read again. The
+        # identity gone, or now linking another user (whose sign-in created it again), means the
+        # unlink committed, with counts no longer known.
         try:
-            credential_revoked = bool(token_store.delete_oidc_credential(user_id, issuer))
-        except Exception:
-            log.warning(
-                "admin.oidc_identity.credential_revoke_failed user=%s", user_id, exc_info=True
-            )
-        try:
-            from turnstone.core.mcp_oauth import obo_server_names
+            now = await asyncio.to_thread(storage.get_oidc_identity, issuer, subject)
+        except storage_errors():
+            return JSONResponse({"error": _ADMIN_CHANGE_MAYBE_SAVED}, status_code=503)
+        if now is not None and str(now.get("user_id") or "") == user_id:
+            return _admin_change_not_saved()
+    else:
+        if unlinked is None:  # another request unlinked it since the read above
+            return JSONResponse({"error": "Identity not found"}, status_code=404)
+        credential_revoked = unlinked["credential_deleted"]
+        rows_purged = unlinked["delegated_token_rows_deleted"]
 
-            obo_servers = sorted(obo_server_names(storage))
-        except Exception:
-            obo_servers = []
-            log.warning(
-                "admin.oidc_identity.obo_server_list_failed user=%s", user_id, exc_info=True
-            )
-        for server_name in obo_servers:
-            # Per-server try/except: a failure on one server must not leave the
-            # remaining servers' cached bearers un-purged for a deprovisioned user.
-            try:
-                if token_store.delete_user_token(user_id, server_name):
-                    obo_cache_purged += 1
-            except Exception:
-                log.warning(
-                    "admin.oidc_identity.obo_cache_purge_failed user=%s server=%s",
-                    user_id,
-                    server_name,
-                    exc_info=True,
-                )
-        # Model-provider OBO rows use synthetic server keys and therefore are
-        # not present in mcp_servers/obo_server_names. Purge only delegated
-        # model rows for this user; __model_app__ rows belong to the shared
-        # __app__ identity and intentionally survive user deprovisioning.
-        try:
-            metadata = token_store.list_user_token_metadata(user_id)
-        except Exception:
-            metadata = []
-            log.warning(
-                "admin.oidc_identity.model_obo_cache_list_failed user=%s",
-                user_id,
-                exc_info=True,
-            )
-        for row in metadata:
-            token_key = str(row.get("token_key") or "")
-            if not token_key.startswith(MODEL_OBO_CACHE_PREFIX):
-                continue
-            try:
-                if token_store.delete_user_token(user_id, token_key):
-                    obo_cache_purged += 1
-            except Exception:
-                log.warning(
-                    "admin.oidc_identity.model_obo_cache_purge_failed user=%s server=%s",
-                    user_id,
-                    token_key,
-                    exc_info=True,
-                )
-    # The console runtime is not in the node collector, so invalidate its
-    # memo directly as well as fanning out below.
-    model_client = get_model_token_client(request.app.state)
-    model_client.invalidate_model_mint_memo_sync(
-        user_id=user_id,
-        server_prefix=MODEL_OBO_CACHE_PREFIX,
-    )
-    memo_nodes_invalidated, memo_nodes_failed = await _invalidate_model_auth_memos_cluster(
-        request, user_id
-    )
-
+    # The unlink is audited as soon as it commits, so it is on record even if the process stops
+    # during the eviction below.
     audit_uid, ip = _audit_context(request)
-    record_audit(
+    resource = f"{issuer}:{subject}"
+    await asyncio.to_thread(
+        record_audit,
         storage,
         audit_uid,
         "oidc_identity.delete",
         "oidc_identity",
-        f"{issuer}:{subject}",
+        resource,
         {
             "user_id": user_id,
             "obo_credential_revoked": credential_revoked,
-            "obo_cache_rows_purged": obo_cache_purged,
-            "model_memo_nodes_invalidated": memo_nodes_invalidated,
-            "model_memo_nodes_failed": memo_nodes_failed,
+            "obo_cache_rows_purged": rows_purged,
+        },
+        ip,
+    )
+    eviction = await _evict_delegated_model_memos(request, storage, user_id)
+    await asyncio.to_thread(
+        record_audit,
+        storage,
+        audit_uid,
+        "oidc_identity.delete.memo_eviction",
+        "oidc_identity",
+        resource,
+        {
+            # First, among the keys the Audit tab shows: where the user's cached model tokens
+            # may outlive the unlink until they expire.
+            "model_memo_unconfirmed": eviction.unconfirmed(),
+            "user_id": user_id,
+            "model_memo": eviction.report(),
         },
         ip,
     )
 
     return JSONResponse(
         {
-            "status": "ok",
+            "status": "ok" if eviction.complete and rows_purged is not None else "incomplete",
             "obo_credential_revoked": credential_revoked,
-            "obo_cache_rows_purged": obo_cache_purged,
-            "model_memo_nodes_invalidated": memo_nodes_invalidated,
-            "model_memo_nodes_failed": memo_nodes_failed,
+            "obo_cache_rows_purged": rows_purged,
+            "model_memo_unconfirmed": eviction.unconfirmed(),
+            "model_memo": eviction.report(),
         }
     )
 

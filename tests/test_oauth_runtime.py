@@ -1031,3 +1031,103 @@ def test_model_bridge_deadline_cancels_but_retains_started_write(
         release.set()
         runtime.call_sync(lambda: _settled(runtime))
     assert completed == ["write"]
+
+
+def test_a_runtime_that_never_started_holds_no_model_memo() -> None:
+    """Every read of the memo runs as an operation on the runtime: one that is not accepting
+    work can serve nothing, so its eviction answers 0 rather than an unconfirmed host."""
+    from turnstone.core.model_oauth import OAuthModelTokenClient
+    from turnstone.core.oauth.context import OAuthContext
+    from turnstone.core.oauth.runtime import OAuthRuntime
+
+    context = OAuthContext()
+    context.runtime = OAuthRuntime(context)
+
+    evicted = OAuthModelTokenClient(context).invalidate_model_mint_memo_sync(
+        user_id="u1", server_prefix="__model_obo__:"
+    )
+
+    assert evicted == 0
+
+
+def test_no_memoized_delegated_token_outlives_the_eviction_window() -> None:
+    """An unlink asks only the nodes registered within the window, so a longer-lived token sits
+    in the memo no longer than the window and is then read again from its row."""
+    from datetime import UTC, datetime, timedelta
+
+    from turnstone.core import model_oauth
+    from turnstone.core.oauth import tokens as oauth_tokens
+    from turnstone.core.oauth.context import OAuthContext
+
+    context = OAuthContext()
+
+    def _expiry(delta: timedelta) -> str:
+        return (datetime.now(UTC) + delta).replace(tzinfo=None).isoformat(timespec="seconds")
+
+    expiries = {
+        "long-lived": _expiry(timedelta(hours=8)),
+        "short-lived": _expiry(timedelta(minutes=5)),
+    }
+    for user_id, expires_at in expiries.items():
+        model_oauth._memoize_minted_token(
+            context,
+            user_id=user_id,
+            cache_server="__model_obo__:gw",
+            access_token="at",
+            expires_at=expires_at,
+            scopes="",
+            issuer="https://idp.example.com",
+            audience="api://gw",
+        )
+    memo = model_oauth._model_mint_memo(context)
+
+    capped = oauth_tokens._parse_iso_to_utc(
+        memo[("long-lived", "__model_obo__:gw")]["expires_at"] or ""
+    )
+    assert capped is not None
+    assert capped <= datetime.now(UTC) + timedelta(seconds=model_oauth._MEMO_MAX_AGE_S)
+    assert memo[("short-lived", "__model_obo__:gw")]["expires_at"] == expiries["short-lived"]
+    # The margin covers a node's 30 s heartbeat interval.
+    assert model_oauth.MEMO_EVICTION_WINDOW_S - model_oauth._MEMO_MAX_AGE_S >= 30
+
+
+def test_a_token_read_from_its_row_is_memoized_no_longer_than_the_window(backend: Any) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from tests.conftest import make_mcp_token_cipher
+    from turnstone.core import model_oauth
+    from turnstone.core.mcp_crypto import MCPTokenStore
+    from turnstone.core.oauth import tokens as oauth_tokens
+    from turnstone.core.oauth.context import OAuthContext
+
+    context = OAuthContext()
+    store = MCPTokenStore(backend, make_mcp_token_cipher(), node_id="test")
+    store.create_user_token(
+        "u1",
+        "__model_obo__:gw",
+        access_token="at-from-row",
+        refresh_token=None,
+        expires_at=(datetime.now(UTC) + timedelta(hours=8))
+        .replace(tzinfo=None)
+        .isoformat(timespec="seconds"),
+        scopes="",
+        as_issuer="https://idp.example.com",
+        audience="api://gw",
+    )
+
+    served = asyncio.run(
+        model_oauth._serve_fresh_mint_cache(
+            app_state=context,
+            token_store=store,
+            user_id="u1",
+            cache_server="__model_obo__:gw",
+            audience="api://gw",
+            scopes="",
+        )
+    )
+
+    assert served == "at-from-row"
+    entry = model_oauth._model_mint_memo(context)[("u1", "__model_obo__:gw")]
+    capped = oauth_tokens._parse_iso_to_utc(entry["expires_at"] or "")
+    assert capped is not None
+    assert capped <= datetime.now(UTC) + timedelta(seconds=model_oauth._MEMO_MAX_AGE_S)

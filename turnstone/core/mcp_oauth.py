@@ -50,7 +50,7 @@ from turnstone.core.oauth import tokens as oauth_tokens
 from turnstone.core.oauth.context import OAuthContext, TokenCoordination, oauth_context
 from turnstone.core.oauth.runtime import ensure_oauth_runtime
 from turnstone.core.oauth.work import OAuthUnavailableError, durable_write
-from turnstone.core.storage._protocol import USER_SCOPED_AUTH_TYPES
+from turnstone.core.storage._protocol import OBO_AUTH_TYPES, USER_SCOPED_AUTH_TYPES
 from turnstone.core.token_store import crypto as token_store_crypto
 from turnstone.core.token_store import store as token_store_store
 
@@ -3729,20 +3729,17 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
 
 
 def obo_server_names(storage: StorageBackend) -> set[str]:
-    """Names of all ``auth_type='oauth_obo'`` MCP servers (raises on storage error).
+    """Names of all sign-in passthrough MCP servers (raises on storage error).
 
-    One definition of "which servers are sign-in passthrough", shared by the
-    connections-list filter (which hides obo cache rows) and the identity-delete
-    cache purge, so a change to how obo is recognised — or a second passthrough
-    auth type — can't leave one path silently missing servers (which would
-    expose obo rows in the connections list, or leave a deprovisioned user's
-    minted-token cache un-purged). Callers wrap their own try/except so each
-    keeps its context-specific fail-open logging.
+    Recognised by ``OBO_AUTH_TYPES``, the definition the OIDC unlink's purge also reads in SQL,
+    so the connections-list filter (which hides obo cache rows) and the purge can't disagree on
+    which servers are passthrough. Callers wrap their own try/except so each keeps its
+    context-specific fail-open logging.
     """
     return {
         str(row.get("name") or "")
         for row in storage.list_mcp_servers()
-        if str(row.get("auth_type") or "") == "oauth_obo"
+        if str(row.get("auth_type") or "") in OBO_AUTH_TYPES
     }
 
 

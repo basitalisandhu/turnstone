@@ -327,10 +327,6 @@ class TokenStore:
             user_id, issuer, refresh_token_ct=refresh_ct
         )
 
-    def delete_oidc_credential(self, user_id: str, issuer: str) -> bool:
-        """Remove the captured credential (logout-all / admin revoke)."""
-        return self._storage.delete_oidc_user_credential(user_id, issuer)
-
     def list_user_token_metadata(self, user_id: str) -> list[UserTokenMetadata]:
         """Return non-secret metadata for every token row owned by ``user_id``.
 

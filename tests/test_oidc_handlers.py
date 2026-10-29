@@ -1112,8 +1112,8 @@ class TestAdminOIDCIdentities:
         storage.create_oidc_identity(
             "https://idp.example.com",
             "sub-456",
-            "test-admin",
-            "admin@example.com",
+            "user-y",
+            "y@example.com",
         )
         resp = admin_client.delete(
             "/v1/api/admin/oidc-identities?issuer=https://idp.example.com&subject=sub-456",
@@ -1122,6 +1122,333 @@ class TestAdminOIDCIdentities:
         assert resp.json()["status"] == "ok"
         # Verify it's gone
         assert storage.get_oidc_identity("https://idp.example.com", "sub-456") is None
+
+    def test_unlinking_your_own_identity_is_refused(
+        self,
+        admin_client: TestClient,
+        storage: SQLiteBackend,
+    ) -> None:
+        storage.create_oidc_identity(
+            "https://idp.example.com", "sub-own", "test-admin", "admin@example.com"
+        )
+
+        resp = admin_client.delete(
+            "/v1/api/admin/oidc-identities?issuer=https://idp.example.com&subject=sub-own",
+        )
+
+        assert resp.status_code == 400
+        assert storage.get_oidc_identity("https://idp.example.com", "sub-own") is not None
+
+    def test_a_storage_failure_changes_nothing_and_a_retry_completes(
+        self,
+        admin_client: TestClient,
+        storage: SQLiteBackend,
+    ) -> None:
+        import sqlalchemy as sa
+
+        issuer = "https://idp.example.com"
+        storage.create_oidc_identity(issuer, "sub-f", "user-f", "f@example.com")
+        storage.upsert_oidc_user_credential("user-f", issuer, refresh_token_ct=b"credential")
+
+        def listener(conn, cursor, statement, parameters, context, executemany):  # type: ignore[no-untyped-def]
+            if statement.startswith("DELETE FROM oidc_identities"):
+                raise sa.exc.OperationalError(statement, {}, Exception("connection lost"))
+
+        sa.event.listen(storage._engine, "before_cursor_execute", listener)
+        try:
+            resp = admin_client.delete(
+                f"/v1/api/admin/oidc-identities?issuer={issuer}&subject=sub-f",
+            )
+        finally:
+            sa.event.remove(storage._engine, "before_cursor_execute", listener)
+
+        assert resp.status_code == 503
+        assert storage.get_oidc_identity(issuer, "sub-f") is not None
+        assert storage.get_oidc_user_credential("user-f", issuer) is not None
+
+        retry = admin_client.delete(f"/v1/api/admin/oidc-identities?issuer={issuer}&subject=sub-f")
+        assert retry.status_code == 200, retry.text
+        assert storage.get_oidc_identity(issuer, "sub-f") is None
+        assert storage.get_oidc_user_credential("user-f", issuer) is None
+
+    def test_hosts_that_cannot_confirm_the_eviction_are_named(self, storage: SQLiteBackend) -> None:
+        """The unlink stands; the reply and the audit say where cached tokens may remain."""
+        import json as _json
+
+        app = Starlette(
+            routes=[
+                Mount(
+                    "/v1",
+                    routes=[
+                        Route(
+                            "/api/admin/oidc-identities",
+                            admin_delete_oidc_identity,
+                            methods=["DELETE"],
+                        )
+                    ],
+                )
+            ],
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = storage
+        model_client = MagicMock()
+        model_client.invalidate_model_mint_memo_sync.side_effect = TimeoutError()
+        app.state.model_token_client = model_client
+        app.state.collector = MagicMock()
+        app.state.collector.get_all_nodes.return_value = [
+            {"node_id": "node-ok", "server_url": "https://node-ok.example.com"},
+            {"node_id": "node-503", "server_url": "https://node-503.example.com"},
+            {"node_id": "node-down", "server_url": "https://node-down.example.com"},
+            {"node_id": "node-nourl", "server_url": ""},
+        ]
+
+        async def _post(url: str, **kwargs: Any) -> Any:
+            if "node-down" in url:
+                raise ConnectionError("refused")
+            return SimpleNamespace(status_code=503 if "node-503" in url else 200)
+
+        app.state.proxy_client = MagicMock()
+        app.state.proxy_client.post = AsyncMock(side_effect=_post)
+        app.state.proxy_token_mgr = SimpleNamespace(bearer_header={"Authorization": "Bearer s"})
+        client = TestClient(app, raise_server_exceptions=False)
+        storage.create_oidc_identity("https://idp.example.com", "sub-e", "user-e", "e@example.com")
+
+        resp = client.delete(
+            "/v1/api/admin/oidc-identities?issuer=https://idp.example.com&subject=sub-e"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "incomplete"
+        assert body["model_memo_unconfirmed"] == ["console", "node-503", "node-down", "node-nourl"]
+        assert body["model_memo"] == {
+            "console": "failed",
+            "node_list_read": True,
+            "nodes_evicted": ["node-ok"],
+            "nodes_failed": ["node-503", "node-down"],
+            "nodes_not_reached": ["node-nourl"],
+        }
+        assert storage.get_oidc_identity("https://idp.example.com", "sub-e") is None
+
+        def _detail(action: str) -> dict[str, Any]:
+            (event,) = storage.list_audit_events(action=action)
+            raw = event["detail"]
+            return _json.loads(raw) if isinstance(raw, str) else raw
+
+        # The unlink is on record as soon as it commits; the eviction's outcome follows it.
+        assert _detail("oidc_identity.delete") == {
+            "user_id": "user-e",
+            "obo_credential_revoked": False,
+            "obo_cache_rows_purged": 0,
+        }
+        eviction = _detail("oidc_identity.delete.memo_eviction")
+        assert list(eviction)[:2] == ["model_memo_unconfirmed", "user_id"]
+        assert eviction["model_memo_unconfirmed"] == body["model_memo_unconfirmed"]
+
+    @staticmethod
+    def _unlink_app(storage: SQLiteBackend) -> Starlette:
+        app = Starlette(
+            routes=[
+                Mount(
+                    "/v1",
+                    routes=[
+                        Route(
+                            "/api/admin/oidc-identities",
+                            admin_delete_oidc_identity,
+                            methods=["DELETE"],
+                        )
+                    ],
+                )
+            ],
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = storage
+        app.state.model_token_client = MagicMock()
+        app.state.model_token_client.invalidate_model_mint_memo_sync.return_value = 0
+        return app
+
+    _UNLINK = "/v1/api/admin/oidc-identities?issuer=https://idp.example.com&subject=sub-d"
+
+    def test_an_unlink_that_committed_despite_an_error_is_reported_incomplete(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """The connection dropped as the commit was acknowledged: the unlink stands, it is
+        evicted and audited, and the counts are unknown."""
+        import sqlalchemy as sa
+
+        storage.create_oidc_identity("https://idp.example.com", "sub-d", "user-d", "d@example.com")
+        real_unlink = storage.unlink_oidc_identity
+
+        def _committed_then_lost(*args: Any, **kwargs: Any) -> Any:
+            real_unlink(*args, **kwargs)
+            raise sa.exc.OperationalError("COMMIT", {}, Exception("connection lost"))
+
+        app = self._unlink_app(storage)
+        with patch.object(storage, "unlink_oidc_identity", side_effect=_committed_then_lost):
+            resp = TestClient(app, raise_server_exceptions=False).delete(self._UNLINK)
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "incomplete"
+        assert body["obo_credential_revoked"] is None
+        assert body["obo_cache_rows_purged"] is None
+        app.state.model_token_client.invalidate_model_mint_memo_sync.assert_called_once()
+        assert len(storage.list_audit_events(action="oidc_identity.delete")) == 1
+        assert len(storage.list_audit_events(action="oidc_identity.delete.memo_eviction")) == 1
+
+    def test_an_unlink_that_did_not_commit_changes_nothing(self, storage: SQLiteBackend) -> None:
+        import sqlalchemy as sa
+
+        storage.create_oidc_identity("https://idp.example.com", "sub-d", "user-d", "d@example.com")
+        failure = sa.exc.OperationalError("DELETE", {}, Exception("connection lost"))
+
+        app = self._unlink_app(storage)
+        with patch.object(storage, "unlink_oidc_identity", side_effect=failure):
+            resp = TestClient(app, raise_server_exceptions=False).delete(self._UNLINK)
+
+        assert resp.status_code == 503
+        assert resp.json()["error"] == (
+            "The change could not be saved, and nothing was changed. Try again."
+        )
+        assert storage.get_oidc_identity("https://idp.example.com", "sub-d") is not None
+        app.state.model_token_client.invalidate_model_mint_memo_sync.assert_not_called()
+
+    def test_an_unlink_whose_outcome_cannot_be_read_says_so(self, storage: SQLiteBackend) -> None:
+        import sqlalchemy as sa
+
+        storage.create_oidc_identity("https://idp.example.com", "sub-d", "user-d", "d@example.com")
+        failure = sa.exc.OperationalError("SELECT", {}, Exception("connection lost"))
+        real_read = storage.get_oidc_identity
+        reads = iter([real_read, failure])
+
+        def _read(*args: Any, **kwargs: Any) -> Any:
+            step = next(reads)
+            if isinstance(step, Exception):
+                raise step
+            return step(*args, **kwargs)
+
+        app = self._unlink_app(storage)
+        with (
+            patch.object(storage, "unlink_oidc_identity", side_effect=failure),
+            patch.object(storage, "get_oidc_identity", side_effect=_read),
+        ):
+            resp = TestClient(app, raise_server_exceptions=False).delete(self._UNLINK)
+
+        assert resp.status_code == 503
+        assert resp.json()["error"] == (
+            "The change may not have been saved. Check before trying again."
+        )
+
+    def test_a_storage_failure_on_the_first_read_answers_503(self, storage: SQLiteBackend) -> None:
+        import sqlalchemy as sa
+
+        failure = sa.exc.OperationalError("SELECT", {}, Exception("database is down"))
+        app = self._unlink_app(storage)
+        with patch.object(storage, "get_oidc_identity", side_effect=failure):
+            resp = TestClient(app, raise_server_exceptions=False).delete(self._UNLINK)
+
+        assert resp.status_code == 503
+
+    @pytest.mark.parametrize("answers", [True, False], ids=["evicted", "unreachable"])
+    def test_a_registered_node_the_collector_does_not_list_is_asked(
+        self, storage: SQLiteBackend, answers: bool
+    ) -> None:
+        """Its heartbeat writes failed long enough to leave the collector's list, but it still
+        serves, so it may hold the user's cached model token."""
+        storage.create_oidc_identity("https://idp.example.com", "sub-d", "user-d", "d@example.com")
+        storage.register_service("server", "node-ok", "https://node-ok.example.com")
+        storage.register_service("server", "node-quiet", "https://node-quiet.example.com")
+        app = self._unlink_app(storage)
+        app.state.collector = MagicMock()
+        app.state.collector.get_all_nodes.return_value = [
+            {"node_id": "node-ok", "server_url": "https://node-ok.example.com"}
+        ]
+
+        async def _post(url: str, **kwargs: Any) -> Any:
+            if "node-quiet" in url and not answers:
+                raise ConnectionError("refused")
+            return SimpleNamespace(status_code=200)
+
+        app.state.proxy_client = MagicMock()
+        app.state.proxy_client.post = AsyncMock(side_effect=_post)
+        app.state.proxy_token_mgr = SimpleNamespace(bearer_header={"Authorization": "Bearer s"})
+
+        resp = TestClient(app, raise_server_exceptions=False).delete(self._UNLINK)
+
+        assert resp.status_code == 200, resp.text
+        posted = sorted(call.args[0] for call in app.state.proxy_client.post.await_args_list)
+        assert posted == [
+            "https://node-ok.example.com/v1/api/_internal/model-auth-cache-invalidate",
+            "https://node-quiet.example.com/v1/api/_internal/model-auth-cache-invalidate",
+        ]
+        if answers:
+            assert resp.json()["status"] == "ok"
+        else:
+            assert resp.json()["status"] == "incomplete"
+            assert resp.json()["model_memo_unconfirmed"] == ["node-quiet"]
+
+    @pytest.mark.parametrize("broken", ["bearer", "client"])
+    def test_a_fan_out_that_cannot_start_names_every_node(
+        self, storage: SQLiteBackend, broken: str
+    ) -> None:
+        storage.create_oidc_identity("https://idp.example.com", "sub-d", "user-d", "d@example.com")
+        app = self._unlink_app(storage)
+        app.state.collector = MagicMock()
+        app.state.collector.get_all_nodes.return_value = [
+            {"node_id": "node-1", "server_url": "https://node-1.example.com"},
+            {"node_id": "node-2", "server_url": "https://node-2.example.com"},
+        ]
+        app.state.proxy_client = MagicMock()
+        app.state.proxy_client.post = AsyncMock()
+        if broken == "bearer":
+            token_mgr = MagicMock()
+            type(token_mgr).bearer_header = property(
+                lambda _self: (_ for _ in ()).throw(RuntimeError("no token"))
+            )
+            app.state.proxy_token_mgr = token_mgr
+        else:
+            app.state.proxy_client = None
+            app.state.proxy_token_mgr = SimpleNamespace(bearer_header={})
+
+        resp = TestClient(app, raise_server_exceptions=False).delete(self._UNLINK)
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "incomplete"
+        assert body["model_memo"]["nodes_not_reached"] == ["node-1", "node-2"]
+        assert len(storage.list_audit_events(action="oidc_identity.delete.memo_eviction")) == 1
+
+    def test_an_unreadable_node_list_is_named(self, storage: SQLiteBackend) -> None:
+        app = Starlette(
+            routes=[
+                Mount(
+                    "/v1",
+                    routes=[
+                        Route(
+                            "/api/admin/oidc-identities",
+                            admin_delete_oidc_identity,
+                            methods=["DELETE"],
+                        )
+                    ],
+                )
+            ],
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = storage
+        app.state.model_token_client = MagicMock()
+        app.state.model_token_client.invalidate_model_mint_memo_sync.return_value = 0
+        app.state.collector = MagicMock()
+        app.state.collector.get_all_nodes.side_effect = RuntimeError("collector down")
+        client = TestClient(app, raise_server_exceptions=False)
+        storage.create_oidc_identity("https://idp.example.com", "sub-n", "user-n", "n@example.com")
+
+        resp = client.delete(
+            "/v1/api/admin/oidc-identities?issuer=https://idp.example.com&subject=sub-n"
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "incomplete"
+        assert resp.json()["model_memo"]["node_list_read"] is False
 
     def test_delete_identity_revokes_credential_and_purges_obo_cache(
         self, storage: SQLiteBackend
@@ -1254,8 +1581,9 @@ class TestAdminOIDCIdentities:
             json={"user_id": "user-x"},
             timeout=5,
         )
-        assert body["model_memo_nodes_invalidated"] == 1
-        assert body["model_memo_nodes_failed"] == 0
+        assert body["status"] == "ok"
+        assert body["model_memo_unconfirmed"] == []
+        assert body["model_memo"]["nodes_evicted"] == ["node-1"]
 
     def test_delete_nonexistent_returns_404(self, admin_client: TestClient) -> None:
         resp = admin_client.delete(

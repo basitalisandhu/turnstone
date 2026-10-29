@@ -41,6 +41,7 @@ from turnstone.core.storage._lease import (
 from turnstone.core.storage._protocol import (
     FORK_RESERVATION_CONFIG_KEY,
     MCP_SECRET_UNCHANGED,
+    OBO_AUTH_TYPES,
     USER_SCOPED_AUTH_TYPES,
     AttachmentWrite,
     ConversationCommitWorkstreamGoneError,
@@ -54,6 +55,7 @@ from turnstone.core.storage._protocol import (
     OAuthTokenMetadataRow,
     OIDCIdentity,
     OIDCPendingState,
+    OIDCUnlinkResult,
     OIDCUserCredential,
     WorkstreamLeaseLostError,
 )
@@ -6876,16 +6878,54 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 for r in rows
             ]
 
-    def delete_oidc_identity(self, issuer: str, subject: str) -> bool:
-
+    def unlink_oidc_identity(
+        self, issuer: str, subject: str, *, model_token_prefix: str
+    ) -> OIDCUnlinkResult | None:
         with self._conn() as conn:
-            result = conn.execute(
+            # The writer lock first, so the purge set and the identity are read and deleted
+            # together; a concurrent unlink waits, then finds nothing.
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            row = conn.execute(
+                sa.select(oidc_identities.c.user_id).where(
+                    (oidc_identities.c.issuer == issuer) & (oidc_identities.c.subject == subject)
+                )
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            user_id = str(row[0])
+            # The credential goes first: a delegated mint that stores its token only while the
+            # credential exists then either lands before this transaction or is refused after it.
+            credential = conn.execute(
+                sa.delete(oidc_user_credentials).where(
+                    (oidc_user_credentials.c.user_id == user_id)
+                    & (oidc_user_credentials.c.issuer == issuer)
+                )
+            )
+            tokens = conn.execute(
+                sa.delete(oauth_tokens).where(
+                    (oauth_tokens.c.user_id == user_id)
+                    & (
+                        oauth_tokens.c.token_key.in_(
+                            sa.select(mcp_servers.c.name).where(
+                                mcp_servers.c.auth_type.in_(sorted(OBO_AUTH_TYPES))
+                            )
+                        )
+                        | oauth_tokens.c.token_key.startswith(model_token_prefix, autoescape=True)
+                    )
+                )
+            )
+            conn.execute(
                 sa.delete(oidc_identities).where(
                     (oidc_identities.c.issuer == issuer) & (oidc_identities.c.subject == subject)
                 )
             )
             conn.commit()
-            return result.rowcount > 0
+            return OIDCUnlinkResult(
+                user_id=user_id,
+                credential_deleted=credential.rowcount > 0,
+                delegated_token_rows_deleted=int(tokens.rowcount or 0),
+            )
 
     # -- OIDC user credential (single-credential MCP minting, #551) -------------
 
@@ -6945,18 +6985,6 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                     & (oidc_user_credentials.c.issuer == issuer)
                 )
                 .values(refresh_token_ct=refresh_token_ct, last_refreshed=now)
-            )
-            conn.commit()
-            return result.rowcount > 0
-
-    def delete_oidc_user_credential(self, user_id: str, issuer: str) -> bool:
-        """Remove the captured credential. Returns True if existed."""
-        with self._conn() as conn:
-            result = conn.execute(
-                sa.delete(oidc_user_credentials).where(
-                    (oidc_user_credentials.c.user_id == user_id)
-                    & (oidc_user_credentials.c.issuer == issuer)
-                )
             )
             conn.commit()
             return result.rowcount > 0

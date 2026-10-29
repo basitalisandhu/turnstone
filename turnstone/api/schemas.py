@@ -51,6 +51,49 @@ class StatusResponse(BaseModel):
     status: str = Field(default="ok", examples=["ok"])
 
 
+class MemoEvictionReport(BaseModel):
+    """Where a user's delegated model tokens were dropped from memory after an unlink or a
+    user deletion."""
+
+    console: str = Field(description="``evicted`` or ``failed``", examples=["evicted"])
+    node_list_read: bool = Field(
+        description="False when the list of nodes could not be read; every node then counts "
+        "as unconfirmed"
+    )
+    nodes_evicted: list[str] = Field(default_factory=list)
+    nodes_failed: list[str] = Field(default_factory=list)
+    nodes_not_reached: list[str] = Field(default_factory=list)
+
+
+class UserDeleteResponse(BaseModel):
+    """DELETE /v1/api/admin/users/{user_id} response."""
+
+    status: str = Field(
+        description="``ok``, or ``incomplete`` when a process could not confirm it dropped the "
+        "user's cached model tokens, or the outcome of the write is not fully known",
+        examples=["ok"],
+    )
+    model_memo_unconfirmed: list[str] = Field(
+        default_factory=list,
+        description="The processes that may still hold the user's cached model tokens until "
+        "they expire",
+    )
+    model_memo: MemoEvictionReport
+
+
+class OIDCUnlinkResponse(UserDeleteResponse):
+    """DELETE /v1/api/admin/oidc-identities response."""
+
+    obo_credential_revoked: bool | None = Field(
+        default=None,
+        description="Whether a captured sign-in credential was deleted; null when not known",
+    )
+    obo_cache_rows_purged: int | None = Field(
+        default=None,
+        description="How many delegated token rows were deleted; null when not known",
+    )
+
+
 class WorkstreamDeleteRequest(BaseModel):
     """POST /v1/api/route/workstreams/delete request."""
 

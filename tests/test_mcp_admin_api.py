@@ -4316,6 +4316,24 @@ class TestInternalModelAuthCacheInvalidateEndpoint:
             server_prefix="__model_obo__:",
         )
 
+    def test_an_eviction_that_cannot_be_confirmed_is_not_reported_as_done(self) -> None:
+        """The console counts this node as evicted only on a 200."""
+        app = Starlette(
+            routes=_routes_with_internal(),
+            middleware=[Middleware(_InjectServiceAuthMiddleware)],
+        )
+        app.state.model_token_client = MagicMock()
+        app.state.model_token_client.invalidate_model_mint_memo_sync.side_effect = TimeoutError()
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/v1/api/_internal/model-auth-cache-invalidate",
+            json={"user_id": "user-x"},
+        )
+
+        assert response.status_code == 503
+        assert "evicted" not in response.json()
+
     def test_non_service_identity_is_rejected(self) -> None:
         app = Starlette(
             routes=_routes_with_internal(),

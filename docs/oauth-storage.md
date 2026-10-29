@@ -97,10 +97,13 @@ does not add a cache-cleanup sweep.
   purge the affected alias's delegated and app token caches. Model purges delete
   only token rows; they leave MCP authorization states and captured credentials
   alone. Other aliases' tokens survive.
-- **Identity unlink:** unlinking an OIDC identity deletes its captured credential,
-  purges the user's delegated MCP/model token caches, and requests model-memo
-  eviction on the console and registered nodes. Independent `oauth_user` grants
-  and shared app-identity caches survive. Existing upstream access tokens may
+- **Identity unlink:** unlinking an OIDC identity deletes its captured credential
+  and purges the user's delegated MCP/model token caches in the same transaction
+  as the identity, then evicts model-memo entries on the console and the nodes
+  registered within the last hour (no memo entry lives longer); the reply and
+  the audit name any host that could not confirm it.
+  Deleting a user evicts the same way. Independent `oauth_user` grants and
+  shared app-identity caches survive. Existing upstream access tokens may
   remain valid until expiry; the identity provider governs downstream access.
 - **User deletion:** deletes that user's database token rows and captured
   credentials. App-identity rows under `__app__` belong to the application and

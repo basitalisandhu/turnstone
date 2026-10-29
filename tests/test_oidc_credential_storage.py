@@ -6,8 +6,9 @@ IdP refresh token:
 - ``upsert_oidc_user_credential`` (create-or-replace semantics)
 - ``get_oidc_user_credential``
 - ``update_oidc_user_credential_refresh`` (rotation write-back)
-- ``delete_oidc_user_credential``
 - ``delete_user`` cascade
+
+A credential is removed only with its identity, through ``unlink_oidc_identity``.
 
 plus the ``MCPTokenStore`` encrypt/decrypt wrappers over the same rows.
 """
@@ -87,14 +88,6 @@ class TestRotationWriteBack:
 
 
 class TestDelete:
-    def test_delete_existing(self, backend) -> None:
-        backend.upsert_oidc_user_credential("u1", ISS, refresh_token_ct=b"ct-1")
-        assert backend.delete_oidc_user_credential("u1", ISS)
-        assert backend.get_oidc_user_credential("u1", ISS) is None
-
-    def test_delete_missing_returns_false(self, backend) -> None:
-        assert not backend.delete_oidc_user_credential("nobody", ISS)
-
     def test_delete_user_cascades_credential(self, backend) -> None:
         backend.create_user("u-doomed", "doomed", "Doomed", "hash")
         backend.upsert_oidc_user_credential("u-doomed", ISS, refresh_token_ct=b"ct-1")
@@ -143,9 +136,3 @@ class TestTokenStoreWrappers:
     def test_get_missing_returns_none(self, backend) -> None:
         store = MCPTokenStore(backend, make_mcp_token_cipher())
         assert store.get_oidc_credential("nobody", ISS) is None
-
-    def test_delete_via_store(self, backend) -> None:
-        store = MCPTokenStore(backend, make_mcp_token_cipher())
-        store.upsert_oidc_credential("u1", ISS, refresh_token="rt")
-        assert store.delete_oidc_credential("u1", ISS)
-        assert store.get_oidc_credential("u1", ISS) is None

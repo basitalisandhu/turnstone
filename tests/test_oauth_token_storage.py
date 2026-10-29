@@ -330,6 +330,91 @@ class TestServerWritesCarryTheirOAuthRows:
         assert _rows_under(backend, "srv") == (True, True)
 
 
+class TestUnlinkOIDCIdentity:
+    """Unlinking deletes the identity and the delegated access it carried, in one transaction."""
+
+    ISSUER = "https://idp.example.com"
+
+    def _seed(self, backend: Any) -> None:
+        backend.create_oidc_identity(self.ISSUER, "sub-1", "u1", "u1@example.com")
+        backend.upsert_oidc_user_credential("u1", self.ISSUER, refresh_token_ct=b"credential")
+        backend.upsert_oidc_user_credential(
+            "u1", "https://other-idp.example.com", refresh_token_ct=b"c2"
+        )
+        backend.create_mcp_server(
+            server_id="id-obo",
+            name="obo-srv",
+            transport="streamable-http",
+            url="https://mcp.example.com/obo",
+            auth_type="oauth_obo",
+        )
+        _create_server(backend, "user-srv")
+        for key in (
+            "obo-srv",
+            "user-srv",
+            "__model_obo__:gateway",
+            # An unescaped LIKE would read the prefix's underscores as wildcards and match this.
+            "XXmodelYoboZZ:gateway",
+        ):
+            _seed_token(backend, "u1", key)
+        _seed_token(backend, "u2", "obo-srv")
+        _seed_token(backend, MODEL_APP_MINT_PRINCIPAL, model_app_cache_server("gateway"))
+
+    def test_the_identity_goes_with_its_credential_and_delegated_tokens(self, backend: Any) -> None:
+        self._seed(backend)
+
+        result = backend.unlink_oidc_identity(
+            self.ISSUER, "sub-1", model_token_prefix="__model_obo__:"
+        )
+
+        assert result == {
+            "user_id": "u1",
+            "credential_deleted": True,
+            "delegated_token_rows_deleted": 2,
+        }
+        assert backend.get_oidc_identity(self.ISSUER, "sub-1") is None
+        assert backend.get_oidc_user_credential("u1", self.ISSUER) is None
+        assert backend.get_oidc_user_credential("u1", "https://other-idp.example.com") is not None
+        assert backend.get_oauth_token("u1", "obo-srv") is None
+        assert backend.get_oauth_token("u1", "__model_obo__:gateway") is None
+        assert backend.get_oauth_token("u1", "user-srv") is not None
+        assert backend.get_oauth_token("u1", "XXmodelYoboZZ:gateway") is not None
+        assert backend.get_oauth_token("u2", "obo-srv") is not None
+        assert (
+            backend.get_oauth_token(MODEL_APP_MINT_PRINCIPAL, model_app_cache_server("gateway"))
+            is not None
+        )
+
+    def test_a_missing_identity_changes_nothing(self, backend: Any) -> None:
+        self._seed(backend)
+
+        assert (
+            backend.unlink_oidc_identity(self.ISSUER, "sub-x", model_token_prefix="__model_obo__:")
+            is None
+        )
+
+        assert backend.get_oidc_user_credential("u1", self.ISSUER) is not None
+        assert backend.get_oauth_token("u1", "obo-srv") is not None
+
+    def test_a_failure_partway_changes_nothing(self, backend: Any) -> None:
+        self._seed(backend)
+        listener = _failing_on("DELETE FROM oidc_identities")
+
+        sa.event.listen(backend._engine, "before_cursor_execute", listener)
+        try:
+            with pytest.raises(RuntimeError, match="controlled failure"):
+                backend.unlink_oidc_identity(
+                    self.ISSUER, "sub-1", model_token_prefix="__model_obo__:"
+                )
+        finally:
+            sa.event.remove(backend._engine, "before_cursor_execute", listener)
+
+        assert backend.get_oidc_identity(self.ISSUER, "sub-1") is not None
+        assert backend.get_oidc_user_credential("u1", self.ISSUER) is not None
+        assert backend.get_oauth_token("u1", "obo-srv") is not None
+        assert backend.get_oauth_token("u1", "__model_obo__:gateway") is not None
+
+
 def test_a_server_update_applies_only_while_the_row_holds_what_was_read(backend: Any) -> None:
     backend.create_mcp_server(
         server_id="s1",
