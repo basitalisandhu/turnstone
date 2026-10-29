@@ -10,6 +10,23 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
+## [2026-10-29]
+
+### Security
+
+- **An MCP server's authorization server stays pinned.** Once discovered, it
+  moves only when an operator changes the server's URL or Authorization Server
+  URL, or when a value stored by an earlier version is refused on its text
+  alone (an IP-literal host, or a bare `localhost` host for a remote server),
+  which is discovered again. A lookup of its host that fails, or that answers
+  with a refused address, now fails the connect or refresh instead of
+  discovering it again. A refresh or a disconnect sends a stored refresh token
+  only to the authorization server that issued it, compared exactly; a grant
+  from any other, including one recorded before 1.8.2 with a templated issuer,
+  is removed, and the user is asked to connect again. A refresh that finishes
+  or fails after the user consented again no longer overwrites or removes the
+  new grant.
+
 ## [1.9.1]
 
 > **Before upgrading:** the database advances from migration 083 to 084, which

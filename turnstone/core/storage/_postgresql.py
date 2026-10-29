@@ -5889,19 +5889,20 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         access_token_ct: bytes,
         refresh_token_ct: bytes | None,
         expires_at: str | None,
+        expected_as_issuer: str,
+        expected_access_token_ct: bytes,
     ) -> bool:
-        """Rewrite token columns + ``last_refreshed`` after an AS refresh.
-
-        Preserves columns this method does not rewrite (``scopes``,
-        ``as_issuer``, ``audience``, ``created``). Returns True when a
-        row was updated.
-        """
+        """Rewrite token columns + ``last_refreshed`` after an AS refresh, while the row is still
+        the grant the refresh read (see the protocol). Returns True when a row was updated."""
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
             result = conn.execute(
                 sa.update(oauth_tokens)
                 .where(
-                    (oauth_tokens.c.user_id == user_id) & (oauth_tokens.c.token_key == token_key)
+                    (oauth_tokens.c.user_id == user_id)
+                    & (oauth_tokens.c.token_key == token_key)
+                    & (oauth_tokens.c.as_issuer == expected_as_issuer)
+                    & (oauth_tokens.c.access_token_ct == expected_access_token_ct)
                 )
                 .values(
                     access_token_ct=access_token_ct,
@@ -5919,6 +5920,26 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             result = conn.execute(
                 sa.delete(oauth_tokens).where(
                     (oauth_tokens.c.user_id == user_id) & (oauth_tokens.c.token_key == token_key)
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_oauth_token_if_unchanged(
+        self,
+        user_id: str,
+        token_key: str,
+        *,
+        expected_as_issuer: str,
+        expected_access_token_ct: bytes,
+    ) -> bool:
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(oauth_tokens).where(
+                    (oauth_tokens.c.user_id == user_id)
+                    & (oauth_tokens.c.token_key == token_key)
+                    & (oauth_tokens.c.as_issuer == expected_as_issuer)
+                    & (oauth_tokens.c.access_token_ct == expected_access_token_ct)
                 )
             )
             conn.commit()

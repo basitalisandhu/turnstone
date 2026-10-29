@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import socket
 import urllib.parse
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -270,6 +271,29 @@ class TestAuthorize:
 
         assert resp.status_code == 502
         assert "S256" in resp.json()["error"]
+
+    def test_a_pin_whose_host_does_not_resolve_answers_502_and_keeps_the_pin(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        token_store = _make_token_store(storage)
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        def _getaddrinfo(host: str, *args: Any, **kwargs: Any) -> list[Any]:
+            if host == "as.example.com":
+                raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+            return [(2, 1, 6, "", ("93.184.216.34", 0))]
+
+        with patch("socket.getaddrinfo", side_effect=_getaddrinfo):
+            resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
+
+        assert resp.status_code == 502
+        assert "did not resolve" in resp.json()["error"]
+        http_client_mock.get.assert_not_called()
+        row = storage.get_mcp_server_by_name("srv-oauth")
+        assert row is not None
+        assert row["oauth_as_issuer_cached"] == "https://as.example.com"
 
     def test_pending_state_persisted(
         self, storage: SQLiteBackend, http_client_mock: MagicMock

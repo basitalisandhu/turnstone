@@ -103,12 +103,16 @@ class TestUserTokenCRUD:
             as_issuer="https://auth.example.com",
             audience="https://mcp.example.com",
         )
+        read = store.get_user_token_and_version("u1", "srv-a")
+        assert read is not None
         ok = store.update_user_token_after_refresh(
             "u1",
             "srv-a",
             access_token="new-access",
             refresh_token="new-refresh",
             expires_at="2026-05-04T13:00:00",
+            expected_as_issuer="https://auth.example.com",
+            expected_version=read[1],
         )
         assert ok is True
         plain = store.get_user_token("u1", "srv-a")
@@ -130,8 +134,76 @@ class TestUserTokenCRUD:
             access_token="x",
             refresh_token=None,
             expires_at=None,
+            expected_as_issuer="",
+            expected_version=b"x",
         )
         assert ok is False
+
+    @pytest.mark.parametrize("change", ["replaced", "other-issuer"])
+    def test_a_refresh_and_a_delete_leave_a_grant_they_did_not_read(
+        self, backend, change: str
+    ) -> None:
+        """A consent that completed after the read replaced the row: the refresh's tokens and
+        its issuer-changed delete belong to the grant that is gone."""
+        store, _ = _make_store(backend)
+
+        def _create(access: str, issuer: str) -> None:
+            store.create_user_token(
+                "u1",
+                "srv-a",
+                access_token=access,
+                refresh_token=f"{access}-refresh",
+                expires_at="2026-05-04T12:00:00",
+                scopes="openid",
+                as_issuer=issuer,
+                audience="https://mcp.example.com",
+            )
+
+        _create("old-access", "https://auth.example.com")
+        read = store.get_user_token_and_version("u1", "srv-a")
+        assert read is not None
+        expected_issuer = "https://auth.example.com"
+        if change == "replaced":
+            store.delete_user_token("u1", "srv-a")
+            _create("new-access", "https://auth.example.com")
+        else:
+            expected_issuer = "https://other-auth.example.com"
+
+        assert not store.update_user_token_after_refresh(
+            "u1",
+            "srv-a",
+            access_token="refreshed",
+            refresh_token="refreshed-refresh",
+            expires_at=None,
+            expected_as_issuer=expected_issuer,
+            expected_version=read[1],
+        )
+        assert not store.delete_user_token_if_unchanged(
+            "u1", "srv-a", expected_as_issuer=expected_issuer, expected_version=read[1]
+        )
+        plain = store.get_user_token("u1", "srv-a")
+        assert plain is not None
+        assert plain["access_token"] == ("new-access" if change == "replaced" else "old-access")
+
+    def test_a_delete_of_the_grant_it_read_removes_it(self, backend) -> None:
+        store, _ = _make_store(backend)
+        store.create_user_token(
+            "u1",
+            "srv-a",
+            access_token="a",
+            refresh_token=None,
+            expires_at=None,
+            scopes=None,
+            as_issuer="https://auth.example.com",
+            audience="https://mcp.example.com",
+        )
+        read = store.get_user_token_and_version("u1", "srv-a")
+        assert read is not None
+
+        assert store.delete_user_token_if_unchanged(
+            "u1", "srv-a", expected_as_issuer="https://auth.example.com", expected_version=read[1]
+        )
+        assert store.get_user_token("u1", "srv-a") is None
 
     def test_delete(self, backend) -> None:
         store, _ = _make_store(backend)

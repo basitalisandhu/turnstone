@@ -2960,17 +2960,35 @@ class StorageBackend(Protocol):
         access_token_ct: bytes,
         refresh_token_ct: bytes | None,
         expires_at: str | None,
+        expected_as_issuer: str,
+        expected_access_token_ct: bytes,
     ) -> bool:
         """Rewrite token columns + ``last_refreshed`` after an AS refresh.
 
-        Preserves columns this method does not rewrite (``scopes``,
-        ``as_issuer``, ``audience``, ``created``). Returns True when a
-        row was updated.
+        Writes only while the row is still the grant the refresh read: its ``as_issuer`` and its
+        ``access_token_ct`` (fresh ciphertext on every write, so it identifies one version of the
+        row) still equal the expected values. A grant replaced meanwhile, by a consent that
+        completed or a revocation, is left alone. Preserves columns this method does not rewrite
+        (``scopes``, ``as_issuer``, ``audience``, ``created``). Returns True when a row was
+        updated.
         """
         ...
 
     def delete_oauth_token(self, user_id: str, token_key: str) -> bool:
         """Delete the per-(user, token key) token row. Returns True if existed."""
+        ...
+
+    def delete_oauth_token_if_unchanged(
+        self,
+        user_id: str,
+        token_key: str,
+        *,
+        expected_as_issuer: str,
+        expected_access_token_ct: bytes,
+    ) -> bool:
+        """Delete the token row only while it is the grant the caller read, compared as
+        :meth:`update_oauth_token_after_refresh` compares it. Returns True when a row was
+        deleted."""
         ...
 
     def list_oauth_token_metadata_by_user(self, user_id: str) -> list[OAuthTokenMetadataRow]:

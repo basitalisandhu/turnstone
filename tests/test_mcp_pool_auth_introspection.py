@@ -429,6 +429,8 @@ class TestForceRefresh:
                 access_token="refreshed-token",
                 refresh_token="rotated-rrr",
                 expires_at=future_expires,
+                expected_as_issuer=kwargs["grant_issuer"],
+                expected_version=kwargs["grant_version"],
             )
             return ("refreshed-token", "rotated-rrr", future_expires)
 

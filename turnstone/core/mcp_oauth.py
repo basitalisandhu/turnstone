@@ -141,6 +141,39 @@ def _private_network_refusal(
     return MCPOAuthDiscoveryError(f"{what} is on a private network - {remedy}")
 
 
+def _pinned_issuer_refusal(exc: oauth_ssrf.OAuthSSRFAddressError, pinned_issuer: str) -> str:
+    """Return the short, remedy-first message for a kept pin whose host failed its checks.
+
+    It ends with the pin's origin, which the admin UI does not show; the full issuer and the
+    refused address are in the log line.
+    """
+    parts = urllib.parse.urlsplit(pinned_issuer)
+    origin = f"{parts.scheme}://{parts.hostname or ''}" + (f":{parts.port}" if parts.port else "")
+    pinned = f"(pinned: {oauth_ssrf.sanitize_log_text(origin)})"
+    if isinstance(exc, oauth_ssrf.OAuthSSRFUnresolvableError):
+        return f"the authorization server's host did not resolve; try again later {pinned}"
+    return (
+        "the authorization server's address is refused - an operator can move this server to "
+        f"another by setting its Authorization Server URL {pinned}"
+    )
+
+
+def _pin_refused_on_its_text(pinned_issuer: str, server_url: str) -> bool:
+    """Would *pinned_issuer* be refused whatever its host resolved to?
+
+    An IP-literal host needs no DNS query, and a bare ``localhost`` host is refused for a remote
+    server because the localhost lane is withheld there, so DNS cannot change either verdict even
+    though the refusal comes after resolution. ``*.localhost`` and other names are looked up, so
+    their verdicts are DNS's.
+    """
+    host = urllib.parse.urlsplit(pinned_issuer).hostname or ""
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return host == "localhost" and not oauth_ssrf.url_is_localhost(server_url)
+    return True
+
+
 def is_user_scoped_auth(auth_type: str | None) -> bool:
     """True when *auth_type* uses per-(user, server) connections and tokens."""
     return auth_type in USER_SCOPED_AUTH_TYPES
@@ -148,6 +181,14 @@ def is_user_scoped_auth(auth_type: str | None) -> bool:
 
 class MCPOAuthDiscoveryError(oauth_http.OAuthError):
     """Discovery (PRM, AS metadata) failed or returned unsuitable values."""
+
+
+class MCPOAuthIssuerChangedError(MCPOAuthDiscoveryError):
+    """Discovery resolved an issuer other than the one a grant or a pending consent came from."""
+
+
+class _GrantReplacedDuringRefreshError(Exception):
+    """The grant a refresh read was replaced or removed before its new tokens were written."""
 
 
 class MCPOAuthExchangeError(oauth_http.OAuthError):
@@ -1030,8 +1071,16 @@ async def discover_authorization_server(
     trusted_hosts: frozenset[str],
     metadata_cache: dict[str, tuple[oauth_http.ASMetadata, float]] | None = None,
     allow_private_network: bool = False,
+    expected_issuer: str | None = None,
 ) -> oauth_http.ASMetadata:
     """Resolve the issuer URL and load AS metadata for an MCP server.
+
+    *expected_issuer* is the issuer a stored grant or a pending consent came from, compared
+    exactly. When it is given, discovery raises :class:`MCPOAuthIssuerChangedError` as soon as the
+    issuer resolves to any other value, before the authorization server's metadata is fetched and
+    before any new pin is written, so a credential bound to one authorization server is never
+    sent to another. With no pin, the server's metadata is fetched first to learn the issuer, and
+    a pin refused on its text has already been cleared by then.
 
     *allow_private_network* is the deployment opt-in
     (``mcp.oauth_allow_private_network``). It reaches only the values the
@@ -1048,7 +1097,11 @@ async def discover_authorization_server(
 
     1. ``override_url`` (operator override) — used directly as the issuer.
     2. ``cached_issuer`` (from ``mcp_servers.oauth_as_issuer_cached``) —
-       trusted across requests until invalidated by an admin edit.
+       kept until an operator changes the Server URL or the Authorization
+       Server URL. A pin whose host does not resolve, or resolves to a refused
+       address, is kept and the attempt fails. A pin refused on its text alone
+       (an IP-literal host, a bare ``localhost`` host for a remote server, or a
+       form no longer accepted) is dropped and discovered again.
     3. PRM discovery via the resource server URL.
 
     The fetched :class:`oauth_http.ASMetadata` is also memoised in *metadata_cache*
@@ -1087,10 +1140,14 @@ async def discover_authorization_server(
                     raise MCPOAuthDiscoveryError(f"override AS URL rejected: {exc}") from exc
                 issuer = override_url
             elif cached_issuer:
-                # Defense-in-depth: re-run SSRF validation on the cached value.
-                # If the issuer's hostname has rebound to a private address since
-                # we cached it (or the operator edited the row to point at a
-                # private host), drop the cache and fall through to PRM.
+                # Re-check the pin before using it. A verdict reached by resolving its host (no
+                # answer, or an address the policy refuses) is DNS's, and says nothing about
+                # which authorization server the row's grants belong to: the pin stays and this
+                # attempt fails. An operator moves the pin by editing the server URL or the
+                # Authorization Server URL, which also purges the grants it described. A pin
+                # refused on its text alone (an IP-literal host, a form or scheme no longer
+                # accepted, or a bare localhost host for a remote server) can never pass again,
+                # so it is dropped and discovery starts over from the server's metadata.
                 try:
                     await oauth_ssrf.validate_url_no_ssrf_async(
                         cached_issuer,
@@ -1098,11 +1155,29 @@ async def discover_authorization_server(
                         allow_localhost=oauth_ssrf.url_is_localhost(server_url),
                     )
                 except oauth_ssrf.OAuthSSRFError as exc:
+                    dns_verdict = (
+                        exc
+                        if isinstance(exc, oauth_ssrf.OAuthSSRFAddressError)
+                        and not _pin_refused_on_its_text(cached_issuer, server_url)
+                        else None
+                    )
+                    if dns_verdict is None:
+                        verdict = "text"
+                    elif isinstance(dns_verdict, oauth_ssrf.OAuthSSRFUnresolvableError):
+                        verdict = "unresolvable"
+                    else:
+                        verdict = "address"
                     log.warning(
                         "mcp_server.oauth.cached_issuer_rejected",
                         server_name=server_name,
+                        kept=dns_verdict is not None,
+                        verdict=verdict,
                         reason=oauth_ssrf.sanitize_log_text(str(exc)),
                     )
+                    if dns_verdict is not None:
+                        raise MCPOAuthDiscoveryError(
+                            _pinned_issuer_refusal(dns_verdict, cached_issuer)
+                        ) from exc
                     cached_issuer = None
                     if server_id:
                         try:
@@ -1133,6 +1208,17 @@ async def discover_authorization_server(
                     deadline=deadline,
                     allow_private=allow_private_network,
                     server_name=server_name,
+                )
+
+            if expected_issuer is not None and expected_issuer != issuer:
+                log.warning(
+                    "mcp_server.oauth.issuer_changed",
+                    server_name=server_name,
+                    expected=oauth_ssrf.sanitize_log_text(expected_issuer),
+                    resolved=oauth_ssrf.sanitize_log_text(issuer),
+                )
+                raise MCPOAuthIssuerChangedError(
+                    "the server's authorization server has changed since this grant was issued"
                 )
 
             cached = metadata_cache.get(issuer) if metadata_cache is not None else None
@@ -1735,7 +1821,9 @@ async def _refresh_user_operation(
     try:
         async with lock, pg_lock:
             try:
-                plain = await asyncio.to_thread(token_store.get_user_token, user_id, server_name)
+                read = await asyncio.to_thread(
+                    token_store.get_user_token_and_version, user_id, server_name
+                )
             except token_store_crypto.TokenDecryptError as exc:
                 return _decrypt_failure_result(
                     user_id,
@@ -1743,8 +1831,10 @@ async def _refresh_user_operation(
                     exc,
                     event="mcp_server.oauth.token_decrypt_failed_classified",
                 )
-            if plain is None:
+            if read is None:
                 return _no_token_result(TokenLookupResult(kind="missing"))
+            plain, version = read
+            grant_issuer = str(plain.get("as_issuer") or "")
             if not oauth_tokens._token_needs_refresh(plain.get("expires_at")):
                 if not force_refresh:
                     return _token_result(plain["access_token"])
@@ -1764,6 +1854,7 @@ async def _refresh_user_operation(
                     server_name,
                     server_id,
                     reason="expired_no_refresh",
+                    grant=(grant_issuer, version),
                 )
             try:
                 access, _, _ = await _refresh_and_persist(
@@ -1775,7 +1866,35 @@ async def _refresh_user_operation(
                     server_row=server_row,
                     refresh_value=refresh_value,
                     existing_scopes=plain.get("scopes") or "",
+                    grant_issuer=grant_issuer,
+                    grant_version=version,
                     allow_private_network=allow_private_network,
+                )
+            except _GrantReplacedDuringRefreshError:
+                # A consent completed, or the grant was revoked, while the refresh was at the
+                # authorization server: the new tokens belong to a grant that is gone, so they are
+                # neither stored nor served, and the next lookup reads the row as it is now.
+                log.info(
+                    "mcp_server.oauth.refresh_discarded_grant_replaced",
+                    user_id=user_id,
+                    server_name=server_name,
+                )
+                return _LookupOutcome(TokenLookupResult(kind="refresh_failed_transient"))
+            except MCPOAuthIssuerChangedError:
+                # The grant belongs to an authorization server this server no longer names: it
+                # can never be refreshed here, and its refresh token must not go to the new one.
+                if not revoke_on_failure:
+                    return _LookupOutcome(
+                        TokenLookupResult(kind="refresh_failed"), _LookupDisposition(apply=False)
+                    )
+                return await _revoke_after_refresh_failure(
+                    context,
+                    token_store,
+                    user_id,
+                    server_name,
+                    server_id,
+                    reason="issuer_changed",
+                    grant=(grant_issuer, version),
                 )
             except oauth_http.OAuthRefreshError as exc:
                 return await _handle_refresh_failure(
@@ -1791,6 +1910,7 @@ async def _refresh_user_operation(
                     events=_REFRESH_FAILURE_EVENTS,
                     permanent_reason="refresh_failed",
                     escalation_reason="refresh_failed_ambiguous_escalated",
+                    grant=(grant_issuer, version),
                 )
             return _token_result(access)
     finally:
@@ -2031,14 +2151,31 @@ async def _revoke_after_refresh_failure(
     *,
     reason: str,
     audit_when_absent: bool = True,
+    grant: tuple[str, bytes] | None = None,
 ) -> _LookupOutcome:
     """Delete under runtime locking, then request MCP backoff/lock cleanup.
 
-    Custodial failures audit even a concurrently removed row: a grant really
-    existed. OBO failures audit only actual deletions because an unsuccessful
-    mint need not have created a cache row and its shared credential survives.
+    *grant* is the ``(as_issuer, version)`` the caller read, and every custodial failure passes
+    it: the row is deleted only while it is still that grant. One replaced or removed meanwhile (a
+    consent that completed, a disconnect, a purge) is left alone, nothing is audited, and the
+    result is transient so the next lookup reads the row as it is now. Without it, as for an OBO
+    mint's cache row, the delete is unconditional and *audit_when_absent* decides whether a row
+    already gone is audited: an unsuccessful mint need not have created one, and its shared
+    credential survives.
     """
-    deleted = await durable_write(token_store.delete_user_token, user_id, server_name)
+    if grant is not None:
+        replaced = not await durable_write(
+            token_store.delete_user_token_if_unchanged,
+            user_id,
+            server_name,
+            expected_as_issuer=grant[0],
+            expected_version=grant[1],
+        )
+        if replaced:
+            return _LookupOutcome(TokenLookupResult(kind="refresh_failed_transient"))
+        deleted = True
+    else:
+        deleted = await durable_write(token_store.delete_user_token, user_id, server_name)
     if deleted or audit_when_absent:
         await _audit_event(
             app_state,
@@ -2136,8 +2273,14 @@ async def _handle_refresh_failure(
     permanent_reason: str,
     escalation_reason: str,
     arm_cooldown_on_permanent: bool = False,
+    grant: tuple[str, bytes] | None = None,
 ) -> _LookupOutcome:
-    """Classify under runtime locking, returning an immutable MCP disposition."""
+    """Classify under runtime locking, returning an immutable MCP disposition.
+
+    *grant* is the ``(as_issuer, version)`` a refresh read: a failure that deletes the grant
+    deletes only that one, so a consent that completed while the refresh was at the
+    authorization server stands (see :func:`_revoke_after_refresh_failure`).
+    """
     if not revoke_on_failure:
         kind: Literal["refresh_failed", "refresh_failed_transient"] = (
             "refresh_failed"
@@ -2156,6 +2299,7 @@ async def _handle_refresh_failure(
             server_id_for_audit,
             reason=permanent_reason,
             audit_when_absent=not arm_cooldown_on_permanent,
+            grant=grant,
         )
         if arm_cooldown_on_permanent:
             return _LookupOutcome(
@@ -2189,6 +2333,7 @@ async def _handle_refresh_failure(
                 server_id_for_audit,
                 reason=escalation_reason,
                 audit_when_absent=not arm_cooldown_on_permanent,
+                grant=grant,
             )
             if arm_cooldown_on_permanent:
                 return _LookupOutcome(
@@ -2372,12 +2517,21 @@ async def _refresh_and_persist(
     server_row: dict[str, Any],
     refresh_value: str,
     existing_scopes: str,
+    grant_issuer: str,
+    grant_version: bytes,
     allow_private_network: bool = False,
 ) -> tuple[str, str | None, str | None]:
     """Run the refresh-grant exchange and persist the new token row.
 
+    *grant_issuer* is the issuer stored with the grant; the refresh token and the client secret
+    go only to that authorization server. *grant_version* is the version of the row the refresh
+    read (``get_user_token_and_version``); the new tokens are written only while the row is still
+    that grant.
+
     Returns ``(access_token, refresh_token_or_none, expires_at_or_none)``.
-    Raises :class:`OAuthRefreshError` on failure.
+    Raises :class:`MCPOAuthIssuerChangedError` when the server now resolves another issuer,
+    :class:`_GrantReplacedDuringRefreshError` when the grant was replaced or removed before the
+    write, and :class:`OAuthRefreshError` on any other failure.
     """
     server_id = str(server_row["server_id"])
     override_url = server_row.get("oauth_authorization_server_url") or None
@@ -2402,7 +2556,10 @@ async def _refresh_and_persist(
                 trusted_hosts=frozenset(),
                 metadata_cache=metadata_cache,
                 allow_private_network=allow_private_network,
+                expected_issuer=grant_issuer,
             )
+        except MCPOAuthIssuerChangedError:
+            raise
         except MCPOAuthDiscoveryError as exc:
             if http_client.is_closed:
                 raise OAuthUnavailableError("OAuth HTTP client closed during discovery") from exc
@@ -2458,14 +2615,18 @@ async def _refresh_and_persist(
         persisted_refresh = refresh_value
     new_expires_at = oauth_tokens._expires_at_from_response(tokens)
 
-    await durable_write(
+    written = await durable_write(
         token_store.update_user_token_after_refresh,
         user_id,
         server_name,
         access_token=new_access,
         refresh_token=persisted_refresh,
         expires_at=new_expires_at,
+        expected_as_issuer=grant_issuer,
+        expected_version=grant_version,
     )
+    if not written:
+        raise _GrantReplacedDuringRefreshError
 
     await _audit_event(
         app_state,
@@ -3469,6 +3630,7 @@ async def _attempt_upstream_revoke(
     server_row: dict[str, Any],
     server_id_for_audit: str,
     refresh_token: str,
+    grant_issuer: str,
 ) -> None:
     """Best-effort RFC 7009 upstream revoke for ``user_revoked`` flow.
 
@@ -3483,6 +3645,10 @@ async def _attempt_upstream_revoke(
     discovery failures emit ``upstream_revoke_discovery_failed``; an
     unexpected exception in the outer block emits
     ``upstream_revoke_failed``.
+
+    *grant_issuer* is the issuer stored with the grant. When the server now resolves another
+    issuer, the refresh token and the client secret are not sent anywhere:
+    ``upstream_revoke_issuer_changed`` is logged and the revoke is skipped.
 
     The outer ``try/except Exception`` is load-bearing: this helper is
     fired as a background task whose handle goes into the host's revoke
@@ -3507,7 +3673,11 @@ async def _attempt_upstream_revoke(
                 trusted_hosts=frozenset(),
                 metadata_cache=metadata_cache,
                 allow_private_network=allow_private_network,
+                expected_issuer=grant_issuer,
             )
+        except MCPOAuthIssuerChangedError:
+            log.info("mcp_server.oauth.upstream_revoke_issuer_changed", server_name=server_name)
+            return
         except MCPOAuthDiscoveryError as exc:
             log.info(
                 "mcp_server.oauth.upstream_revoke_discovery_failed",
@@ -3688,6 +3858,7 @@ async def _handle_mcp_oauth_revoke_connection_inner(request: Request) -> Respons
                     server_row=server_row,
                     server_id_for_audit=server_id_for_audit,
                     refresh_token=refresh_token_for_revoke,
+                    grant_issuer=str(plain.get("as_issuer") or ""),
                 ),
                 name="mcp-oauth-upstream-revoke",
             )

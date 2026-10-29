@@ -13,6 +13,7 @@ consents to the settings UI:
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -156,6 +157,7 @@ def _seed_user_token(
     user_id: str = "user-1",
     server_name: str = "srv-oauth",
     refresh_token: str | None = "refresh-secret",
+    as_issuer: str = "https://as.example.com",
 ) -> None:
     token_store.create_user_token(
         user_id,
@@ -164,7 +166,7 @@ def _seed_user_token(
         refresh_token=refresh_token,
         expires_at="2099-12-31T00:00:00",
         scopes="openid profile",
-        as_issuer="https://as.example.com",
+        as_issuer=as_issuer,
         audience="https://mcp.example.com",
     )
 
@@ -583,6 +585,35 @@ class TestRevokeConnection:
             assert data.get("token") == "refresh-secret"
             assert data.get("token_type_hint") == "refresh_token"
             assert data.get("client_id") == "client-abc"
+
+    def test_revoke_connection_never_sends_a_grant_to_another_issuer(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The grant came from an authorization server the row no longer names: the local delete
+        stands and its refresh token goes nowhere."""
+        _seed_oauth_user_server(storage)
+        token_store = _make_token_store(storage)
+        _seed_user_token(
+            token_store, refresh_token="refresh-secret", as_issuer="https://old-as.example.com"
+        )
+        http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
+        http_client_mock.post.return_value = _mk_response(200)
+
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        with (
+            TestClient(app, raise_server_exceptions=False) as client,
+            _public_addr_patch(),
+            caplog.at_level(logging.INFO, logger="turnstone.core.mcp_oauth"),
+        ):
+            resp = client.delete("/v1/api/mcp/oauth/connections/srv-oauth")
+
+            assert resp.status_code == 204
+            assert token_store.get_user_token("user-1", "srv-oauth") is None
+            _drain_revoke_upstream_tasks(client)
+            http_client_mock.get.assert_not_called()
+            http_client_mock.post.assert_not_called()
+        # Skipped because of the grant's issuer, not for some other reason.
+        assert "mcp_server.oauth.upstream_revoke_issuer_changed" in caplog.text
 
     def test_revoke_connection_without_revocation_endpoint_skips_upstream(
         self, storage: SQLiteBackend, http_client_mock: MagicMock

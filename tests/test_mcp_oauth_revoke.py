@@ -20,6 +20,7 @@ import httpx2
 
 from turnstone.core.mcp_oauth import (
     MCPOAuthDiscoveryError,
+    MCPOAuthIssuerChangedError,
     _attempt_upstream_revoke,
     revoke_token_at_as,
 )
@@ -343,7 +344,41 @@ class TestAttemptUpstreamRevokeNeverRaises:
             },
             "server_id_for_audit": "srv-id-1",
             "refresh_token": "r-secret",
+            "grant_issuer": "https://as.example.com",
         }
+
+    def test_discovery_is_bound_to_the_grant_issuer(self) -> None:
+        args = self._build_args()
+        seen: dict[str, Any] = {}
+
+        async def _discover(**kwargs: Any) -> Any:
+            seen.update(kwargs)
+            raise MCPOAuthDiscoveryError("stop here")
+
+        with patch("turnstone.core.mcp_oauth.discover_authorization_server", side_effect=_discover):
+            asyncio.run(_attempt_upstream_revoke(**args))
+
+        assert seen["expected_issuer"] == "https://as.example.com"
+
+    def test_a_changed_issuer_skips_the_upstream_revoke(self) -> None:
+        """The refresh token and client secret never go to an issuer other than the grant's."""
+        args = self._build_args()
+
+        async def _changed(*_a: Any, **_kw: Any) -> Any:
+            raise MCPOAuthIssuerChangedError("moved")
+
+        with (
+            patch("turnstone.core.mcp_oauth.discover_authorization_server", side_effect=_changed),
+            patch("turnstone.core.mcp_oauth.revoke_token_at_as", new=AsyncMock()) as revoke,
+            patch("turnstone.core.mcp_oauth.log") as mock_log,
+        ):
+            asyncio.run(_attempt_upstream_revoke(**args))
+
+        revoke.assert_not_called()
+        args["storage"].get_mcp_oauth_client_secret_ct.assert_not_called()
+        events = [call.args[0] for call in mock_log.info.call_args_list]
+        assert "mcp_server.oauth.upstream_revoke_issuer_changed" in events
+        assert "mcp_server.oauth.upstream_revoke_discovery_failed" not in events
 
     def test_attempt_upstream_revoke_swallows_unexpected_exception(self) -> None:
         """A generic exception from a path the inner handlers don't

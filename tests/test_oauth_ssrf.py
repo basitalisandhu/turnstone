@@ -15,8 +15,10 @@ from unittest.mock import patch
 import pytest
 
 from turnstone.core.oauth.ssrf import (
+    OAuthSSRFAddressError,
     OAuthSSRFError,
     OAuthSSRFPrivateAddressError,
+    OAuthSSRFUnresolvableError,
     effective_port,
     is_localhost,
     url_is_localhost,
@@ -157,9 +159,47 @@ class TestValidateUrlNoSSRF:
 
         with (
             patch("socket.getaddrinfo", side_effect=socket.gaierror("fail")),
-            pytest.raises(OAuthSSRFError, match="cannot be resolved"),
+            pytest.raises(OAuthSSRFUnresolvableError, match="cannot be resolved"),
         ):
             validate_url_no_ssrf("https://no.such.host.invalid", allow_http=False)
+
+    @pytest.mark.parametrize(
+        ("url", "address", "expected"),
+        [
+            ("https://as.example.com", "10.0.0.1", OAuthSSRFPrivateAddressError),
+            ("https://as.example.com", "169.254.169.254", OAuthSSRFAddressError),
+            ("http://dev.localhost", "10.0.0.5", OAuthSSRFAddressError),
+        ],
+        ids=["private", "metadata", "cleartext-off-loopback"],
+    )
+    def test_verdicts_reached_by_resolving_raise_the_address_class(
+        self, url: str, address: str, expected: type[OAuthSSRFError]
+    ) -> None:
+        """A caller holding a URL it trusted before tells DNS's verdicts apart by this class."""
+        with (
+            patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", (address, 0))]),
+            pytest.raises(expected) as caught,
+        ):
+            validate_url_no_ssrf(url, allow_http=True)
+        assert isinstance(caught.value, OAuthSSRFAddressError)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://user@as.example.com",
+            "http://as.example.com",
+            "https://as.example.com/" + chr(1),
+            "https://",
+        ],
+        ids=["userinfo", "cleartext", "control-character", "no-host"],
+    )
+    def test_verdicts_on_the_text_never_raise_the_address_class(self, url: str) -> None:
+        with (
+            patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]),
+            pytest.raises(OAuthSSRFError) as caught,
+        ):
+            validate_url_no_ssrf(url, allow_http=False)
+        assert not isinstance(caught.value, OAuthSSRFAddressError)
 
     @pytest.mark.parametrize(
         "char", [chr(9), chr(10), chr(13), chr(1), chr(0x7F)], ids=["tab", "lf", "cr", "soh", "del"]

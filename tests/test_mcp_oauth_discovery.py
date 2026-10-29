@@ -17,10 +17,12 @@ Covers PRM (RFC 9728) and AS metadata (RFC 8414) discovery, including:
 from __future__ import annotations
 
 import asyncio
+import logging
+import socket
 import time
 import urllib.parse
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx2
 import pytest
@@ -28,6 +30,7 @@ import pytest
 from tests._oauth_runtime_helpers import make_oauth_context
 from turnstone.core.mcp_oauth import (
     MCPOAuthDiscoveryError,
+    MCPOAuthIssuerChangedError,
     _parse_prm_url_from_www_authenticate,
     canonical_resource,
     discover_authorization_server,
@@ -179,6 +182,16 @@ def _private_addr_patch(addr: str = "192.168.1.50"):
     return patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", (addr, 0))])
 
 
+def _addr_map(mapping: dict[str, list[str]], default: str = "93.184.216.34") -> Any:
+    """A ``socket.getaddrinfo`` that resolves each hostname to the addresses named for it."""
+
+    def _getaddrinfo(host, *args, **kwargs):
+        addrs = mapping.get(host, [default])
+        return [(2, 1, 6, "", (a, 0)) for a in addrs]
+
+    return _getaddrinfo
+
+
 def _addr_map_patch(mapping: dict[str, list[str]], default: str = "93.184.216.34"):
     """Resolve each hostname to the addresses named for it.
 
@@ -186,12 +199,7 @@ def _addr_map_patch(mapping: dict[str, list[str]], default: str = "93.184.216.34
     authorization server is not", which is the shape the opt-in exists to
     allow, nor a name answering with both a public and a private record.
     """
-
-    def _getaddrinfo(host, *args, **kwargs):
-        addrs = mapping.get(host, [default])
-        return [(2, 1, 6, "", (a, 0)) for a in addrs]
-
-    return patch("socket.getaddrinfo", side_effect=_getaddrinfo)
+    return patch("socket.getaddrinfo", side_effect=_addr_map(mapping, default))
 
 
 def _discover_private(
@@ -1148,7 +1156,8 @@ class TestMetadataCache:
         assert meta is not stale_meta
         assert cache[meta.issuer][0] is meta
 
-    @pytest.mark.parametrize("cached_issuer", [None, "https://internal.corp.example.com"])
+    # A pin refused on its text is the one case that clears it and falls back to PRM.
+    @pytest.mark.parametrize("cached_issuer", [None, "http://legacy-as.example.com"])
     def test_failed_metadata_fetch_does_not_persist_issuer(self, cached_issuer: str | None) -> None:
         doc = _good_as_metadata_doc()
         doc["code_challenge_methods_supported"] = []
@@ -1166,7 +1175,7 @@ class TestMetadataCache:
         cache: dict[str, tuple[ASMetadata, float]] = {}
 
         async def _run() -> None:
-            with _addr_map_patch({"internal.corp.example.com": ["10.0.0.1"]}):
+            with _public_addr_patch():
                 await discover_authorization_server(
                     server_name="srv-x",
                     server_url=_SERVER,
@@ -1249,66 +1258,260 @@ class TestMetadataCache:
 # ---------------------------------------------------------------------------
 
 
-class TestCachedIssuerSSRFRevalidation:
-    """A cached issuer URL must still pass SSRF validation on every read.
+def _getaddrinfo_failing(failure: BaseException | None) -> Any:
+    """``socket.getaddrinfo`` that fails for the pinned issuer's host and answers public otherwise.
 
-    Defense-in-depth: an admin who points ``oauth_as_issuer_cached`` at a
-    private address (or a hostname that has rebound to one) should not
-    bypass the guard just because the value was already in the row.
+    ``None`` answers the issuer's host with no records at all.
     """
 
-    def test_cached_issuer_rejected_clears_row_and_persists_replacement(self) -> None:
-        async def _get(url: str, *args: Any, **kwargs: Any) -> MagicMock:
-            if url.endswith("/oauth-protected-resource/sse"):
-                return _mk_response(
-                    200,
-                    {
-                        "resource": "https://mcp.example.com/sse",
-                        "authorization_servers": ["https://as.example.com"],
-                    },
-                )
-            if url.endswith("/oauth-authorization-server"):
-                return _mk_response(200, _good_as_metadata_doc())
-            raise AssertionError(f"unexpected URL: {url}")
+    def _getaddrinfo(host: str, *args: Any, **kwargs: Any) -> list[Any]:
+        if host == "as.example.com":
+            if failure is None:
+                return []
+            raise failure
+        return [(2, 1, 6, "", ("93.184.216.34", 0))]
 
+    return _getaddrinfo
+
+
+class TestCachedIssuerSSRFRevalidation:
+    """A cached issuer is re-checked on every read.
+
+    A verdict reached by resolving the pin's host comes from DNS, which says nothing about which
+    authorization server the row's grants belong to: the pin stays and the attempt fails. A pin
+    refused on its text alone (an IP literal, a bare localhost host for a remote server, a form no
+    longer accepted) can never pass again, so it is dropped and rediscovered.
+    """
+
+    @staticmethod
+    def _discover_pinned(
+        get_addr: Any, *, server_url: str = _SERVER, pin: str = "https://as.example.com"
+    ) -> tuple[MagicMock, MagicMock, BaseException | None]:
         client = MagicMock(spec=httpx2.AsyncClient)
-        client.get = AsyncMock(side_effect=_get)
+        client.get = AsyncMock(
+            side_effect=_router(
+                {_PATH_PRM: _prm(_SERVER), _AS_META: _mk_response(200, _good_as_metadata_doc())}
+            )
+        )
         storage = _mk_storage_mock()
 
-        # cached_issuer points at a private host. SSRF guard fires on
-        # the cached value first, the row is cleared, and PRM
-        # discovery runs as a fallback.
-        async def _run() -> Any:
-            with patch(
-                "socket.getaddrinfo",
-                # Private resolution for "internal.corp", public for everything else.
-                side_effect=lambda host, *a, **kw: [
-                    (2, 1, 6, "", ("10.0.0.1" if "internal" in host else "93.184.216.34", 0))
-                ],
-            ):
-                return await discover_authorization_server(
+        async def _run() -> None:
+            with patch("socket.getaddrinfo", side_effect=get_addr):
+                await discover_authorization_server(
                     server_name="srv-x",
-                    server_url="https://mcp.example.com/sse",
+                    server_url=server_url,
                     override_url=None,
-                    cached_issuer="https://internal.corp.example.com",
+                    cached_issuer=pin,
                     http_client=client,
                     storage=storage,
                     server_id="srv-id",
                     trusted_hosts=frozenset(),
                 )
 
-        meta = asyncio.run(_run())
-        assert meta.token_endpoint == "https://as.example.com/token"
-        # The bad cached_issuer was cleared from the row.
-        clear_calls = [
-            c
-            for c in storage.update_mcp_server.call_args_list
-            if c.kwargs.get("oauth_as_issuer_cached") is None
+        try:
+            asyncio.run(_run())
+        except MCPOAuthDiscoveryError as exc:
+            return client, storage, exc
+        return client, storage, None
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            socket.gaierror(socket.EAI_NONAME, "Name or service not known"),
+            socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution"),
+            OSError("resolver unreachable"),
+            None,
+        ],
+        ids=["nxdomain", "eai-again", "oserror", "empty-answer"],
+    )
+    def test_a_pin_whose_host_does_not_resolve_is_kept(self, failure: BaseException | None) -> None:
+        client, storage, exc = self._discover_pinned(_getaddrinfo_failing(failure))
+
+        assert exc is not None
+        assert "did not resolve" in str(exc)
+        storage.update_mcp_server.assert_not_called()
+        client.get.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "address",
+        ["10.0.0.1", "169.254.169.254", "127.0.0.1"],
+        ids=["private", "metadata", "loopback"],
+    )
+    def test_a_pin_resolving_to_a_refused_address_is_kept(
+        self, address: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="turnstone.core.mcp_oauth"):
+            client, storage, exc = self._discover_pinned(_addr_map({"as.example.com": [address]}))
+
+        assert exc is not None
+        assert "address is refused" in str(exc)
+        assert str(exc).endswith("(pinned: https://as.example.com)")
+        storage.update_mcp_server.assert_not_called()
+        client.get.assert_not_called()
+        rejected = [
+            line
+            for line in caplog.text.splitlines()
+            if "mcp_server.oauth.cached_issuer_rejected" in line
         ]
-        assert clear_calls, "cached_issuer should have been cleared"
-        storage.update_mcp_server.assert_called_with(
-            "srv-id", oauth_as_issuer_cached="https://as.example.com"
+        assert len(rejected) == 1
+        assert {"kept=True", "verdict=address"} <= set(rejected[0].split())
+
+    @pytest.mark.parametrize(
+        "pin",
+        [
+            "https://127.0.0.1:9443",
+            "https://[::1]:9443",
+            "https://localhost:9443",
+            "https://10.0.0.7",
+            "https://169.254.169.254",
+        ],
+    )
+    def test_a_pin_refused_on_its_text_after_resolving_is_dropped_and_rediscovered(
+        self, pin: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No DNS answer changes the verdict on an IP-literal host, or on a bare localhost host
+        for a remote server, so such a pin (written before the localhost lane was withheld, or
+        by hand) heals instead of failing every attempt."""
+        # A literal "resolves" to itself; localhost answers loopback.
+        answers = _addr_map(
+            {
+                "127.0.0.1": ["127.0.0.1"],
+                "::1": ["::1"],
+                "10.0.0.7": ["10.0.0.7"],
+                "169.254.169.254": ["169.254.169.254"],
+                "localhost": ["127.0.0.1"],
+            }
         )
+
+        with caplog.at_level(logging.WARNING, logger="turnstone.core.mcp_oauth"):
+            client, storage, exc = self._discover_pinned(answers, pin=pin)
+
+        assert exc is None, exc
+        assert storage.update_mcp_server.call_args_list == [
+            call("srv-id", oauth_as_issuer_cached=None),
+            call("srv-id", oauth_as_issuer_cached="https://as.example.com"),
+        ]
+        assert _urls(client) == [_PATH_PRM, _AS_META]
+        assert "kept=False" in caplog.text and "verdict=text" in caplog.text
+
+    def test_a_dot_localhost_pin_answering_loopback_for_a_remote_server_is_kept(self) -> None:
+        """Whether ``*.localhost`` answers loopback is DNS's verdict, which a forged answer must
+        not be able to turn into a moved pin."""
+        client, storage, exc = self._discover_pinned(
+            _addr_map({"dev.localhost": ["127.0.0.1"]}), pin="https://dev.localhost:9443"
+        )
+
+        assert exc is not None
+        storage.update_mcp_server.assert_not_called()
+        client.get.assert_not_called()
+
+    def test_an_http_localhost_pin_that_leaves_loopback_is_kept(self) -> None:
+        """A cleartext localhost pin must resolve to loopback; anything else is DNS's verdict."""
+        client, storage, exc = self._discover_pinned(
+            _addr_map({"dev.localhost": ["10.0.0.5"]}),
+            server_url="http://localhost:8080/sse",
+            pin="http://dev.localhost:9000",
+        )
+
+        assert exc is not None
+        storage.update_mcp_server.assert_not_called()
+        client.get.assert_not_called()
+
+    def test_a_pin_refused_on_its_text_is_dropped_and_rediscovered(self) -> None:
+        client, storage, exc = self._discover_pinned(
+            _addr_map({}), pin="http://legacy-as.example.com"
+        )
+
+        assert exc is None
+        assert storage.update_mcp_server.call_args_list == [
+            call("srv-id", oauth_as_issuer_cached=None),
+            call("srv-id", oauth_as_issuer_cached="https://as.example.com"),
+        ]
+        assert _urls(client) == [_PATH_PRM, _AS_META]
+
+
+class TestExpectedIssuer:
+    """A grant's or pending consent's issuer binds discovery, compared exactly, before the
+    authorization server's metadata is fetched and before any new pin is written."""
+
+    def test_a_recorded_template_does_not_match_its_expansion(self) -> None:
+        """A grant from before v1.8.2 recorded a multi-tenant template; it is consented again
+        rather than sent to whichever tenant the server names now."""
+        client, storage, outcome = self._run(
+            expected_issuer="https://as.example.com/{tenantid}/v2.0",
+            cached_issuer="https://as.example.com/t1/v2.0",
+        )
+
+        assert isinstance(outcome, MCPOAuthIssuerChangedError)
+        client.get.assert_not_called()
+        storage.update_mcp_server.assert_not_called()
+
+    @staticmethod
+    def _run(
+        *,
+        expected_issuer: str,
+        cached_issuer: str | None = None,
+        override_url: str | None = None,
+    ) -> tuple[MagicMock, MagicMock, BaseException | ASMetadata]:
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(
+            side_effect=_router(
+                {_PATH_PRM: _prm(_SERVER), _AS_META: _mk_response(200, _good_as_metadata_doc())}
+            )
+        )
+        storage = _mk_storage_mock()
+
+        async def _run() -> ASMetadata:
+            with _public_addr_patch():
+                return await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url=_SERVER,
+                    override_url=override_url,
+                    cached_issuer=cached_issuer,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                    expected_issuer=expected_issuer,
+                )
+
+        try:
+            return client, storage, asyncio.run(_run())
+        except MCPOAuthDiscoveryError as exc:
+            return client, storage, exc
+
+    @pytest.mark.parametrize(
+        ("cached_issuer", "override_url"),
+        [("https://as.example.com", None), (None, "https://as.example.com")],
+        ids=["pin", "override"],
+    )
+    def test_another_issuer_is_refused_before_any_request(
+        self, cached_issuer: str | None, override_url: str | None
+    ) -> None:
+        client, storage, outcome = self._run(
+            expected_issuer="https://old-as.example.com",
+            cached_issuer=cached_issuer,
+            override_url=override_url,
+        )
+
+        assert isinstance(outcome, MCPOAuthIssuerChangedError)
+        client.get.assert_not_called()
+        storage.update_mcp_server.assert_not_called()
+
+    def test_a_discovered_issuer_that_differs_is_never_pinned(self) -> None:
+        client, storage, outcome = self._run(expected_issuer="https://old-as.example.com")
+
+        assert isinstance(outcome, MCPOAuthIssuerChangedError)
+        assert _urls(client) == [_PATH_PRM]
+        storage.update_mcp_server.assert_not_called()
+
+    def test_the_recorded_issuer_passes(self) -> None:
+        client, storage, outcome = self._run(
+            expected_issuer="https://as.example.com", cached_issuer="https://as.example.com"
+        )
+
+        assert isinstance(outcome, ASMetadata)
+        assert outcome.issuer == "https://as.example.com"
 
 
 # ---------------------------------------------------------------------------

@@ -149,6 +149,18 @@ class TokenStore:
         auto-delete the row. The configured decrypt-failure hook receives the
         token identity and attempted key fingerprints.
         """
+        got = self.get_user_token_and_version(user_id, token_key)
+        return None if got is None else got[0]
+
+    def get_user_token_and_version(
+        self, user_id: str, token_key: str
+    ) -> tuple[UserTokenPlain, bytes] | None:
+        """Like :meth:`get_user_token`, plus the version of the row it read.
+
+        The version is the stored access-token ciphertext, fresh on every write, so a writer
+        can make its write conditional on the row still being the one it read
+        (:meth:`update_user_token_after_refresh`, :meth:`delete_user_token_if_unchanged`).
+        """
         row = self._storage.get_oauth_token(user_id, token_key)
         if row is None:
             return None
@@ -162,7 +174,7 @@ class TokenStore:
         except token_store_crypto.TokenDecryptError as exc:
             self._decrypt_failure(token_key, exc.key_fingerprints_attempted)
             raise
-        return UserTokenPlain(
+        plain = UserTokenPlain(
             user_id=row["user_id"],
             token_key=row["token_key"],
             access_token=access_pt,
@@ -174,6 +186,7 @@ class TokenStore:
             created=row["created"],
             last_refreshed=row["last_refreshed"],
         )
+        return plain, row["access_token_ct"]
 
     def update_user_token_after_refresh(
         self,
@@ -183,10 +196,14 @@ class TokenStore:
         access_token: str,
         refresh_token: str | None,
         expires_at: str | None,
+        expected_as_issuer: str,
+        expected_version: bytes,
     ) -> bool:
         """Atomic write of new tokens after a refresh-grant exchange.
 
-        Returns True when a row was updated.
+        Writes only while the row is still the grant the refresh read (*expected_as_issuer* and
+        *expected_version* from :meth:`get_user_token_and_version`). Returns True when a row was
+        updated; False means the grant was replaced or removed meanwhile.
 
         ``refresh_token=None`` CLEARS the column — it does NOT preserve
         the existing value.  Per RFC 6749 §6, an authorization server MAY
@@ -203,11 +220,24 @@ class TokenStore:
             access_token_ct=access_ct,
             refresh_token_ct=refresh_ct,
             expires_at=expires_at,
+            expected_as_issuer=expected_as_issuer,
+            expected_access_token_ct=expected_version,
         )
 
     def delete_user_token(self, user_id: str, token_key: str) -> bool:
         """Delete the user-token row. Returns True if existed."""
         return self._storage.delete_oauth_token(user_id, token_key)
+
+    def delete_user_token_if_unchanged(
+        self, user_id: str, token_key: str, *, expected_as_issuer: str, expected_version: bytes
+    ) -> bool:
+        """Delete the user-token row only while it is the grant the caller read."""
+        return self._storage.delete_oauth_token_if_unchanged(
+            user_id,
+            token_key,
+            expected_as_issuer=expected_as_issuer,
+            expected_access_token_ct=expected_version,
+        )
 
     def upsert_oidc_credential(self, user_id: str, issuer: str, *, refresh_token: str) -> None:
         """Encrypt and create-or-replace the user's captured IdP refresh token."""

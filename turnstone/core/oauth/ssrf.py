@@ -81,7 +81,23 @@ class OAuthSSRFError(Exception):
     """
 
 
-class OAuthSSRFPrivateAddressError(OAuthSSRFError):
+class OAuthSSRFAddressError(OAuthSSRFError):
+    """The verdict came from resolving the hostname, not from the URL's text.
+
+    The name did not resolve, or an address it resolved to is refused. DNS decides these verdicts
+    for a host name, so a caller re-checking a URL it accepted before (a pinned issuer) can keep
+    its record and fail the attempt, where a URL refused on its text alone can never pass again.
+    An IP-literal host is refused here too without any DNS query, and a bare ``localhost`` host is
+    refused after resolving when the localhost lane is withheld; no DNS answer changes either, so
+    such a caller treats them as refused on their text.
+    """
+
+
+class OAuthSSRFUnresolvableError(OAuthSSRFAddressError):
+    """The hostname did not resolve to any address."""
+
+
+class OAuthSSRFPrivateAddressError(OAuthSSRFAddressError):
     """A hostname resolved to a non-public address, specifically.
 
     A distinct subclass so callers with an operator-facing opt-in can catch
@@ -174,6 +190,10 @@ def validate_url_no_ssrf(
     :class:`OAuthSSRFPrivateAddressError` subclass so callers that *have*
     an opt-in can point the operator at it.
 
+    A verdict reached by resolving the hostname raises :class:`OAuthSSRFAddressError` or a subclass
+    (:class:`OAuthSSRFUnresolvableError` when the name did not resolve), so a caller can tell it from
+    a refusal of the URL's text, which no answer from DNS can change.
+
     ``private_requires_all=True`` narrows the opt-in to a hostname whose
     records are ALL non-public. A name answering with both a public and a
     private address is refused: the request may land on either, chosen by
@@ -258,7 +278,7 @@ def validate_url_no_ssrf(
     try:
         classified = resolve_and_classify(hostname)
     except ResolutionError as exc:
-        raise OAuthSSRFError(f"endpoint {exc}: {url}") from exc
+        raise OAuthSSRFUnresolvableError(f"endpoint {exc}: {url}") from exc
 
     if allow_private and private_requires_all:
         lanes = {lane for lane, _addr in classified}
@@ -282,14 +302,14 @@ def validate_url_no_ssrf(
         # operator acting on that re-registers the same endpoint over TLS
         # without ever learning it pointed at the instance metadata service.
         if lane is AddressLane.NEVER:
-            raise OAuthSSRFError(
+            raise OAuthSSRFAddressError(
                 f"endpoint URL resolves to a link-local/multicast/unspecified/"
                 f"reserved/metadata address ({describe_address(addr)}), refused "
                 f"even with private addresses allowed: {url}"
             )
         # Cleartext must reach loopback and nothing else, on every record.
         if http_pending_loopback_proof and not reaches_only_loopback(addr):
-            raise OAuthSSRFError(
+            raise OAuthSSRFAddressError(
                 f"endpoint URL must use HTTPS: {hostname} does not resolve to "
                 f"loopback ({describe_address(addr)}): {url}"
             )
@@ -411,8 +431,10 @@ async def validate_discovered_endpoint_async(
 
 __all__ = [
     "KNOWN_TRUSTED_OAUTH_ENDPOINT_HOSTS",
+    "OAuthSSRFAddressError",
     "OAuthSSRFError",
     "OAuthSSRFPrivateAddressError",
+    "OAuthSSRFUnresolvableError",
     "effective_port",
     "is_localhost",
     "url_is_localhost",
