@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from turnstone.core.token_store import crypto as token_store_crypto
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping, Sequence
 
     from turnstone.core.storage._protocol import StorageBackend
 
@@ -140,6 +140,39 @@ class TokenStore:
             scopes=scopes,
             as_issuer=as_issuer,
             audience=audience,
+        )
+
+    def replace_consented_user_token(
+        self,
+        user_id: str,
+        token_key: str,
+        *,
+        access_token: str,
+        refresh_token: str | None,
+        expires_at: str | None,
+        scopes: str | None,
+        as_issuer: str,
+        audience: str,
+        expected_server: Mapping[str, Any],
+        pins: Sequence[str | None],
+    ) -> bool:
+        """Encrypt and replace a consented grant while its server is the one consented to.
+
+        See :meth:`StorageBackend.replace_consented_oauth_token`.
+        """
+        access_ct = self._cipher.encrypt(access_token.encode("utf-8"))
+        refresh_ct = self._cipher.encrypt(refresh_token.encode("utf-8")) if refresh_token else None
+        return self._storage.replace_consented_oauth_token(
+            user_id,
+            token_key,
+            access_token_ct=access_ct,
+            refresh_token_ct=refresh_ct,
+            expires_at=expires_at,
+            scopes=scopes,
+            as_issuer=as_issuer,
+            audience=audience,
+            expected_server=expected_server,
+            pins=pins,
         )
 
     def get_user_token(self, user_id: str, token_key: str) -> UserTokenPlain | None:

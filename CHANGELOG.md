@@ -12,7 +12,27 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 ## [2026-10-29]
 
+> **Before upgrading:** the database advances from migration 084 to 085, which
+> records what each pending MCP sign-in was started against. A sign-in begun
+> before the upgrade fails as expired; connecting again works. Custom storage
+> backends must accept and return the new pending-flow fields (`as_issuer`,
+> `iss_parameter_supported`, `server_id`, `server_url`, `audience`).
+
 ### Security
+
+- **MCP sign-ins check the authorization server's `iss` (#1408).** The consent
+  callback compares the response's `iss` with the issuer the user was sent to,
+  and refuses a missing one when the authorization server advertises it
+  (RFC 9207); one that neither sends nor advertises `iss` is not checked this
+  way. The callback also refuses when the server's URL, audience, auth type or
+  authorization server changed since Connect was clicked, checked before the
+  code exchange and again in the transaction that stores the token, so the
+  code goes only to the token endpoint of the authorization server the user was
+  sent to and no token is stored for a server changed meanwhile. A consent
+  replaces the user's earlier grant in that one step, and of two at once the
+  later one stands. An error from the authorization server is shown once the
+  state, the user and `iss` check out, and a response that repeats any
+  parameter is refused.
 
 - **An MCP server's authorization server stays pinned.** Once discovered, it
   moves only when an operator changes the server's URL or Authorization Server

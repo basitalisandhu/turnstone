@@ -1104,6 +1104,13 @@ mcp_oauth_pending = sa.Table(
     sa.Column("code_verifier", sa.Text, nullable=False),
     sa.Column("return_url", sa.Text, nullable=False),
     sa.Column("created_at", sa.Text, nullable=False),
+    # What the flow was started against: the authorization server the user was sent to and
+    # whether it promised ``iss`` (RFC 9207), and the server's id, canonical URL and audience.
+    sa.Column("as_issuer", sa.Text, nullable=False, server_default=""),
+    sa.Column("iss_parameter_supported", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("server_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("server_url", sa.Text, nullable=False, server_default=""),
+    sa.Column("audience", sa.Text, nullable=False, server_default=""),
 )
 
 sa.Index("idx_mcp_pending_created", mcp_oauth_pending.c.created_at)

@@ -62,7 +62,7 @@ if TYPE_CHECKING:
     from starlette.responses import Response
 
     from turnstone.core.mcp_crypto import MCPTokenStore
-    from turnstone.core.storage._protocol import StorageBackend
+    from turnstone.core.storage._protocol import MCPOAuthPendingState, StorageBackend
 
 
 log = get_logger(__name__)
@@ -705,6 +705,70 @@ def _discovery_error(message: str, cause: BaseException) -> MCPOAuthDiscoveryErr
     return err
 
 
+def _token_audience(server_row: Mapping[str, Any]) -> str:
+    """The audience a user's token is requested for and checked against.
+
+    ``audience=`` is a registered API identifier at the authorization servers that use it instead
+    of ``resource=``, not a resource URL, so its default stays the row's stored spelling:
+    canonicalizing it could rename an identifier the operator registered. ``resource=`` uses the
+    canonical URL, and the callback's accepted-``aud`` set carries both.
+    """
+    return str(server_row.get("oauth_audience") or server_row.get("url") or "")
+
+
+class _FlowBinding(NamedTuple):
+    """What a consent is bound to: recorded by /start, compared by the callback."""
+
+    server_id: str
+    server_url: str | None
+    audience: str
+
+
+def _flow_binding(server_row: Mapping[str, Any]) -> _FlowBinding:
+    """The server's id, canonical URL and configured audience, read the same way at both ends.
+
+    The audience is the configured ``oauth_audience`` alone: the URL is bound in canonical form,
+    and the console treats a spelling-only rewrite of it as the same server. A URL that no longer
+    canonicalizes gives ``None``, which never matches a recorded value.
+    """
+    try:
+        server_url: str | None = _canonical_server_url(server_row)
+    except MCPOAuthDiscoveryError:
+        server_url = None
+    return _FlowBinding(
+        str(server_row["server_id"]), server_url, str(server_row.get("oauth_audience") or "")
+    )
+
+
+def _binding_changes(server_row: Mapping[str, Any], pending: MCPOAuthPendingState) -> list[str]:
+    """Name what differs between the server under the flow's name now and the binding /start
+    recorded: ``server_id``, ``server_url``, ``audience``, and ``auth_type`` when it is no longer
+    ``oauth_user``."""
+    recorded = _FlowBinding(pending["server_id"], pending["server_url"], pending["audience"])
+    changed = [
+        name
+        for name, now, then in zip(
+            _FlowBinding._fields, _flow_binding(server_row), recorded, strict=True
+        )
+        if now != then
+    ]
+    if server_row.get("auth_type") != "oauth_user":
+        changed.append("auth_type")
+    return changed
+
+
+# The server columns a consent's grant is bound to, besides the name it is stored under: the
+# callback stores the grant only while the server holds the values it checked before the code
+# exchange (see :meth:`StorageBackend.replace_consented_oauth_token`).
+_CONSENT_BINDING_COLUMNS = (
+    "server_id",
+    "auth_type",
+    "url",
+    "oauth_authorization_server_url",
+    "oauth_audience",
+)
+
+
 def _issuer_template_matches(declared: str, requested: str) -> bool:
     """True when *declared* is a placeholder template that expands to *requested*.
 
@@ -883,6 +947,10 @@ def _as_metadata_from_document(
         jwks_uri=jwks_uri,
         code_challenge_methods_supported=code_methods,
         token_endpoint_auth_methods_supported=auth_methods,
+        # Only a JSON true: a string or a number is not the promise RFC 9207 describes.
+        authorization_response_iss_parameter_supported=(
+            doc.get("authorization_response_iss_parameter_supported") is True
+        ),
     )
 
 
@@ -1350,8 +1418,17 @@ async def create_pending_state(
     server_name: str,
     code_verifier: str,
     return_url: str,
+    as_metadata: oauth_http.ASMetadata,
+    server_id: str,
+    server_url: str,
+    audience: str,
 ) -> str:
-    """Insert a fresh pending row and return the new ``state`` value."""
+    """Insert a fresh pending row and return the new ``state`` value.
+
+    The row records the authorization server the user is sent to, whether it promised ``iss``,
+    and the server's binding, so the callback can refuse a response or an exchange that no
+    longer matches them.
+    """
     state = secrets.token_urlsafe(32)
     await asyncio.to_thread(
         storage.create_mcp_oauth_pending_state,
@@ -1360,23 +1437,26 @@ async def create_pending_state(
         server_name,
         code_verifier,
         return_url,
+        as_issuer=as_metadata.issuer,
+        iss_parameter_supported=as_metadata.authorization_response_iss_parameter_supported,
+        server_id=server_id,
+        server_url=server_url,
+        audience=audience,
     )
     return state
 
 
-async def pop_pending_state(*, storage: StorageBackend, state: str) -> dict[str, str] | None:
+async def pop_pending_state(*, storage: StorageBackend, state: str) -> MCPOAuthPendingState | None:
     """Atomically pop a pending state row, applying TTL.
 
-    Returns the row dict on hit, ``None`` on miss/expiry.
+    Returns the row on hit, ``None`` on miss or expiry. Values keep their types: a flag or a
+    missing value turned into text would read as true.
     """
-    row = await asyncio.to_thread(
+    return await asyncio.to_thread(
         storage.pop_mcp_oauth_pending_state,
         state,
         MCP_OAUTH_STATE_TTL_SECONDS,
     )
-    if row is None:
-        return None
-    return {str(k): str(v) for k, v in row.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -2668,7 +2748,7 @@ async def _audit_event(
     if storage is None:
         return
     resolved_server_id: str = server_id or ""
-    if not resolved_server_id and server_name and server_name != "(unknown)":
+    if not resolved_server_id and server_name:
         try:
             row = await asyncio.to_thread(storage.get_mcp_server_by_name, server_name)
         except Exception:
@@ -3117,15 +3197,20 @@ async def _handle_mcp_oauth_authorize_inner(request: Request) -> Response:
 
     # Build PKCE pair and persist the pending state.
     code_verifier, code_challenge = generate_pkce_pair()
+    audience = _token_audience(server_row)
+    binding = _flow_binding(server_row)
     state = await create_pending_state(
         storage=storage,
         user_id=user_id,
         server_name=server_name,
         code_verifier=code_verifier,
         return_url=return_url,
+        as_metadata=as_metadata,
+        server_id=binding.server_id,
+        server_url=server_url,
+        audience=binding.audience,
     )
 
-    audience = server_row.get("oauth_audience") or str(server_row.get("url") or "")
     configured_scopes = str(server_row.get("oauth_scopes") or "")
     if requested_scopes:
         # Union: configured scopes + caller-supplied step-up scopes, deduped
@@ -3157,6 +3242,57 @@ async def _handle_mcp_oauth_authorize_inner(request: Request) -> Response:
     )
 
     return RedirectResponse(url, status_code=302)
+
+
+async def _consent_refusal(
+    storage: StorageBackend,
+    server_row: Mapping[str, Any],
+    pending: MCPOAuthPendingState,
+    issuer: str,
+) -> tuple[str, str]:
+    """Name what changed when the grant was not stored because the server changed.
+
+    Returns ``(reason, redirect query)``. The server is read once more for the message and the
+    audit only, since nothing was stored either way: the Authorization Server URL or a pin that is
+    neither the one checked before the exchange nor *issuer* (which this callback's own discovery
+    may have written) reads as ``issuer_changed``, and anything else, a read that fails included,
+    as ``server_changed``.
+    """
+    server_name = pending["server_name"]
+    try:
+        current = await asyncio.to_thread(storage.get_mcp_server_by_name, server_name)
+    except Exception:
+        log.warning("mcp_server.oauth.callback_refusal_read_failed", server_name=server_name)
+        current = None
+    if (
+        current is not None
+        and not _binding_changes(current, pending)
+        and (
+            current.get("oauth_authorization_server_url")
+            != server_row.get("oauth_authorization_server_url")
+            or current.get("oauth_as_issuer_cached")
+            not in (server_row.get("oauth_as_issuer_cached"), issuer)
+        )
+    ):
+        return ("issuer_changed", "mcp_oauth_error=authorization+server+changed")
+    return ("server_changed", "mcp_oauth_error=server+changed")
+
+
+def _authorization_response_issuer_refusal(
+    params: Mapping[str, str], pending: MCPOAuthPendingState
+) -> str | None:
+    """Return why the response's ``iss`` rules it out (RFC 9207 section 2.4), or ``None``.
+
+    ``iss`` is compared, form-decoded and otherwise as received, with the issuer the user was sent
+    to: a trailing slash or a host's case makes another issuer, and a present but empty ``iss`` is
+    compared too. An authorization server that promised ``iss`` and left it out is refused; one
+    that never promised it is taken at its word.
+    """
+    if "iss" in params:
+        return None if params["iss"] == pending["as_issuer"] else "issuer_mismatch"
+    if pending["iss_parameter_supported"]:
+        return "issuer_missing"
+    return None
 
 
 async def _consent_failed(
@@ -3196,9 +3332,14 @@ async def _consent_failed(
 async def handle_mcp_oauth_callback(request: Request) -> Response:
     """``GET /api/mcp/oauth/callback?code=...&state=...``.
 
-    AS-redirected callback. Pops the pending state, exchanges the code,
-    audience-validates the access token (logs + trusts opaque), persists,
-    and redirects to ``return_url``.
+    AS-redirected callback. Pops the pending state, checks the response's
+    ``iss`` (RFC 9207) and that the server is still the one the flow started
+    for, exchanges the code with the authorization server the user was sent
+    to, audience-validates the access token (logs + trusts opaque), stores it
+    only while the server is still the one checked, in one transaction, and
+    redirects to ``return_url``.
+    An authorization server that neither sends nor advertises ``iss`` gets no
+    mix-up protection from the ``iss`` check.
     """
     return _apply_security_headers(await _handle_mcp_oauth_callback_inner(request))
 
@@ -3245,49 +3386,76 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
         except Exception:
             log.debug("mcp_server.oauth.cleanup_failed", exc_info=True)
 
+    # A parameter appears at most once in an authorization response (RFC 6749 section 3.1); with
+    # a repeat there is no telling which value the authorization server sent, so nothing in the
+    # response is used and the flow is kept.
+    if len(request.query_params.multi_items()) != len(request.query_params):
+        return RedirectResponse("/?mcp_oauth_error=invalid+response", status_code=302)
+
+    # Pop first, for an error response as much as for a code: the state is single-use, and
+    # nothing the authorization server sent is acted on or shown until the state, the user and
+    # the issuer check out (RFC 9207).
     state = request.query_params.get("state", "")
-
-    error = request.query_params.get("error", "")
-    if error:
-        desc = request.query_params.get("error_description", error)
-        # Pop the pending row so the state can't be replayed within the
-        # TTL even though the AS already declared the flow failed.
-        if state:
-            try:
-                await pop_pending_state(storage=storage, state=state)
-            except Exception:
-                log.debug("mcp_server.oauth.callback_error_pop_failed", exc_info=True)
-        await _audit_event(
-            request.app.state,
-            user_id=user_id,
-            action="mcp_server.oauth.consent_failed",
-            server_name="(unknown)",
-            detail={
-                "error": oauth_ssrf.sanitize_log_text(error),
-                "description": oauth_ssrf.sanitize_log_text(desc),
-            },
-        )
-        return RedirectResponse(
-            f"/?mcp_oauth_error={urllib.parse.quote(oauth_ssrf.sanitize_log_text(desc))}",
-            status_code=302,
-        )
-
-    pending = await pop_pending_state(storage=storage, state=state)
-    if pending is None:
+    try:
+        pending = await pop_pending_state(storage=storage, state=state) if state else None
+    except Exception:
+        log.warning("mcp_server.oauth.callback_pop_failed", exc_info=True)
+        return RedirectResponse("/?mcp_oauth_error=storage+unavailable", status_code=302)
+    if pending is None or not pending["as_issuer"]:
+        # Unknown, expired or used, or written before flows recorded their issuer.
         return RedirectResponse("/?mcp_oauth_error=session+expired", status_code=302)
 
+    server_name = pending["server_name"]
     if pending["user_id"] != user_id:
         # Cross-user state stuffing — fail loudly.
         return await _consent_failed(
             request,
+            server_id=pending["server_id"],
             user_id=user_id,
-            server_name=pending.get("server_name", ""),
+            server_name=server_name,
             reason="user_id_mismatch",
             redirect_query="mcp_oauth_error=user+mismatch",
+            detail_extra={"flow_user_id": pending["user_id"]},
         )
 
-    server_name = pending["server_name"]
-    server_row = await asyncio.to_thread(storage.get_mcp_server_by_name, server_name)
+    issuer_refusal = _authorization_response_issuer_refusal(request.query_params, pending)
+    if issuer_refusal is not None:
+        received = request.query_params.get("iss")
+        return await _consent_failed(
+            request,
+            server_id=pending["server_id"],
+            user_id=user_id,
+            server_name=server_name,
+            reason=issuer_refusal,
+            redirect_query="mcp_oauth_error=authorization+server+mismatch",
+            detail_extra=(
+                None if received is None else {"iss": oauth_ssrf.sanitize_log_text(received)}
+            ),
+        )
+
+    error = request.query_params.get("error", "")
+    if error:
+        desc = request.query_params.get("error_description", error)
+        return await _consent_failed(
+            request,
+            server_id=pending["server_id"],
+            user_id=user_id,
+            server_name=server_name,
+            reason="authorization_error",
+            redirect_query=(
+                f"mcp_oauth_error={urllib.parse.quote(oauth_ssrf.sanitize_log_text(desc))}"
+            ),
+            detail_extra={
+                "error": oauth_ssrf.sanitize_log_text(error),
+                "description": oauth_ssrf.sanitize_log_text(desc),
+            },
+        )
+
+    try:
+        server_row = await asyncio.to_thread(storage.get_mcp_server_by_name, server_name)
+    except Exception:
+        log.warning("mcp_server.oauth.callback_server_read_failed", exc_info=True)
+        return RedirectResponse("/?mcp_oauth_error=storage+unavailable", status_code=302)
     if server_row is None:
         return RedirectResponse("/?mcp_oauth_error=server+missing", status_code=302)
 
@@ -3298,6 +3466,22 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
         return JSONResponse({"error": "OAuth HTTP client not initialised"}, status_code=503)
 
     server_id = str(server_row["server_id"])
+    audience = _token_audience(server_row)
+    changed = _binding_changes(server_row, pending)
+    if changed:
+        # The server this consent was started for is not the one under this name now (deleted
+        # and created again, re-pointed, or turned to another auth type).
+        return await _consent_failed(
+            request,
+            server_id=pending["server_id"],
+            user_id=user_id,
+            server_name=server_name,
+            reason="server_changed",
+            redirect_query="mcp_oauth_error=server+changed",
+            detail_extra={"changed": changed, "current_server_id": server_id},
+        )
+    server_url = pending["server_url"]
+
     scopes = server_row.get("oauth_scopes") or ""
     client_id = server_row.get("oauth_client_id") or ""
     if not client_id:
@@ -3308,7 +3492,6 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
     cached_issuer = server_row.get("oauth_as_issuer_cached") or None
 
     try:
-        server_url = _canonical_server_url(server_row)
         as_metadata = await discover_authorization_server(
             server_name=server_name,
             server_url=server_url,
@@ -3320,6 +3503,18 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
             trusted_hosts=frozenset(),
             metadata_cache=metadata_cache,
             allow_private_network=oauth_allow_private_network(request.app.state),
+            expected_issuer=pending["as_issuer"],
+        )
+    except MCPOAuthIssuerChangedError:
+        # The code goes only to the token endpoint of the authorization server the user was
+        # sent to.
+        return await _consent_failed(
+            request,
+            server_id=server_id,
+            user_id=user_id,
+            server_name=server_name,
+            reason="issuer_changed",
+            redirect_query="mcp_oauth_error=authorization+server+changed",
         )
     except MCPOAuthDiscoveryError as exc:
         log.warning(
@@ -3338,13 +3533,6 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
             ),
         )
 
-    # ``audience=`` is a registered API identifier at the authorization
-    # servers that use it instead of ``resource=``, not a resource URL, so
-    # its default stays the row's stored spelling —
-    # canonicalizing it could rename an identifier the operator registered.
-    # ``resource=`` uses the canonical value; the accepted-aud set below
-    # carries both.
-    audience = server_row.get("oauth_audience") or str(server_row.get("url") or "")
     redirect_uri = _build_redirect_uri(redirect_base)
 
     client_secret: str | None
@@ -3423,11 +3611,13 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
         issued_scopes_raw if isinstance(issued_scopes_raw, str) and issued_scopes_raw else scopes
     )
 
-    # Replace existing row (idempotent re-consent).
+    # Replace any earlier grant, in one transaction that requires the server under the name to
+    # still hold what was checked before the exchange (this callback's own discovery may have
+    # pinned the issuer meanwhile): a change that commits first leaves no grant, and one that
+    # commits after finds the grant to purge.
     try:
-        await asyncio.to_thread(token_store.delete_user_token, user_id, server_name)
-        await asyncio.to_thread(
-            token_store.create_user_token,
+        stored = await asyncio.to_thread(
+            token_store.replace_consented_user_token,
             user_id,
             server_name,
             access_token=access_token,
@@ -3436,10 +3626,24 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
             scopes=issued_scopes,
             as_issuer=as_metadata.issuer,
             audience=audience,
+            expected_server={column: server_row.get(column) for column in _CONSENT_BINDING_COLUMNS},
+            pins=(cached_issuer if isinstance(cached_issuer, str) else None, as_metadata.issuer),
         )
     except Exception:
         log.exception("mcp_server.oauth.persist_failed", server_name=server_name)
         return RedirectResponse("/?mcp_oauth_error=storage+failure", status_code=302)
+    if not stored:
+        reason, redirect_query = await _consent_refusal(
+            storage, server_row, pending, as_metadata.issuer
+        )
+        return await _consent_failed(
+            request,
+            server_id=server_id,
+            user_id=user_id,
+            server_name=server_name,
+            reason=reason,
+            redirect_query=redirect_query,
+        )
 
     await _audit_event(
         request.app.state,

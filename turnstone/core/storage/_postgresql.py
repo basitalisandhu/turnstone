@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
     from turnstone.core.storage._notify import Notify, NotifyStream
     from turnstone.core.storage._protocol import SavedWorkstreamPage
@@ -201,6 +201,9 @@ from turnstone.core.storage._utils import (
 )
 from turnstone.core.storage._utils import (
     build_attachments_by_msg as _build_attachments_by_msg,
+)
+from turnstone.core.storage._utils import (
+    consented_server_clause as _consented_server_clause,
 )
 from turnstone.core.storage._utils import (
     delete_messages_after_core as _delete_messages_after_core,
@@ -5820,6 +5823,64 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             conn.commit()
             return result.rowcount > 0
 
+    def replace_consented_oauth_token(
+        self,
+        user_id: str,
+        server_name: str,
+        *,
+        access_token_ct: bytes,
+        refresh_token_ct: bytes | None,
+        expires_at: str | None,
+        scopes: str | None,
+        as_issuer: str,
+        audience: str,
+        expected_server: Mapping[str, Any],
+        pins: Sequence[str | None],
+    ) -> bool:
+        from sqlalchemy.dialects import postgresql
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            # A shared lock waits out a change in flight; the row is then matched as committed.
+            server = conn.execute(
+                sa.select(mcp_servers.c.server_id)
+                .where(_consented_server_clause(server_name, expected_server, pins))
+                .with_for_update(read=True)
+            ).fetchone()
+            if server is None:
+                conn.rollback()
+                return False
+            stmt = postgresql.insert(oauth_tokens).values(
+                user_id=user_id,
+                token_key=server_name,
+                access_token_ct=access_token_ct,
+                refresh_token_ct=refresh_token_ct,
+                expires_at=expires_at,
+                scopes=scopes,
+                as_issuer=as_issuer,
+                audience=audience,
+                created=now,
+                last_refreshed=None,
+            )
+            replaced = (
+                "access_token_ct",
+                "refresh_token_ct",
+                "expires_at",
+                "scopes",
+                "as_issuer",
+                "audience",
+                "created",
+                "last_refreshed",
+            )
+            conn.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[oauth_tokens.c.user_id, oauth_tokens.c.token_key],
+                    set_={column: stmt.excluded[column] for column in replaced},
+                )
+            )
+            conn.commit()
+            return True
+
     def create_oauth_token(
         self,
         user_id: str,
@@ -6052,6 +6113,12 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         server_name: str,
         code_verifier: str,
         return_url: str,
+        *,
+        as_issuer: str,
+        iss_parameter_supported: bool,
+        server_id: str,
+        server_url: str,
+        audience: str,
     ) -> None:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -6065,6 +6132,11 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                     "code_verifier": code_verifier,
                     "return_url": return_url,
                     "created_at": now,
+                    "as_issuer": as_issuer,
+                    "iss_parameter_supported": 1 if iss_parameter_supported else 0,
+                    "server_id": server_id,
+                    "server_url": server_url,
+                    "audience": audience,
                 },
             )
             conn.commit()
@@ -6083,7 +6155,8 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                     "DELETE FROM mcp_oauth_pending "
                     "WHERE state = :state AND created_at > :cutoff "
                     "RETURNING state, user_id, server_name, code_verifier, "
-                    "return_url, created_at"
+                    "return_url, created_at, as_issuer, iss_parameter_supported, "
+                    "server_id, server_url, audience"
                 ),
                 {"state": state, "cutoff": cutoff},
             ).fetchone()
@@ -6100,6 +6173,11 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                 code_verifier=row[3],
                 return_url=row[4],
                 created_at=row[5],
+                as_issuer=row[6],
+                iss_parameter_supported=bool(row[7]),
+                server_id=row[8],
+                server_url=row[9],
+                audience=row[10],
             )
 
     def cleanup_expired_mcp_oauth_pending_states(self, max_age_seconds: int = 600) -> int:

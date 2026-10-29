@@ -24,7 +24,8 @@ Checks:
   C1 authorize URL: PKCE S256, RFC 8707 resource = the canonical row URL,
      the callback derived from redirect_base
   C2 consent: headless login → callback 302 to return_url; token row persisted,
-     ciphertext only; aud carries the canonical resource
+     ciphertext only; aud carries the canonical resource; the redirect carried
+     an RFC 9207 ``iss`` equal to the realm issuer
   C3 the stored token is live at Keycloak; the callback made exactly one
      request (the code exchange — issuer and metadata already cached)
   C4 cache hit: ZERO requests
@@ -40,6 +41,8 @@ Checks:
      fallback was probed and 404'd; no authorization-server traffic
   N2 a token whose aud omits the resource is refused at the callback;
      nothing persisted
+  N3 a callback whose ``iss`` was rewritten to another authorization server is
+     refused before the exchange: ZERO requests, nothing persisted
   D2 the origin-level PRM location is accepted as the fallback
   D3 dynamic client registration (registration_mode=dcr) followed by consent
   D4 the resolved issuer is persisted on a row whose authorization server the
@@ -469,6 +472,7 @@ async def _run(cfg: dict[str, str]) -> None:
         browser = _Browser(kc, cfg["KC_USER"], cfg["KC_PASSWORD"])
         callback_location = await browser.consent(authorize_url, callback_url)
         state_ok = _query(callback_location).get("state") == authz.get("state")
+        sent_iss = _query(callback_location).get("iss")
         done = await console.get(callback_location)
         exchange = wire.drain()
         ct_row = storage.get_oauth_token(USER, "kc-mcp")
@@ -496,10 +500,12 @@ async def _run(cfg: dict[str, str]) -> None:
             and jwt_claims(access).get("azp") == cfg["KC_CLIENT_ID"]
             and plain["as_issuer"] == issuer
             and bool(plain["expires_at"])
+            and sent_iss == issuer
         )
         record(
             "VERIFIED" if c2_ok else "FAILED",
             f"C2 consent: redirect={done.headers.get('location')} state_ok={state_ok} "
+            f"iss={sent_iss!r} want={issuer!r} "
             f"row_encrypted={encrypted} aud={aud} want={canonical} "
             f"expires_at={plain['expires_at']} refresh={redact(refresh)}",
         )
@@ -741,6 +747,40 @@ async def _run(cfg: dict[str, str]) -> None:
                 else "FAILED",
                 f"N2 audience mismatch: HTTP {done2.status_code} location={done2.headers.get('location')} "
                 f"persisted={persisted} (want False) wire={calls} (want one token POST, no PRM)",
+            )
+
+        # N3 — a callback whose iss names another authorization server (RFC 9207).
+        _seed(storage, "kc-iss", resource, client_id=cfg["KC_CLIENT_ID"])
+        start3 = await console.get(START, params={"server": "kc-iss"})
+        wire.drain()
+        stub.drain()
+        if start3.status_code != 302:
+            record("FAILED", f"N3 authorize: HTTP {start3.status_code} {start3.text[:200]}")
+        else:
+            browser3 = _Browser(kc, cfg["KC_USER"], cfg["KC_PASSWORD"])
+            location3 = await browser3.consent(start3.headers["location"], callback_url)
+            parts = urllib.parse.urlsplit(location3)
+            query3 = [
+                (key, value)
+                for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+                if key != "iss"
+            ]
+            query3.append(("iss", "https://other-as.example.com/realms/other"))
+            rewritten = urllib.parse.urlunsplit(
+                parts._replace(query=urllib.parse.urlencode(query3))
+            )
+            done3 = await console.get(rewritten)
+            calls = wire.drain()
+            persisted = storage.get_oauth_token(USER, "kc-iss") is not None
+            record(
+                "VERIFIED"
+                if done3.status_code == 302
+                and "authorization+server+mismatch" in done3.headers.get("location", "")
+                and not persisted
+                and calls == []
+                else "FAILED",
+                f"N3 rewritten iss: HTTP {done3.status_code} location={done3.headers.get('location')} "
+                f"persisted={persisted} (want False) wire={calls} (want none)",
             )
 
         # D4 — the issuer is persisted on a row whose authorization server is

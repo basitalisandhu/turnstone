@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 from turnstone.core.workstream import SAVED_PAGE_DEFAULT_LIMIT
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
     from contextlib import AbstractContextManager
 
     from turnstone.core.storage._notify import NotifyStream
@@ -308,7 +308,14 @@ class OAuthTokenMetadataRow(TypedDict):
 
 
 class MCPOAuthPendingState(TypedDict):
-    """Row shape returned when popping a pending MCP OAuth flow state."""
+    """Row shape returned when popping a pending MCP OAuth flow state.
+
+    ``as_issuer`` is the authorization server the user was sent to and
+    ``iss_parameter_supported`` whether it promised ``iss`` in its responses (RFC 9207);
+    ``server_id``, ``server_url`` (canonical) and ``audience`` (the configured
+    ``oauth_audience``, empty when unset) are the server's binding when the flow started. A row
+    written before migration 085 has ``as_issuer == ""``.
+    """
 
     state: str
     user_id: str
@@ -316,6 +323,11 @@ class MCPOAuthPendingState(TypedDict):
     code_verifier: str
     return_url: str
     created_at: str
+    as_issuer: str
+    iss_parameter_supported: bool
+    server_id: str
+    server_url: str
+    audience: str
 
 
 class MCPPendingConsentRow(TypedDict):
@@ -2933,6 +2945,32 @@ class StorageBackend(Protocol):
 
     # -- Shared OAuth tokens -------------------------------------------------
 
+    def replace_consented_oauth_token(
+        self,
+        user_id: str,
+        server_name: str,
+        *,
+        access_token_ct: bytes,
+        refresh_token_ct: bytes | None,
+        expires_at: str | None,
+        scopes: str | None,
+        as_issuer: str,
+        audience: str,
+        expected_server: Mapping[str, Any],
+        pins: Sequence[str | None],
+    ) -> bool:
+        """Replace the user's grant for *server_name* while that server is the one consented to.
+
+        In one transaction with the ``mcp_servers`` row under *server_name* locked against change
+        (a shared row lock; SQLite's write transaction), the row must hold each of
+        *expected_server*'s column values (``None`` matching ``NULL``, a boolean its stored 0/1)
+        and have its ``oauth_as_issuer_cached`` among *pins*; then the user's grant under the name
+        is replaced, one a concurrent consent stored included. Returns False, writing nothing,
+        when the server changed or is gone: a change that commits first leaves no grant, and one
+        that commits after this finds the grant to purge.
+        """
+        ...
+
     def create_oauth_token(
         self,
         user_id: str,
@@ -3064,6 +3102,12 @@ class StorageBackend(Protocol):
         server_name: str,
         code_verifier: str,
         return_url: str,
+        *,
+        as_issuer: str,
+        iss_parameter_supported: bool,
+        server_id: str,
+        server_url: str,
+        audience: str,
     ) -> None:
         """Insert a pending MCP OAuth flow row for callback validation."""
         ...

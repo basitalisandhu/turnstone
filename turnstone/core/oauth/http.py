@@ -430,3 +430,5 @@ class ASMetadata:
     jwks_uri: str | None
     code_challenge_methods_supported: tuple[str, ...]
     token_endpoint_auth_methods_supported: tuple[str, ...]
+    # RFC 9207: the authorization server promises ``iss`` in every authorization response.
+    authorization_response_iss_parameter_supported: bool = False

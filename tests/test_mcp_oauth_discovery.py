@@ -1514,6 +1514,34 @@ class TestExpectedIssuer:
         assert outcome.issuer == "https://as.example.com"
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(True, True), ("true", False), (1, False), (None, False)],
+    ids=["json-true", "string", "number", "absent"],
+)
+def test_iss_parameter_supported_is_only_a_json_true(value: Any, expected: bool) -> None:
+    doc = _good_as_metadata_doc()
+    if value is not None:
+        doc["authorization_response_iss_parameter_supported"] = value
+    client = MagicMock(spec=httpx2.AsyncClient)
+    client.get = AsyncMock(return_value=_mk_response(200, doc))
+
+    async def _run() -> ASMetadata:
+        with _public_addr_patch():
+            return await discover_authorization_server(
+                server_name="srv-x",
+                server_url=_SERVER,
+                override_url="https://as.example.com",
+                cached_issuer=None,
+                http_client=client,
+                storage=_mk_storage_mock(),
+                server_id="srv-id",
+                trusted_hosts=frozenset(),
+            )
+
+    assert asyncio.run(_run()).authorization_response_iss_parameter_supported is expected
+
+
 # ---------------------------------------------------------------------------
 # revocation_endpoint parsing (RFC 8414)
 # ---------------------------------------------------------------------------

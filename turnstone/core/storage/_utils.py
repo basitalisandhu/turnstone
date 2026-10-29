@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 import sqlalchemy as sa
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Mapping
 
     from turnstone.core.skill_scanner import ScanResult
     from turnstone.core.storage._protocol import StorageBackend
@@ -34,6 +34,7 @@ from turnstone.core.storage._protocol import (
 )
 from turnstone.core.storage._schema import (
     conversations,
+    mcp_servers,
     memory_index_snapshots,
     project_members,
     projects,
@@ -3312,3 +3313,20 @@ def senders_from_user_meta(metas: Iterable[str | None]) -> list[str]:
         if isinstance(sender, str) and sender.strip():
             senders.add(sender.strip())
     return sorted(senders)
+
+
+def consented_server_clause(
+    server_name: str, expected_server: Mapping[str, Any], pins: Iterable[str | None]
+) -> sa.ColumnElement[bool]:
+    """Match the ``mcp_servers`` row under *server_name* only while it is the server a consent was
+    exchanged for: each column holds its *expected_server* value (``None`` matching ``NULL``, and
+    a boolean its stored 0/1), and ``oauth_as_issuer_cached`` holds one of *pins*."""
+    clause: sa.ColumnElement[bool] = mcp_servers.c.name == server_name
+    for column, value in expected_server.items():
+        col = mcp_servers.c[column]
+        if value is None:
+            clause = clause & col.is_(None)
+        else:
+            clause = clause & (col == (int(value) if isinstance(value, bool) else value))
+    pin = mcp_servers.c.oauth_as_issuer_cached
+    return clause & sa.or_(*(pin.is_(None) if p is None else pin == p for p in pins))

@@ -30,7 +30,18 @@ def _seed_token(
 
 
 def _seed_auth_state(storage: StorageBackend, key: str) -> None:
-    storage.create_mcp_oauth_pending_state(f"state-{key}", "u1", key, "verifier", "/settings")
+    storage.create_mcp_oauth_pending_state(
+        f"state-{key}",
+        "u1",
+        key,
+        "verifier",
+        "/settings",
+        as_issuer="https://as.example.com",
+        iss_parameter_supported=False,
+        server_id=f"id-{key}",
+        server_url="https://mcp.example.com/mcp",
+        audience="https://mcp.example.com",
+    )
     storage.upsert_mcp_pending_consent("u1", key, "needs_auth", None, "2026-01-01T00:00:00")
 
 

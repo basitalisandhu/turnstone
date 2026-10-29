@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
     from turnstone.core.storage._notify import Notify, NotifyStream
     from turnstone.core.storage._protocol import SavedWorkstreamPage
@@ -205,6 +205,9 @@ from turnstone.core.storage._utils import (
 )
 from turnstone.core.storage._utils import (
     build_attachments_by_msg as _build_attachments_by_msg,
+)
+from turnstone.core.storage._utils import (
+    consented_server_clause as _consented_server_clause,
 )
 from turnstone.core.storage._utils import (
     delete_messages_after_core as _delete_messages_after_core,
@@ -5829,6 +5832,54 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             conn.commit()
             return result.rowcount > 0
 
+    def replace_consented_oauth_token(
+        self,
+        user_id: str,
+        server_name: str,
+        *,
+        access_token_ct: bytes,
+        refresh_token_ct: bytes | None,
+        expires_at: str | None,
+        scopes: str | None,
+        as_issuer: str,
+        audience: str,
+        expected_server: Mapping[str, Any],
+        pins: Sequence[str | None],
+    ) -> bool:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            server = conn.execute(
+                sa.select(mcp_servers.c.server_id).where(
+                    _consented_server_clause(server_name, expected_server, pins)
+                )
+            ).fetchone()
+            if server is None:
+                conn.rollback()
+                return False
+            conn.execute(
+                sa.delete(oauth_tokens).where(
+                    (oauth_tokens.c.user_id == user_id) & (oauth_tokens.c.token_key == server_name)
+                )
+            )
+            conn.execute(
+                sa.insert(oauth_tokens),
+                {
+                    "user_id": user_id,
+                    "token_key": server_name,
+                    "access_token_ct": access_token_ct,
+                    "refresh_token_ct": refresh_token_ct,
+                    "expires_at": expires_at,
+                    "scopes": scopes,
+                    "as_issuer": as_issuer,
+                    "audience": audience,
+                    "created": now,
+                    "last_refreshed": None,
+                },
+            )
+            conn.commit()
+            return True
+
     def create_oauth_token(
         self,
         user_id: str,
@@ -6058,6 +6109,12 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         server_name: str,
         code_verifier: str,
         return_url: str,
+        *,
+        as_issuer: str,
+        iss_parameter_supported: bool,
+        server_id: str,
+        server_url: str,
+        audience: str,
     ) -> None:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -6071,6 +6128,11 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                     "code_verifier": code_verifier,
                     "return_url": return_url,
                     "created_at": now,
+                    "as_issuer": as_issuer,
+                    "iss_parameter_supported": 1 if iss_parameter_supported else 0,
+                    "server_id": server_id,
+                    "server_url": server_url,
+                    "audience": audience,
                 },
             )
             conn.commit()
@@ -6093,6 +6155,11 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                     mcp_oauth_pending.c.code_verifier,
                     mcp_oauth_pending.c.return_url,
                     mcp_oauth_pending.c.created_at,
+                    mcp_oauth_pending.c.as_issuer,
+                    mcp_oauth_pending.c.iss_parameter_supported,
+                    mcp_oauth_pending.c.server_id,
+                    mcp_oauth_pending.c.server_url,
+                    mcp_oauth_pending.c.audience,
                 ).where(
                     (mcp_oauth_pending.c.state == state) & (mcp_oauth_pending.c.created_at > cutoff)
                 )
@@ -6109,6 +6176,11 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 code_verifier=row[3],
                 return_url=row[4],
                 created_at=row[5],
+                as_issuer=row[6],
+                iss_parameter_supported=bool(row[7]),
+                server_id=row[8],
+                server_url=row[9],
+                audience=row[10],
             )
 
     def cleanup_expired_mcp_oauth_pending_states(self, max_age_seconds: int = 600) -> int:

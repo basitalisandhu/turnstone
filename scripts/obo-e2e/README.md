@@ -140,6 +140,12 @@ joined before closing the browser clients and token store.
 ./scripts/obo-e2e/oauth_user_e2e.sh
 ```
 
+Results — RUN 2026-10-29, 18 VERIFIED / 0 FAILED (exit 0) with the authorization-response `iss`
+check (#1408): C2 asserts that the callback carries `iss` equal to the issuer the flow recorded,
+and the new N3 rewrites `iss` on the redirect and asserts that the callback refuses it with no
+request sent and nothing stored. Consent, refresh, rediscovery, registration and revocation
+checks remain verified.
+
 Results — RUN 2026-09-10, 17 VERIFIED / 0 FAILED (exit 0) with the #963 refresh-client fix:
 C6/C7 refresh on the MCP loop; D5 covers uncached discovery; L1 checks client loop ownership.
 Restoring the original refresh helper in an isolated process reproduces
