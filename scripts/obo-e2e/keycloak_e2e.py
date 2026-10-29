@@ -4,7 +4,7 @@ Parallel to ``entra_e2e.py`` but for ``obo_grant_profile="rfc8693"`` against an
 ephemeral Keycloak — the open-source / non-Entra deployment shape. Fully
 headless (password grant, no browser), so it runs unattended.
 
-Drives the REAL Turnstone code: ``MCPTokenStore.upsert_oidc_credential`` (capture)
+Drives the REAL Turnstone code: ``MCPTokenStore.upsert_oidc_credential`` (credential seed)
 then ``get_obo_access_token_classified`` → ``_obo_mint_rfc8693`` (refresh grant →
 RFC 8693 token exchange) against the live Keycloak token endpoint.
 

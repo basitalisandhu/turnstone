@@ -9,8 +9,9 @@ live Entra, not just that the protocol does.
 Flow:
   1. Interactive Entra login (auth-code + PKCE + offline_access) → a real
      refresh credential. This is what ``handle_oidc_callback`` receives.
-  2. Persist it via ``MCPTokenStore.upsert_oidc_credential`` — the exact call
-     the OIDC callback makes on capture (auth.py). The rest of the callback
+  2. Seed it via ``MCPTokenStore.upsert_oidc_credential`` (the callback itself
+     captures through ``capture_oidc_credential``, which also checks the
+     identity still links the user; auth.py). The rest of the callback
      (JWKS validation, user provisioning) is OIDC-generic and unit-tested; the
      novel path is capture + mint, which this exercises for real.
   3. Seed real ``oauth_obo`` ``mcp_servers`` rows (audiences A/B consented, C
@@ -171,7 +172,8 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
         capture_user_credential=True,
     )
 
-    # Step 2 — CAPTURE: the exact storage call handle_oidc_callback makes.
+    # Step 2 — SEED the credential the callback would capture (it uses the guarded
+    # capture_oidc_credential, which also checks the identity row).
     store.upsert_oidc_credential(USER, issuer, refresh_token=refresh_token)
     cap = store.get_oidc_credential(USER, issuer)
     if cap and cap["refresh_token"] == refresh_token:

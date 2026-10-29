@@ -800,8 +800,14 @@ class TestOIDCCallbackCapture:
         *,
         tokens: dict[str, Any],
         state: str = "valid-state",
+        linked: bool = True,
     ) -> Any:
         storage.create_oidc_pending_state(state, "test-nonce", "test-verifier", "test-audience")
+        # Provisioning is mocked: seed the identity it would have matched or created, unless the
+        # test stands for an identity unlinked while the sign-in was in flight.
+        issuer = oauth_context(client.app.state).oidc_config.issuer
+        if linked and storage.get_oidc_identity(issuer, "user123") is None:
+            storage.create_oidc_identity(issuer, "user123", "test-admin", "u@example.com")
         mock_exchange.return_value = tokens
         mock_validate.return_value = {
             "sub": "user123",
@@ -1057,7 +1063,7 @@ class TestOIDCCallbackCapture:
     ) -> None:
         client, store, _cfg = self._capture_client(storage, oidc_config)
         assert store is not None
-        with patch.object(store, "upsert_oidc_credential", side_effect=RuntimeError("boom")):
+        with patch.object(store, "capture_oidc_credential", side_effect=RuntimeError("boom")):
             resp = self._login(
                 client,
                 storage,
@@ -1068,6 +1074,98 @@ class TestOIDCCallbackCapture:
             )
         assert resp.status_code == 302
         assert "oidc_success=1" in resp.headers["location"]
+
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_a_sign_in_through_real_provisioning_captures_the_credential(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        """Provisioning and the capture derive the identity key the same way, so a new user's
+        first sign-in stores the credential."""
+        client, store, cfg = self._capture_client(storage, oidc_config)
+        assert store is not None
+        storage.create_oidc_pending_state(
+            "valid-state", "test-nonce", "test-verifier", "test-audience"
+        )
+        mock_exchange.return_value = {"id_token": "t", "refresh_token": "rt-real"}
+        mock_validate.return_value = {
+            "sub": "real-sub",
+            "email": "real@example.com",
+            "nonce": "test-nonce",
+        }
+
+        resp = client.get(
+            "/v1/api/auth/oidc/callback?code=authcode&state=valid-state", follow_redirects=False
+        )
+
+        assert resp.status_code == 302
+        assert "oidc_success=1" in resp.headers["location"], resp.headers["location"]
+        identity = storage.get_oidc_identity(cfg.issuer, "real-sub")
+        assert identity is not None
+        credential = store.get_oidc_credential(identity["user_id"], cfg.issuer)
+        assert credential is not None
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_an_identity_unlinked_during_sign_in_gets_no_credential_and_no_session(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        """Provisioning matched the identity, then an unlink deleted it before the capture."""
+        client, store, cfg = self._capture_client(storage, oidc_config)
+        assert store is not None
+
+        resp = self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "t", "refresh_token": "rt-1"},
+            linked=False,
+        )
+
+        assert resp.status_code == 302
+        assert resp.headers["location"] == "/?oidc_error=Authentication+failed"
+        assert store.get_oidc_credential("test-admin", cfg.issuer) is None
+        assert "set-cookie" not in resp.headers
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_a_credential_is_captured_only_for_the_user_the_identity_links(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        """The subject was unlinked and its next sign-in re-provisioned another user meanwhile."""
+        client, store, cfg = self._capture_client(storage, oidc_config)
+        assert store is not None
+        storage.create_oidc_identity(cfg.issuer, "user123", "someone-else", "u@example.com")
+
+        resp = self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "t", "refresh_token": "rt-1"},
+        )
+
+        assert resp.headers["location"] == "/?oidc_error=Authentication+failed"
+        assert store.get_oidc_credential("test-admin", cfg.issuer) is None
 
 
 # ---------------------------------------------------------------------------

@@ -45,6 +45,7 @@ from turnstone.core.storage._protocol import (
     USER_SCOPED_AUTH_TYPES,
     AttachmentWrite,
     ConversationCommitWorkstreamGoneError,
+    DelegatedTokenWrite,
     ForkCloneExpectation,
     ForkCloneSnapshot,
     LeaseFence,
@@ -2300,6 +2301,21 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                 ).fetchall()
             }
             _version_role_authority(conn, removed_roles, now)
+            # Lock the user's identities, then their credentials, before deleting anything else:
+            # a sign-in capture holds an identity and a delegated mint a credential until they
+            # commit, so every delete below starts after them and sees what they wrote, whatever
+            # the order of the deletes. Identity before credential is the order unlink and
+            # capture take, so this adds no lock cycle.
+            conn.execute(
+                sa.select(oidc_identities.c.subject)
+                .where(oidc_identities.c.user_id == user_id)
+                .with_for_update()
+            ).fetchall()
+            conn.execute(
+                sa.select(oidc_user_credentials.c.issuer)
+                .where(oidc_user_credentials.c.user_id == user_id)
+                .with_for_update()
+            ).fetchall()
             conn.execute(sa.delete(channel_users).where(channel_users.c.user_id == user_id))
             conn.execute(sa.delete(api_tokens).where(api_tokens.c.user_id == user_id))
             conn.execute(sa.delete(oidc_identities).where(oidc_identities.c.user_id == user_id))
@@ -5966,6 +5982,71 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             )
             conn.commit()
 
+    def replace_delegated_oauth_token(
+        self,
+        user_id: str,
+        token_key: str,
+        *,
+        access_token_ct: bytes,
+        expires_at: str | None,
+        scopes: str | None,
+        as_issuer: str,
+        audience: str,
+        obo_server: str | None = None,
+    ) -> DelegatedTokenWrite:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            credential = conn.execute(
+                sa.select(oidc_user_credentials.c.user_id)
+                .where(
+                    (oidc_user_credentials.c.user_id == user_id)
+                    & (oidc_user_credentials.c.issuer == as_issuer)
+                )
+                .with_for_update(read=True)
+            ).fetchone()
+            if credential is None:
+                conn.rollback()
+                return "credential_gone"
+            if obo_server is not None:
+                server = conn.execute(
+                    sa.select(mcp_servers.c.server_id)
+                    .where(
+                        (mcp_servers.c.name == obo_server)
+                        & mcp_servers.c.auth_type.in_(sorted(OBO_AUTH_TYPES))
+                    )
+                    .with_for_update(read=True)
+                ).fetchone()
+                if server is None:
+                    conn.rollback()
+                    return "binding_changed"
+            conn.execute(
+                sa.delete(oauth_tokens).where(
+                    (oauth_tokens.c.user_id == user_id) & (oauth_tokens.c.token_key == token_key)
+                )
+            )
+            from sqlalchemy.dialects import postgresql
+
+            result = conn.execute(
+                postgresql.insert(oauth_tokens)
+                .values(
+                    user_id=user_id,
+                    token_key=token_key,
+                    access_token_ct=access_token_ct,
+                    refresh_token_ct=None,
+                    expires_at=expires_at,
+                    scopes=scopes,
+                    as_issuer=as_issuer,
+                    audience=audience,
+                    created=now,
+                    last_refreshed=None,
+                )
+                .on_conflict_do_nothing()
+                .returning(oauth_tokens.c.user_id)
+            )
+            stored = result.scalar_one_or_none() is not None
+            conn.commit()
+            return "stored" if stored else "already_stored"
+
     def get_oauth_token(self, user_id: str, token_key: str) -> OAuthToken | None:
         """Return the per-(user, token key) token row or None."""
         with self._conn() as conn:
@@ -6972,6 +7053,39 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                 )
             )
             conn.commit()
+
+    def upsert_oidc_user_credential_for_identity(
+        self, user_id: str, issuer: str, subject: str, *, refresh_token_ct: bytes
+    ) -> bool:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            identity = conn.execute(
+                sa.select(oidc_identities.c.user_id)
+                .where(
+                    (oidc_identities.c.issuer == issuer) & (oidc_identities.c.subject == subject)
+                )
+                .with_for_update(read=True)
+            ).fetchone()
+            if identity is None or identity[0] != user_id:
+                conn.rollback()
+                return False
+            from sqlalchemy.dialects import postgresql
+
+            stmt = postgresql.insert(oidc_user_credentials).values(
+                user_id=user_id,
+                issuer=issuer,
+                refresh_token_ct=refresh_token_ct,
+                created=now,
+                last_refreshed=now,
+            )
+            conn.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=["user_id", "issuer"],
+                    set_={"refresh_token_ct": refresh_token_ct, "last_refreshed": now},
+                )
+            )
+            conn.commit()
+            return True
 
     def get_oidc_user_credential(self, user_id: str, issuer: str) -> OIDCUserCredential | None:
         """Return the captured credential row or None."""

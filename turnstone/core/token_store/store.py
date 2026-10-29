@@ -9,7 +9,7 @@ from turnstone.core.token_store import crypto as token_store_crypto
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
-    from turnstone.core.storage._protocol import StorageBackend
+    from turnstone.core.storage._protocol import DelegatedTokenWrite, StorageBackend
 
 # Storage owns the reserved token-key namespace shared by consumers. Model
 # mints create these keys and MCP adapters filter them; the store otherwise
@@ -272,10 +272,51 @@ class TokenStore:
             expected_access_token_ct=expected_version,
         )
 
+    def replace_delegated_user_token(
+        self,
+        user_id: str,
+        token_key: str,
+        *,
+        access_token: str,
+        expires_at: str | None,
+        scopes: str | None,
+        as_issuer: str,
+        audience: str,
+        obo_server: str | None = None,
+    ) -> DelegatedTokenWrite:
+        """Encrypt and replace a delegated mint-cache row while the user's credential exists.
+
+        See :meth:`StorageBackend.replace_delegated_oauth_token`.
+        """
+        access_ct = self._cipher.encrypt(access_token.encode("utf-8"))
+        return self._storage.replace_delegated_oauth_token(
+            user_id,
+            token_key,
+            access_token_ct=access_ct,
+            expires_at=expires_at,
+            scopes=scopes,
+            as_issuer=as_issuer,
+            audience=audience,
+            obo_server=obo_server,
+        )
+
     def upsert_oidc_credential(self, user_id: str, issuer: str, *, refresh_token: str) -> None:
         """Encrypt and create-or-replace the user's captured IdP refresh token."""
         refresh_ct = self._cipher.encrypt(refresh_token.encode("utf-8"))
         self._storage.upsert_oidc_user_credential(user_id, issuer, refresh_token_ct=refresh_ct)
+
+    def capture_oidc_credential(
+        self, user_id: str, issuer: str, subject: str, *, refresh_token: str
+    ) -> bool:
+        """Encrypt and store a sign-in's credential only while its identity still links the user.
+
+        Returns ``False``, storing nothing, when the identity was unlinked meanwhile. See
+        :meth:`StorageBackend.upsert_oidc_user_credential_for_identity`.
+        """
+        refresh_ct = self._cipher.encrypt(refresh_token.encode("utf-8"))
+        return self._storage.upsert_oidc_user_credential_for_identity(
+            user_id, issuer, subject, refresh_token_ct=refresh_ct
+        )
 
     def get_oidc_credential(self, user_id: str, issuer: str) -> OIDCCredentialPlain | None:
         """Returns plaintext dict or None.

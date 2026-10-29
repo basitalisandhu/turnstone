@@ -2190,7 +2190,7 @@ async def _mint_mcp_obo_operation(
                 _LookupDisposition(backoff=_BackoffSnapshot(time.monotonic())),
             )
         try:
-            await oauth_tokens._persist_obo_cache_row(
+            written = await oauth_tokens._persist_obo_cache_row(
                 token_store,
                 user_id,
                 server_name,
@@ -2201,14 +2201,31 @@ async def _mint_mcp_obo_operation(
                 scopes=effective_scopes,
                 issuer=issuer,
                 audience=audience,
+                obo_server=server_name,
             )
         except Exception:
+            # The write also checks that the credential still exists; a failed check is not a
+            # pass, so the token is not used.
             log.warning(
                 "mcp_server.oauth.obo_cache_persist_failed",
                 user_id=user_id,
                 server_name=server_name,
                 exc_info=True,
             )
+            return _LookupOutcome(
+                TokenLookupResult(kind="refresh_failed_transient"),
+                _LookupDisposition(backoff=_BackoffSnapshot(time.monotonic())),
+            )
+        if written not in ("stored", "already_stored"):
+            # Revoked, or the server stopped being sign-in passthrough, while the mint was in
+            # flight: answered as if that had happened before.
+            log.info(
+                "mcp_server.oauth.obo_mint_discarded",
+                user_id=user_id,
+                server_name=server_name,
+                outcome=written,
+            )
+            return _no_token_result(TokenLookupResult(kind="missing"))
         return _token_result(access)
 
 

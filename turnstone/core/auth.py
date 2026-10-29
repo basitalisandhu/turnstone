@@ -49,7 +49,7 @@ from turnstone.core.oauth.oidc import (
     maybe_rediscover_oidc,
     validate_id_token,
 )
-from turnstone.core.oidc import provision_oidc_user
+from turnstone.core.oidc import oidc_identity_key, provision_oidc_user
 from turnstone.core.project_access import (
     decide_project_access,
     decide_project_management_access,
@@ -2410,9 +2410,10 @@ async def handle_oidc_callback(request: Request, audience: str, cookie_name: str
     if isinstance(perms, JSONResponse):
         return perms
 
-    # Capture the IdP refresh token as the user's single OBO credential
-    # (issue #551).  Best-effort: capture failure must not block login —
-    # the mint path surfaces a missing credential on the reconnect rail.
+    # Capture the IdP refresh token as the user's single OBO credential (issue #551). A storage
+    # error while capturing stays best-effort: login proceeds, and the mint path surfaces the
+    # missing credential on the reconnect rail. A capture refused because the identity no longer
+    # links the user fails the sign-in.
     if oidc_config.capture_user_credential:
         idp_refresh_token = tokens.get("refresh_token")
         token_store = oauth_context(request.app.state).token_store
@@ -2430,15 +2431,27 @@ async def handle_oidc_callback(request: Request, audience: str, cookie_name: str
             )
         else:
             try:
-                await asyncio.to_thread(
-                    token_store.upsert_oidc_credential,
+                # Written only while the identity this sign-in matched still links the user: an
+                # unlink that lands meanwhile can never be undone by the credential coming back.
+                identity_issuer, identity_subject = oidc_identity_key(oidc_config, id_claims)
+                captured = await asyncio.to_thread(
+                    token_store.capture_oidc_credential,
                     user["user_id"],
-                    oidc_config.issuer,
+                    identity_issuer,
+                    identity_subject,
                     refresh_token=idp_refresh_token,
                 )
             except Exception:
                 log.exception("oidc.capture: failed to persist credential")
             else:
+                if not captured:
+                    # The admin unlinked this identity while the sign-in was in flight: no
+                    # credential and no session for it.
+                    log.warning(
+                        "oidc.capture: identity unlinked during sign-in (user=%s)", user["user_id"]
+                    )
+                    _record_oidc_failure()
+                    return RedirectResponse("/?oidc_error=Authentication+failed", status_code=302)
                 # Re-login is the OBO restore moment (#836): a dropped
                 # obo catalog (credential unlinked / mint rejected) has
                 # no consent flow to heal through, so warm this user's

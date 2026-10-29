@@ -60,6 +60,15 @@ def _ensure_default_role(
     storage.assign_role(user_id, "builtin-viewer", "oidc-default")
 
 
+def oidc_identity_key(config: oauth_oidc.OIDCConfig, claims: dict[str, Any]) -> tuple[str, str]:
+    """The ``(issuer, subject)`` an ID token's claims match an identity by.
+
+    One derivation for provisioning and for the sign-in's credential capture, which writes only
+    while that identity still links the user.
+    """
+    return config.issuer, str(claims["sub"])
+
+
 def provision_oidc_user(
     storage: Any,
     config: oauth_oidc.OIDCConfig,
@@ -76,8 +85,7 @@ def provision_oidc_user(
     """
     from turnstone.core.storage import StorageConflictError
 
-    issuer = config.issuer
-    sub = str(claims["sub"])
+    issuer, sub = oidc_identity_key(config, claims)
     email = str(claims.get("email", ""))
     # Entra `oid`+`tid` are the STABLE, cross-app user key. The `sub` above is
     # pairwise (a different value per application), so it cannot correlate this

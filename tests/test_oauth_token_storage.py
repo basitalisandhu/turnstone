@@ -415,6 +415,90 @@ class TestUnlinkOIDCIdentity:
         assert backend.get_oauth_token("u1", "__model_obo__:gateway") is not None
 
 
+class TestGuardedDelegatedWrites:
+    """A delegated token and a sign-in's credential are written only while what they depend on
+    still exists, checked in the same transaction as the write."""
+
+    ISSUER = "https://idp.example.com"
+
+    def _replace(self, backend: Any, access: bytes = b"new") -> str:
+        result: str = backend.replace_delegated_oauth_token(
+            "u1",
+            "obo-srv",
+            access_token_ct=access,
+            expires_at="2099-01-01T00:00:00",
+            scopes=None,
+            as_issuer=self.ISSUER,
+            audience="api://new",
+        )
+        return result
+
+    def test_a_token_replaces_the_row_while_the_credential_exists(self, backend: Any) -> None:
+        backend.upsert_oidc_user_credential("u1", self.ISSUER, refresh_token_ct=b"credential")
+        _seed_token(backend, "u1", "obo-srv")
+
+        assert self._replace(backend) == "stored"
+
+        row = backend.get_oauth_token("u1", "obo-srv")
+        assert row is not None
+        assert row["audience"] == "api://new"
+        assert row["refresh_token_ct"] is None
+
+    def test_a_token_minted_across_an_unlink_is_never_written(self, backend: Any) -> None:
+        backend.create_oidc_identity(self.ISSUER, "sub-1", "u1", "u1@example.com")
+        backend.upsert_oidc_user_credential("u1", self.ISSUER, refresh_token_ct=b"credential")
+        # The mint read the credential; the unlink commits; then the mint persists.
+        backend.unlink_oidc_identity(self.ISSUER, "sub-1", model_token_prefix="__model_obo__:")
+
+        assert self._replace(backend) == "credential_gone"
+
+        assert backend.get_oauth_token("u1", "obo-srv") is None
+
+    def test_a_token_for_a_server_no_longer_passthrough_is_never_written(
+        self, backend: Any
+    ) -> None:
+        backend.upsert_oidc_user_credential("u1", self.ISSUER, refresh_token_ct=b"credential")
+        backend.create_mcp_server(
+            server_id="s-obo",
+            name="obo-srv",
+            transport="streamable-http",
+            url="https://mcp.example.com/obo",
+            auth_type="oauth_user",
+        )
+
+        result = backend.replace_delegated_oauth_token(
+            "u1",
+            "obo-srv",
+            access_token_ct=b"new",
+            expires_at="2099-01-01T00:00:00",
+            scopes=None,
+            as_issuer=self.ISSUER,
+            audience="api://new",
+            obo_server="obo-srv",
+        )
+
+        assert result == "binding_changed"
+        assert backend.get_oauth_token("u1", "obo-srv") is None
+
+    def test_a_credential_is_captured_only_for_a_live_identity(self, backend: Any) -> None:
+        assert not backend.upsert_oidc_user_credential_for_identity(
+            "u1", self.ISSUER, "sub-1", refresh_token_ct=b"rt"
+        )
+        assert backend.get_oidc_user_credential("u1", self.ISSUER) is None
+
+        backend.create_oidc_identity(self.ISSUER, "sub-1", "u2", "u2@example.com")
+        assert not backend.upsert_oidc_user_credential_for_identity(
+            "u1", self.ISSUER, "sub-1", refresh_token_ct=b"rt"
+        )
+        assert backend.get_oidc_user_credential("u1", self.ISSUER) is None
+
+        assert backend.upsert_oidc_user_credential_for_identity(
+            "u2", self.ISSUER, "sub-1", refresh_token_ct=b"rt"
+        )
+        credential = backend.get_oidc_user_credential("u2", self.ISSUER)
+        assert credential is not None and credential["refresh_token_ct"] == b"rt"
+
+
 def test_a_server_update_applies_only_while_the_row_holds_what_was_read(backend: Any) -> None:
     backend.create_mcp_server(
         server_id="s1",

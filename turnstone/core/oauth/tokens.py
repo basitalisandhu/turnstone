@@ -9,10 +9,10 @@ from typing import TYPE_CHECKING, Any
 
 from turnstone.core.oauth.context import TokenCoordination, oauth_context
 from turnstone.core.oauth.work import durable_write
+from turnstone.core.token_store import store as token_store_store
 
 if TYPE_CHECKING:
-    from turnstone.core.storage._protocol import StorageBackend
-    from turnstone.core.token_store import store as token_store_store
+    from turnstone.core.storage._protocol import DelegatedTokenWrite, StorageBackend
 
 _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 60
 
@@ -132,8 +132,43 @@ async def _persist_obo_cache_row(
     scopes: str,
     issuer: str,
     audience: str,
+    obo_server: str | None = None,
+) -> DelegatedTokenWrite:
+    """Write a delegated mint-cache row, only while the user's credential for *issuer* exists.
+
+    A delegated mint reads the user's captured credential, then calls the identity provider, and
+    an unlink can delete the credential meanwhile. The row is replaced in one transaction that
+    checks the credential still exists, so a mint that was in flight never outlives the
+    revocation. An MCP mint passes *obo_server*, which must still be a sign-in passthrough server.
+    The token may be used only on ``stored`` or ``already_stored``; on anything else nothing was
+    written. Every delegated mint persists through here; only the shared app identity, which no
+    user unlink revokes, uses :func:`_persist_app_mint_cache_row`.
+    """
+    return await durable_write(
+        token_store.replace_delegated_user_token,
+        user_id,
+        server_name,
+        access_token=access_token,
+        expires_at=expires_at,
+        scopes=scopes or None,
+        as_issuer=issuer,
+        audience=audience,
+        obo_server=obo_server,
+    )
+
+
+async def _persist_app_mint_cache_row(
+    token_store: token_store_store.TokenStore,
+    user_id: str,
+    server_name: str,
+    *,
+    access_token: str,
+    expires_at: str | None,
+    scopes: str,
+    issuer: str,
+    audience: str,
 ) -> None:
-    """Write the per-(user, server) mint-cache row (refresh_token=NULL).
+    """Write the shared app identity's per-(user, server) mint-cache row (refresh_token=NULL).
 
     Delete-then-create rather than update-in-place: the row is pure cache (no
     refresh token to preserve), and — crucially — a plain update would keep the
@@ -144,7 +179,12 @@ async def _persist_obo_cache_row(
     forever. Deleting first guarantees the row's audience matches what was minted.
     Runs under the per-(user, server) lock, so the delete/create can't race a
     concurrent mint for this pair.
+
+    Only the app principal's rows are written here: a delegated mint routed here by mistake
+    would skip the credential guard, so it fails instead.
     """
+    if user_id != token_store_store.MODEL_APP_MINT_PRINCIPAL:
+        raise ValueError("only the shared app identity's mint is stored without the guard")
     await durable_write(token_store.delete_user_token, user_id, server_name)
     await durable_write(
         token_store.create_user_token,

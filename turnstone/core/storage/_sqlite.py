@@ -45,6 +45,7 @@ from turnstone.core.storage._protocol import (
     USER_SCOPED_AUTH_TYPES,
     AttachmentWrite,
     ConversationCommitWorkstreamGoneError,
+    DelegatedTokenWrite,
     ForkCloneExpectation,
     ForkCloneSnapshot,
     LeaseFence,
@@ -5960,6 +5961,64 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             )
             conn.commit()
 
+    def replace_delegated_oauth_token(
+        self,
+        user_id: str,
+        token_key: str,
+        *,
+        access_token_ct: bytes,
+        expires_at: str | None,
+        scopes: str | None,
+        as_issuer: str,
+        audience: str,
+        obo_server: str | None = None,
+    ) -> DelegatedTokenWrite:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            credential = conn.execute(
+                sa.select(oidc_user_credentials.c.user_id).where(
+                    (oidc_user_credentials.c.user_id == user_id)
+                    & (oidc_user_credentials.c.issuer == as_issuer)
+                )
+            ).fetchone()
+            if credential is None:
+                conn.rollback()
+                return "credential_gone"
+            if obo_server is not None:
+                server = conn.execute(
+                    sa.select(mcp_servers.c.server_id).where(
+                        (mcp_servers.c.name == obo_server)
+                        & mcp_servers.c.auth_type.in_(sorted(OBO_AUTH_TYPES))
+                    )
+                ).fetchone()
+                if server is None:
+                    conn.rollback()
+                    return "binding_changed"
+            conn.execute(
+                sa.delete(oauth_tokens).where(
+                    (oauth_tokens.c.user_id == user_id) & (oauth_tokens.c.token_key == token_key)
+                )
+            )
+            result = conn.execute(
+                sa.insert(oauth_tokens).prefix_with("OR IGNORE"),
+                {
+                    "user_id": user_id,
+                    "token_key": token_key,
+                    "access_token_ct": access_token_ct,
+                    "refresh_token_ct": None,
+                    "expires_at": expires_at,
+                    "scopes": scopes,
+                    "as_issuer": as_issuer,
+                    "audience": audience,
+                    "created": now,
+                    "last_refreshed": None,
+                },
+            )
+            stored = result.rowcount > 0
+            conn.commit()
+            return "stored" if stored else "already_stored"
+
     def get_oauth_token(self, user_id: str, token_key: str) -> OAuthToken | None:
         """Return the per-(user, token key) token row or None."""
         with self._conn() as conn:
@@ -6951,6 +7010,38 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 )
             )
             conn.commit()
+
+    def upsert_oidc_user_credential_for_identity(
+        self, user_id: str, issuer: str, subject: str, *, refresh_token_ct: bytes
+    ) -> bool:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            identity = conn.execute(
+                sa.select(oidc_identities.c.user_id).where(
+                    (oidc_identities.c.issuer == issuer) & (oidc_identities.c.subject == subject)
+                )
+            ).fetchone()
+            if identity is None or identity[0] != user_id:
+                conn.rollback()
+                return False
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+            stmt = sqlite_insert(oidc_user_credentials).values(
+                user_id=user_id,
+                issuer=issuer,
+                refresh_token_ct=refresh_token_ct,
+                created=now,
+                last_refreshed=now,
+            )
+            conn.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=["user_id", "issuer"],
+                    set_={"refresh_token_ct": refresh_token_ct, "last_refreshed": now},
+                )
+            )
+            conn.commit()
+            return True
 
     def get_oidc_user_credential(self, user_id: str, issuer: str) -> OIDCUserCredential | None:
         """Return the captured credential row or None."""

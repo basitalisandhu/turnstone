@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, runtime_checkable
 
 from turnstone.core.workstream import SAVED_PAGE_DEFAULT_LIMIT
 
@@ -262,6 +262,11 @@ class OIDCUserCredential(TypedDict):
     refresh_token_ct: bytes
     created: str
     last_refreshed: str
+
+
+# How a guarded write of a delegated mint-cache row ended: written; left to a row a concurrent
+# writer stored after this one's delete; or not written, because the user's credential is gone.
+DelegatedTokenWrite = Literal["stored", "already_stored", "credential_gone", "binding_changed"]
 
 
 class OIDCUnlinkResult(TypedDict):
@@ -1785,6 +1790,18 @@ class StorageBackend(Protocol):
         """
         ...
 
+    def upsert_oidc_user_credential_for_identity(
+        self, user_id: str, issuer: str, subject: str, *, refresh_token_ct: bytes
+    ) -> bool:
+        """Create or replace the captured credential only while the identity still links to it.
+
+        In one transaction with the identity ``(issuer, subject)`` locked against deletion: when it
+        no longer exists, or links another user, nothing is written and ``False`` is returned. A
+        sign-in that read the identity before an unlink can then never write the credential back
+        after it.
+        """
+        ...
+
     def get_oidc_user_credential(self, user_id: str, issuer: str) -> OIDCUserCredential | None:
         """Return the captured credential row or None."""
         ...
@@ -3031,6 +3048,32 @@ class StorageBackend(Protocol):
         audience: str,
     ) -> None:
         """Insert a new per-(user, token key) token row. No-op on conflict."""
+        ...
+
+    def replace_delegated_oauth_token(
+        self,
+        user_id: str,
+        token_key: str,
+        *,
+        access_token_ct: bytes,
+        expires_at: str | None,
+        scopes: str | None,
+        as_issuer: str,
+        audience: str,
+        obo_server: str | None = None,
+    ) -> DelegatedTokenWrite:
+        """Replace a delegated mint-cache row, only while the credential that minted it exists.
+
+        In one transaction with the user's captured credential for *as_issuer* locked against
+        deletion: delete the user's row under *token_key*, then insert the new one (no refresh
+        token). With the credential gone, nothing is written (``credential_gone``): a mint that
+        was in flight when the credential was deleted never outlives it. *obo_server* names the
+        MCP server an MCP mint was for; the write also requires it to still be a sign-in
+        passthrough server (``OBO_AUTH_TYPES``), locked the same way, or answers
+        ``binding_changed``, so a mint in flight when the server's auth type changed never
+        outlives the purge. ``delete_user`` and ``unlink_oidc_identity`` delete the credential
+        before the delegated rows, which is what lets them see a row this wrote.
+        """
         ...
 
     def get_oauth_token(self, user_id: str, token_key: str) -> OAuthToken | None:

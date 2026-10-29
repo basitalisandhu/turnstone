@@ -77,6 +77,14 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   (`status: "incomplete"`), the audit and the admin page, which also warns when
   the reply can't be read. Deleting a user evicts the same way. An admin can no
   longer unlink their own identity.
+- **A delegated token minted while its user is unlinked is never used.**
+  On-behalf-of MCP and model tokens are stored only while the credential that
+  minted them still exists (and an MCP server is still sign-in passthrough),
+  checked in the same transaction, and a token read or minted across a memory
+  eviction is not kept in memory. A token whose store fails is discarded too,
+  and that user's next mint for the server or model waits 30 seconds. A
+  sign-in in progress when its identity is unlinked no longer stores the
+  credential again; it fails instead.
 
 ### Changed
 

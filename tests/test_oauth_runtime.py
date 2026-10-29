@@ -1078,6 +1078,7 @@ def test_no_memoized_delegated_token_outlives_the_eviction_window() -> None:
             scopes="",
             issuer="https://idp.example.com",
             audience="api://gw",
+            generation=model_oauth._memo_generation(context, user_id),
         )
     memo = model_oauth._model_mint_memo(context)
 

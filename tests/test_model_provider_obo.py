@@ -1878,3 +1878,219 @@ def test_a_host_with_no_oauth_runtime_held_nothing() -> None:
         )
         == 0
     )
+
+
+class TestRevokedWhileMinting:
+    """A delegated model token minted or read across a revocation is never used or memoized."""
+
+    @staticmethod
+    def _state(storage: SQLiteBackend, post: Any) -> SimpleNamespace:
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.post = AsyncMock(side_effect=post)
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
+        _seed_credential(state)
+        return state
+
+    def test_a_credential_deleted_during_the_mint_leaves_no_token(
+        self, storage: SQLiteBackend
+    ) -> None:
+        async def _post(*args: Any, **kwargs: Any) -> Any:
+            storage.unlink_oidc_identity(ISSUER, "sub-1", model_token_prefix="__model_obo__:")
+            return _mk_response(200, {"access_token": "at-late", "expires_in": 3600})
+
+        from turnstone.core.model_oauth import model_mint_refusal_cause, model_obo_cache_server
+
+        storage.create_oidc_identity(ISSUER, "sub-1", USER, "user@example.com")
+        state = self._state(storage, _post)
+
+        assert _mint(state) is None
+        assert oauth_context(state).token_memo == {}
+        assert storage.list_oauth_token_metadata_by_user(USER) == []
+        assert (
+            model_mint_refusal_cause("model_obo", model_obo_cache_server(MODEL_ALIAS), USER)
+            == "credential_removed"
+        )
+
+    def test_an_eviction_during_the_mint_keeps_the_token_out_of_the_memo(
+        self, storage: SQLiteBackend
+    ) -> None:
+        from turnstone.core.model_oauth import invalidate_model_mint_memo
+
+        holder: dict[str, SimpleNamespace] = {}
+
+        async def _post(*args: Any, **kwargs: Any) -> Any:
+            invalidate_model_mint_memo(holder["state"], user_id=USER)
+            return _mk_response(200, {"access_token": "at-minted", "expires_in": 3600})
+
+        state = self._state(storage, _post)
+        holder["state"] = state
+
+        assert _mint(state) == "at-minted"
+        assert oauth_context(state).token_memo == {}
+
+    def test_an_eviction_during_a_cache_read_is_not_served_from_that_read(
+        self, storage: SQLiteBackend
+    ) -> None:
+        from turnstone.core.model_oauth import invalidate_model_mint_memo
+
+        state = self._state(
+            storage,
+            lambda *a, **kw: _mk_response(200, {"access_token": "at-minted", "expires_in": 3600}),
+        )
+        store = oauth_context(state).token_store
+        store.replace_delegated_user_token(
+            USER,
+            f"__model_obo__:{MODEL_ALIAS}",
+            access_token="at-cached",
+            expires_at="2099-12-31T00:00:00",
+            scopes=None,
+            as_issuer=ISSUER,
+            audience=AUDIENCE,
+        )
+        real_read = store.get_user_token
+
+        def _read_across_an_eviction(*args: Any, **kwargs: Any) -> Any:
+            row = real_read(*args, **kwargs)
+            invalidate_model_mint_memo(state, user_id=USER)
+            return row
+
+        store.get_user_token = _read_across_an_eviction  # type: ignore[method-assign]
+
+        assert _mint(state) == "at-minted"
+
+    def test_a_cache_write_that_fails_is_not_served(self, storage: SQLiteBackend) -> None:
+        """The token is discarded and the 30 s cooldown armed: a second call within it reaches
+        no identity provider."""
+        from unittest.mock import patch
+
+        from turnstone.core.model_oauth import model_mint_refusal_cause, model_obo_cache_server
+
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(200, {"access_token": "at-minted", "expires_in": 3600})
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
+        _seed_credential(state)
+
+        with patch.object(
+            oauth_context(state).token_store,
+            "replace_delegated_user_token",
+            side_effect=RuntimeError("database is locked"),
+        ):
+            assert _mint(state) is None
+            assert _mint(state) is None
+        assert oauth_context(state).token_memo == {}
+        assert client.post.call_count == 1
+        assert (
+            model_mint_refusal_cause("model_obo", model_obo_cache_server(MODEL_ALIAS), USER)
+            == "cache_persist_failed"
+        )
+
+
+def test_only_the_guarded_writers_store_delegated_tokens_and_credentials() -> None:
+    """Every reference to a token or credential writer, by attribute, bare name, import alias or
+    string, is accounted for: a delegated mint must persist through the guarded helper, and a
+    sign-in capture through the guarded capture, or a write in flight outlives an unlink."""
+    import ast
+
+    root = Path(__file__).resolve().parents[1] / "turnstone"
+    writers = {
+        "_persist_obo_cache_row",
+        "_persist_app_mint_cache_row",
+        "create_user_token",
+        "create_oauth_token",
+        "replace_consented_user_token",
+        "replace_consented_oauth_token",
+        "replace_delegated_user_token",
+        "replace_delegated_oauth_token",
+        "upsert_oidc_credential",
+        "upsert_oidc_user_credential",
+        "capture_oidc_credential",
+        "upsert_oidc_user_credential_for_identity",
+    }
+    references: dict[str, set[str]] = {name: set() for name in writers}
+
+    class _References(ast.NodeVisitor):
+        def __init__(self, module: str) -> None:
+            self.module = module
+            self.functions: list[str] = []
+
+        def _function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            self.functions.append(node.name)
+            self.generic_visit(node)
+            self.functions.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._function(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._function(node)
+
+        def _note(self, name: str) -> None:
+            if name in writers:
+                where = self.functions[-1] if self.functions else "<module>"
+                references[name].add(f"{self.module}:{where}")
+
+        def visit_Name(self, node: ast.Name) -> None:
+            self._note(node.id)
+
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            self._note(node.attr)
+            self.generic_visit(node)
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            for alias in node.names:
+                self._note(alias.name)
+
+        def visit_Constant(self, node: ast.Constant) -> None:
+            if isinstance(node.value, str):
+                self._note(node.value)
+
+    for path in root.rglob("*.py"):
+        _References(str(path.relative_to(root))).visit(ast.parse(path.read_text()))
+
+    assert references == {
+        "_persist_obo_cache_row": {
+            "core/mcp_oauth.py:_mint_mcp_obo_operation",
+            "core/model_oauth.py:_mint_obo_access_token",
+        },
+        "_persist_app_mint_cache_row": {"core/model_oauth.py:_mint_app_access_token"},
+        "create_user_token": {"core/oauth/tokens.py:_persist_app_mint_cache_row"},
+        "create_oauth_token": {"core/token_store/store.py:create_user_token"},
+        # The consent callback stores an oauth_user grant, not a delegated token.
+        "replace_consented_user_token": {"core/mcp_oauth.py:_handle_mcp_oauth_callback_inner"},
+        "replace_consented_oauth_token": {"core/token_store/store.py:replace_consented_user_token"},
+        "replace_delegated_user_token": {"core/oauth/tokens.py:_persist_obo_cache_row"},
+        "replace_delegated_oauth_token": {"core/token_store/store.py:replace_delegated_user_token"},
+        # The unguarded upsert seeds tests only; production captures through the guarded one.
+        "upsert_oidc_credential": set(),
+        "upsert_oidc_user_credential": {"core/token_store/store.py:upsert_oidc_credential"},
+        "capture_oidc_credential": {"core/auth.py:handle_oidc_callback"},
+        "upsert_oidc_user_credential_for_identity": {
+            "core/token_store/store.py:capture_oidc_credential"
+        },
+    }
+
+
+def test_the_unguarded_helper_refuses_a_delegated_mint(storage: SQLiteBackend) -> None:
+    """Routed to the app-mint helper by mistake, a user's token fails instead of skipping the
+    credential guard."""
+    from turnstone.core.oauth import tokens as oauth_tokens
+
+    store = MCPTokenStore(storage, make_mcp_token_cipher(), node_id="test")
+
+    async def _persist() -> None:
+        await oauth_tokens._persist_app_mint_cache_row(
+            store,
+            USER,
+            "__model_obo__:gw",
+            access_token="at",
+            expires_at=None,
+            scopes="",
+            issuer=ISSUER,
+            audience=AUDIENCE,
+        )
+
+    with pytest.raises(ValueError):
+        asyncio.run(_persist())
+    assert storage.list_oauth_token_metadata_by_user(USER) == []

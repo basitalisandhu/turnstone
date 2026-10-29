@@ -51,8 +51,8 @@ before the token POST; a logged HTTP error identifies the upstream rejection.
 
 `entra_spike.py` verified the raw OAuth WIRE (before code existed). `entra_e2e.py`
 verifies the SHIPPED Turnstone code: it does a real Entra login, feeds the
-credential through the real `MCPTokenStore.upsert_oidc_credential` (the call the
-OIDC callback makes on capture), then drives the real
+credential through `MCPTokenStore.upsert_oidc_credential` (a seed; the OIDC
+callback captures through the guarded `capture_oidc_credential`), then drives the real
 `get_obo_access_token_classified` → `_obo_mint_entra` against the live Entra token
 endpoint. Checks E1–E7: real mint + aud claim, cache-hit (0 Entra calls),
 single-credential→audiences A&B, rotation write-back, force_refresh re-mint,

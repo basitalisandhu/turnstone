@@ -45,6 +45,9 @@ class OAuthContext:
     rediscover_last: float | None = None
     coordination: TokenCoordination = field(default_factory=TokenCoordination)
     token_memo: dict[tuple[str, str], UserTokenPlain] = field(default_factory=dict)
+    # Bumped for a user each time their memo entries are evicted: a token read or minted before
+    # an eviction is never memoized after it.
+    token_memo_generation: dict[str, int] = field(default_factory=dict)
     metadata_cache: dict[str, Any] = field(default_factory=dict)
     http_client: httpx2.AsyncClient | None = field(default=None, repr=False)
     runtime: OAuthRuntime | None = field(default=None, repr=False)

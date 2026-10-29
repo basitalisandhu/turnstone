@@ -1289,3 +1289,79 @@ class TestMisconfiguration:
 
         assert result.kind == "refresh_failed_transient"
         assert client.post.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# A credential revoked while a mint is in flight
+# ---------------------------------------------------------------------------
+
+
+class TestRevokedWhileMinting:
+    def test_a_credential_deleted_during_the_mint_leaves_no_token(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """The unlink lands while the identity provider answers: the minted token is neither
+        stored nor used."""
+        _seed_obo_server(storage)
+        storage.create_oidc_identity(ISSUER, "sub-1", USER, "user@example.com")
+
+        async def _post(*args: Any, **kwargs: Any) -> Any:
+            storage.unlink_oidc_identity(ISSUER, "sub-1", model_token_prefix="__model_obo__:")
+            return _mk_response(200, {"access_token": "at-late", "expires_in": 3600})
+
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.post = AsyncMock(side_effect=_post)
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
+        _seed_credential(state)
+
+        result = _mint(state)
+
+        assert result.kind == "missing"
+        assert result.token is None
+        assert storage.get_oauth_token(USER, SERVER) is None
+
+    def test_a_cache_write_that_fails_is_not_served(self, storage: SQLiteBackend) -> None:
+        from unittest.mock import patch
+
+        _seed_obo_server(storage)
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(200, {"access_token": "at-minted", "expires_in": 3600})
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
+        _seed_credential(state)
+
+        with patch.object(
+            oauth_context(state).token_store,
+            "replace_delegated_user_token",
+            side_effect=RuntimeError("database is locked"),
+        ):
+            result = _mint(state)
+            again = _mint(state)
+
+        assert result.kind == "refresh_failed_transient"
+        assert result.token is None
+        # The backoff holds the next call off the identity provider.
+        assert again.kind == "refresh_failed_transient"
+        assert client.post.call_count == 1
+
+    def test_a_server_that_stopped_being_passthrough_during_the_mint_gets_no_row(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """An admin flips the server to oauth_user while the identity provider answers: the
+        flip's purge ran before the mint's write, so the write itself refuses."""
+        _seed_obo_server(storage)
+
+        async def _post(*args: Any, **kwargs: Any) -> Any:
+            storage.update_mcp_server(SERVER_ID, auth_type="oauth_user", purge_oauth_rows=True)
+            return _mk_response(200, {"access_token": "at-late", "expires_in": 3600})
+
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.post = AsyncMock(side_effect=_post)
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
+        _seed_credential(state)
+
+        result = _mint(state)
+
+        assert result.kind == "missing"
+        assert storage.get_oauth_token(USER, SERVER) is None

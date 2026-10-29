@@ -102,8 +102,14 @@ does not add a cache-cleanup sweep.
   as the identity, then evicts model-memo entries on the console and the nodes
   registered within the last hour (no memo entry lives longer); the reply and
   the audit name any host that could not confirm it.
-  Deleting a user evicts the same way. Independent `oauth_user` grants and
-  shared app-identity caches survive. Existing upstream access tokens may
+  Deleting a user evicts the same way. A delegated token is stored only while
+  the credential that minted it exists (and, for an MCP server, while the
+  server is still sign-in passthrough), checked in the same transaction, so a
+  mint that finishes after the unlink stores nothing; a row stored just before
+  it is purged with it, and a request that already holds the token can finish
+  with it. A sign-in stores its credential only while its identity still links
+  the user. Independent `oauth_user` grants
+  and shared app-identity caches survive. Existing upstream access tokens may
   remain valid until expiry; the identity provider governs downstream access.
 - **User deletion:** deletes that user's database token rows and captured
   credentials. App-identity rows under `__app__` belong to the application and

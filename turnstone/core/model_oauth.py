@@ -233,6 +233,10 @@ def _model_mint_memo(app_state: Any) -> dict[tuple[str, str], token_store_store.
     return memo
 
 
+def _memo_generation(app_state: Any, user_id: str) -> int:
+    return oauth_context(app_state).token_memo_generation.get(user_id, 0)
+
+
 def invalidate_model_mint_memo(
     app_state: Any,
     *,
@@ -243,8 +247,12 @@ def invalidate_model_mint_memo(
 
     This must run on the OAuth loop. OIDC unlink schedules it there
     alongside deleting the corresponding DB rows, so the in-process fast path
-    cannot extend a revoked bearer beyond the purge.
+    cannot extend a revoked bearer beyond the purge. It also bumps the
+    principal's generation, so a read or mint already in flight does not
+    memoize its token afterwards.
     """
+    generations = oauth_context(app_state).token_memo_generation
+    generations[user_id] = generations.get(user_id, 0) + 1
     memo = _model_mint_memo(app_state)
     keys = [key for key in memo if key[0] == user_id and key[1].startswith(server_prefix)]
     for key in keys:
@@ -286,12 +294,16 @@ async def _serve_fresh_mint_cache(
     if oauth_tokens._is_fresh_obo_cache_row(plain, audience, scopes) and plain is not None:
         return plain["access_token"]
     memo.pop(key, None)
+    generation = _memo_generation(app_state, user_id)
     try:
         plain = await asyncio.to_thread(token_store.get_user_token, user_id, cache_server)
     except token_store_crypto.TokenDecryptError:
         # A mint-cache row encrypted under a retired key is only a cache miss.
         return None
     if not oauth_tokens._is_fresh_obo_cache_row(plain, audience, scopes) or plain is None:
+        return None
+    if _memo_generation(app_state, user_id) != generation:
+        # Evicted while the row was being read: the read may predate a revocation.
         return None
     memo[key] = {**plain, "expires_at": _memo_expiry(plain.get("expires_at"))}
     return plain["access_token"]
@@ -307,8 +319,15 @@ def _memoize_minted_token(
     scopes: str,
     issuer: str,
     audience: str,
+    generation: int,
 ) -> None:
-    """Install a freshly minted token in the loop-local memo."""
+    """Install a freshly minted token in the loop-local memo.
+
+    *generation* is the principal's memo generation when the mint began; a token minted before
+    an eviction is not memoized after it.
+    """
+    if _memo_generation(app_state, user_id) != generation:
+        return
     now = datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="seconds")
     _model_mint_memo(app_state)[(user_id, cache_server)] = {
         "user_id": user_id,
@@ -488,7 +507,10 @@ async def _mint_obo_access_token(
     Returns ``None`` — the signal for callers to fall back to their static
     credential — when OIDC is disabled/unconfigured, the profile has no mint
     leg or contradicts ``grant_leg``, the user has no captured credential (or
-    it won't decrypt), or the mint is rejected.  This is the model-provider
+    it won't decrypt), the mint is rejected, the minted token could not be
+    stored (the store could not confirm the credential still exists, which
+    arms the 30 s cooldown), or the credential was removed while the mint was
+    in flight.  This is the model-provider
     entry point; the MCP-server path uses
     :func:`get_obo_access_token_classified`, which additionally owns
     per-server cache rows, dead-grant classification, and consent affordances
@@ -638,6 +660,7 @@ async def _mint_obo_access_token(
             ):
                 return None
 
+            generation = _memo_generation(app_state, user_id)
             try:
                 credential = await asyncio.to_thread(
                     token_store.get_oidc_credential, user_id, issuer
@@ -725,7 +748,7 @@ async def _mint_obo_access_token(
                 tokens, default_ttl_seconds=oauth_tokens._OBO_DEFAULT_TTL_SECONDS
             )
             try:
-                await oauth_tokens._persist_obo_cache_row(
+                written = await oauth_tokens._persist_obo_cache_row(
                     token_store,
                     user_id,
                     cache_server,
@@ -736,12 +759,27 @@ async def _mint_obo_access_token(
                     audience=audience,
                 )
             except Exception:
+                # The write also checks that the credential still exists; a failed check is not
+                # a pass, so the token is not used.
+                oauth_tokens._arm_cooldown(
+                    oauth_context(app_state).coordination, user_id, cooldown_key
+                )
+                _record_mint_refusal_cause("model_obo", cause_key, user_id, "cache_persist_failed")
                 log.warning(
                     "model_obo.cache_persist_failed",
                     user_id=user_id,
                     audience=audience,
                     exc_info=True,
                 )
+                return None
+            if written not in ("stored", "already_stored"):
+                # Revoked while the mint was in flight.
+                oauth_tokens._arm_cooldown(
+                    oauth_context(app_state).coordination, user_id, cooldown_key
+                )
+                _record_mint_refusal_cause("model_obo", cause_key, user_id, "credential_removed")
+                log.info("model_obo.credential_removed_during_mint", user_id=user_id, alias=alias)
+                return None
             _memoize_minted_token(
                 app_state,
                 user_id=user_id,
@@ -751,6 +789,7 @@ async def _mint_obo_access_token(
                 scopes=scopes,
                 issuer=issuer,
                 audience=audience,
+                generation=generation,
             )
             oauth_tokens._clear_refresh_backoff(
                 oauth_context(app_state).coordination, user_id, cooldown_key
@@ -931,6 +970,7 @@ async def _mint_app_access_token(
                 oauth_context(app_state).coordination, _APP_CACHE_USER, cooldown_key
             ):
                 return None
+            app_generation = _memo_generation(app_state, _APP_CACHE_USER)
 
             try:
                 async with oauth_http._enter_mint_client(app_state) as mint_client:
@@ -963,7 +1003,7 @@ async def _mint_app_access_token(
                 tokens, default_ttl_seconds=oauth_tokens._OBO_DEFAULT_TTL_SECONDS
             )
             try:
-                await oauth_tokens._persist_obo_cache_row(
+                await oauth_tokens._persist_app_mint_cache_row(
                     token_store,
                     _APP_CACHE_USER,
                     cache_server,
@@ -984,6 +1024,7 @@ async def _mint_app_access_token(
                 scopes="",
                 issuer=issuer,
                 audience=audience,
+                generation=app_generation,
             )
             oauth_tokens._clear_refresh_backoff(
                 oauth_context(app_state).coordination, _APP_CACHE_USER, cooldown_key
