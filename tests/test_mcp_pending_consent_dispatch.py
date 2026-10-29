@@ -71,6 +71,7 @@ class TestParseEnvelope:
             "mcp_tool_call_forbidden",
             "mcp_resource_read_forbidden",
             "mcp_prompt_get_forbidden",
+            "mcp_server_disabled",
         ):
             env = json.dumps({"error": {"code": code, "server": "x", "detail": "d"}})
             assert _parse_pending_consent_envelope(env) is None, code

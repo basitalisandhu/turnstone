@@ -102,7 +102,11 @@ def _invoke(manager: mcp_client.MCPClientManager, bridge: str) -> object:
             user_id="user-1",
             server_name="sample",
             access_token="synthetic-token",
-            server_row={"transport": "streamable-http", "url": "https://mcp.example.com"},
+            server_row={
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com",
+                "enabled": True,
+            },
         )
     return method("user-1", "sample")
 

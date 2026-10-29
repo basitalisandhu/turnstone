@@ -261,6 +261,22 @@ class TestAuthorize:
         resp = client.get("/v1/api/mcp/oauth/start?server=nope")
         assert resp.status_code == 404
 
+    def test_a_disabled_server_takes_no_consent(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        storage.update_mcp_server("srv-id-1", enabled=False)
+        token_store = _make_token_store(storage)
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth")
+
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "Unknown MCP server"}
+        http_client_mock.get.assert_not_called()
+        http_client_mock.post.assert_not_called()
+
     def test_wrong_auth_type_400(self, storage: SQLiteBackend, http_client_mock: MagicMock) -> None:
         storage.create_mcp_server(
             server_id="static-1",
@@ -1902,6 +1918,42 @@ class TestAuthorizationResponseChecks:
         assert token_store.get_user_token("user-1", "srv-oauth") is not None
         row = storage.get_mcp_server_by_name("srv-oauth")
         assert row is not None and row["oauth_as_issuer_cached"] == "https://as.example.com"
+
+    def test_a_server_disabled_since_start_sends_nothing(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        _seed_pending(storage)
+        storage.update_mcp_server("srv-id-1", enabled=False)
+        self._ready(http_client_mock)
+
+        resp, _ = self._callback(storage, http_client_mock, "code=auth-code&state=valid-state")
+
+        assert resp.headers["location"] == "/?mcp_oauth_error=server+missing"
+        http_client_mock.post.assert_not_called()
+        assert storage.get_oauth_token("user-1", "srv-oauth") is None
+
+    def test_a_server_disabled_during_the_code_exchange_gets_no_grant(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        _seed_pending(storage)
+        self._ready(http_client_mock)
+        answer = http_client_mock.post.return_value
+
+        async def _post(*_args: Any, **_kwargs: Any) -> Any:
+            storage.update_mcp_server("srv-id-1", enabled=False)
+            return answer
+
+        http_client_mock.post = AsyncMock(side_effect=_post)
+
+        resp, token_store = self._callback(
+            storage, http_client_mock, "code=auth-code&state=valid-state" + self._ISS
+        )
+
+        assert resp.headers["location"] == "/?mcp_oauth_error=server+missing"
+        assert token_store.get_user_token("user-1", "srv-oauth") is None
+        assert _consent_failed_reasons(storage) == ["server_disabled"]
 
     def test_a_flow_started_before_flows_recorded_their_issuer_reads_as_expired(
         self, storage: SQLiteBackend, http_client_mock: MagicMock

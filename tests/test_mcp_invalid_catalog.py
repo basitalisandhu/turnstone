@@ -305,7 +305,13 @@ def test_pool_prime_shows_the_invalid_tool_in_the_users_status(
     upstream_server: tuple[str, Upstream],
 ) -> None:
     url, _upstream = upstream_server
-    row = {"name": "srv", "transport": "streamable-http", "url": url, "auth_type": "oauth_user"}
+    row = {
+        "name": "srv",
+        "transport": "streamable-http",
+        "url": url,
+        "auth_type": "oauth_user",
+        "enabled": True,
+    }
     storage = MagicMock()
     storage.get_mcp_server_by_name.return_value = row
     lookup = AsyncMock(return_value=SimpleNamespace(kind="token", token="access-token"))

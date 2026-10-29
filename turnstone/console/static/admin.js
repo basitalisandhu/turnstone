@@ -4682,11 +4682,12 @@ function _renderMcpServers(items) {
     const detailAttr = isConfig
       ? 'data-mcp-detail-name="' + escapeHtml(s.name) + '"'
       : 'data-mcp-detail="' + escapeHtml(s.server_id) + '"';
-    // Phase 9: surface the connect/bulk-revoke affordances only for
-    // user-OAuth servers, and bulk-revoke only once a user has consented.
-    // oauth_obo has NO per-server connect (it uses the org sign-in); its
-    // "flush cache" drops minted tokens so users re-mint (honest label — it is
-    // not a durable revoke; that is governed by the identity provider).
+    // Phase 9: surface the connect/bulk-revoke affordances only for user-OAuth
+    // servers, connect only while the server is enabled (/start answers a
+    // disabled one as unknown), and bulk-revoke only once a user has consented.
+    // oauth_obo has NO per-server connect (it uses the org sign-in); its "flush
+    // cache" drops minted tokens so users re-mint (honest label — it is not a
+    // durable revoke; that is governed by the identity provider).
     const isOauth = s.auth_type === "oauth_user";
     const isObo = s.auth_type === "oauth_obo";
     const consentCount =
@@ -4694,7 +4695,7 @@ function _renderMcpServers(items) {
     const actions = _kebabMenu([
       { label: "refresh", attrs: { "data-mcp-refresh": s.name } },
       { label: "reconnect", attrs: { "data-mcp-reconnect": s.name } },
-      isOauth
+      isOauth && s.enabled
         ? { label: "connect", attrs: { "data-mcp-oauth-connect": s.name } }
         : null,
       isOauth && consentCount > 0

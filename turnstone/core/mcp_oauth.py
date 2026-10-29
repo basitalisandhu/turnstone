@@ -179,6 +179,15 @@ def is_user_scoped_auth(auth_type: str | None) -> bool:
     return auth_type in USER_SCOPED_AUTH_TYPES
 
 
+def server_row_disabled(row: dict[str, Any] | None) -> bool:
+    """Is *row* an ``mcp_servers`` row that does not say it is enabled?
+
+    A row without the flag counts as disabled. ``None`` (no row) does not, so each caller decides
+    what having no row means for it.
+    """
+    return row is not None and not row.get("enabled", False)
+
+
 class MCPOAuthDiscoveryError(oauth_http.OAuthError):
     """Discovery (PRM, AS metadata) failed or returned unsuitable values."""
 
@@ -759,13 +768,14 @@ def _binding_changes(server_row: Mapping[str, Any], pending: MCPOAuthPendingStat
 
 # The server columns a consent's grant is bound to, besides the name it is stored under: the
 # callback stores the grant only while the server holds the values it checked before the code
-# exchange (see :meth:`StorageBackend.replace_consented_oauth_token`).
+# exchange, enabled included (see :meth:`StorageBackend.replace_consented_oauth_token`).
 _CONSENT_BINDING_COLUMNS = (
     "server_id",
     "auth_type",
     "url",
     "oauth_authorization_server_url",
     "oauth_audience",
+    "enabled",
 )
 
 
@@ -3171,7 +3181,8 @@ async def _handle_mcp_oauth_authorize_inner(request: Request) -> Response:
         return JSONResponse({"error": "Storage unavailable"}, status_code=503)
 
     server_row = await asyncio.to_thread(storage.get_mcp_server_by_name, server_name)
-    if server_row is None:
+    # A disabled server takes no new consent, and answers as unknown, like a deleted one.
+    if server_row is None or server_row_disabled(server_row):
         return JSONResponse({"error": "Unknown MCP server"}, status_code=404)
 
     if server_row.get("auth_type") != "oauth_user":
@@ -3304,10 +3315,11 @@ async def _consent_refusal(
     """Name what changed when the grant was not stored because the server changed.
 
     Returns ``(reason, redirect query)``. The server is read once more for the message and the
-    audit only, since nothing was stored either way: the Authorization Server URL or a pin that is
-    neither the one checked before the exchange nor *issuer* (which this callback's own discovery
-    may have written) reads as ``issuer_changed``, and anything else, a read that fails included,
-    as ``server_changed``.
+    audit only, since nothing was stored either way: a disabled server reads as
+    ``server_disabled`` (answered like a missing one), the Authorization Server URL or a pin that
+    is neither the one checked before the exchange nor *issuer* (which this callback's own
+    discovery may have written) as ``issuer_changed``, and anything else, a read that fails
+    included, as ``server_changed``.
     """
     server_name = pending["server_name"]
     try:
@@ -3315,6 +3327,8 @@ async def _consent_refusal(
     except Exception:
         log.warning("mcp_server.oauth.callback_refusal_read_failed", server_name=server_name)
         current = None
+    if current is not None and server_row_disabled(current):
+        return ("server_disabled", "mcp_oauth_error=server+missing")
     if (
         current is not None
         and not _binding_changes(current, pending)
@@ -3507,7 +3521,8 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
     except Exception:
         log.warning("mcp_server.oauth.callback_server_read_failed", exc_info=True)
         return RedirectResponse("/?mcp_oauth_error=storage+unavailable", status_code=302)
-    if server_row is None:
+    # Disabled since /start: no code exchange and no grant, as for a deleted server.
+    if server_row is None or server_row_disabled(server_row):
         return RedirectResponse("/?mcp_oauth_error=server+missing", status_code=302)
 
     http_client: httpx2.AsyncClient | None = getattr(
@@ -4200,6 +4215,12 @@ async def _handle_mcp_oauth_list_pending_inner(request: Request) -> Response:
         return JSONResponse({"pending": 0, "servers": []})
 
     rows = await asyncio.to_thread(storage.list_mcp_pending_consent_by_user, user_id)
+    if rows:
+        # A disabled server takes no consent (/start answers it as unknown): its record waits,
+        # unlisted, until the server is enabled again.
+        servers = await asyncio.to_thread(storage.list_mcp_servers)
+        disabled = {str(server.get("name")) for server in servers if server_row_disabled(server)}
+        rows = [row for row in rows if row["server_name"] not in disabled]
     return JSONResponse({"pending": len(rows), "servers": list(rows)})
 
 

@@ -83,6 +83,7 @@ def test_images_and_errors_survive_sdk_and_normalize_off_loop(image_server, pool
             "transport": "streamable-http",
             "url": url,
             "auth_type": "oauth_user",
+            "enabled": True,
         }
         manager.set_storage(storage)
         manager.set_app_state(SimpleNamespace())

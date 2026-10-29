@@ -28,6 +28,7 @@ import mcp.types as mcp_types
 import pytest
 
 from tests._oauth_runtime_helpers import make_oauth_context
+from tests._session_helpers import log_has_field
 from tests.conftest import (
     _drain_background,
     _run_on_loop,
@@ -2846,3 +2847,528 @@ class TestUserTokenFreshnessSweep:
         # last_exercised = COALESCE(last_refreshed, created); never-refreshed rows
         # fall back to created, so it is always populated (drives the keepalive).
         assert all(last_exercised for _, _, last_exercised in targets)
+
+
+# ---------------------------------------------------------------------------
+# A server an administrator has disabled
+# ---------------------------------------------------------------------------
+
+
+class TestDisabledServer:
+    """A disabled server is refused on every pool path, checked on the row each call reads."""
+
+    def _wire(self, mgr: MCPClientManager, storage: SQLiteBackend) -> None:
+        cipher = make_mcp_token_cipher()
+        _seed_oauth_server(storage, name="pool-srv")
+        _seed_user_token(storage, cipher)
+        mgr.set_storage(storage)
+        mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+        mgr._oauth_user_server_names = {"pool-srv"}
+
+    def _warm_entry(
+        self, mgr: MCPClientManager, loop: asyncio.AbstractEventLoop, session: Any
+    ) -> PoolEntryState:
+        async def _seed() -> PoolEntryState:
+            entry = await mgr._ensure_pool_entry(("user-1", "pool-srv"))
+            entry.session = session
+            entry.tools = _fake_pool_tools("pool-srv", "do_thing")
+            mgr._rebuild_user_tool_map("user-1")
+            return entry
+
+        entry: PoolEntryState = _run_on_loop(loop, _seed())
+        return entry
+
+    _SDK_METHOD = {"tool": "call_tool", "resource": "read_resource", "prompt": "get_prompt"}
+
+    def _session(self) -> MagicMock:
+        """A warm session that answers every pool surface with "ok"."""
+        session = MagicMock()
+        session.call_tool = AsyncMock(
+            return_value=mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(type="text", text="ok")], is_error=False
+            )
+        )
+        session.read_resource = AsyncMock(
+            return_value=mcp_types.ReadResourceResult(
+                contents=[mcp_types.TextResourceContents(uri="res://x/1", text="ok")]
+            )
+        )
+        session.get_prompt = AsyncMock(
+            return_value=mcp_types.GetPromptResult(
+                messages=[
+                    mcp_types.PromptMessage(
+                        role="user", content=mcp_types.TextContent(type="text", text="ok")
+                    )
+                ]
+            )
+        )
+        return session
+
+    def _dispatch(self, mgr: MCPClientManager, kind: str, row: dict[str, Any]) -> Any:
+        common: dict[str, Any] = {"user_id": "user-1", "server_name": "pool-srv", "server_row": row}
+        if kind == "tool":
+            return mgr._dispatch_pool(original_name="do_thing", arguments={}, **common)
+        if kind == "resource":
+            return mgr._dispatch_pool_resource(uri="res://x/1", **common)
+        return mgr._dispatch_pool_prompt(original_name="p", arguments=None, **common)
+
+    @staticmethod
+    def _answered_ok(kind: str, result: Any) -> bool:
+        if kind == "tool":
+            return bool(_decode_tool_result(result) == "ok")
+        if kind == "resource":
+            return bool(result == "ok")
+        return bool(result == [{"role": "user", "content": "ok"}])
+
+    def test_a_tool_call_is_refused_before_any_token_work_and_drops_the_catalog(
+        self, running_loop_mgr, storage: SQLiteBackend, caplog
+    ) -> None:
+        mgr, loop, _ = running_loop_mgr
+        self._wire(mgr, storage)
+        session = MagicMock()
+        session.call_tool = AsyncMock()
+        entry = self._warm_entry(mgr, loop, session)
+        fired = [0]
+
+        def _listener() -> None:
+            fired[0] += 1
+
+        mgr.add_listener(_listener, user_id="user-1")
+        storage.update_mcp_server("srv-pool", enabled=False)
+        lookup = AsyncMock()
+
+        with (
+            patch.object(mgr, "_pool_lookup_checked", new=lookup),
+            caplog.at_level(logging.INFO, logger="turnstone.mcp"),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5)
+        _drain_background(mgr, loop)
+
+        assert json.loads(str(exc_info.value)) == {
+            "error": {
+                "code": "mcp_server_disabled",
+                "server": "pool-srv",
+                "detail": (
+                    "This MCP server has been disabled or removed by an administrator. "
+                    "Operator action required."
+                ),
+            }
+        }
+        lookup.assert_not_awaited()
+        session.call_tool.assert_not_awaited()
+        assert entry.session is None
+        assert entry.tools is None
+        assert mgr.is_mcp_tool("mcp__pool-srv__do_thing", user_id="user-1") is False
+        assert fired[0] == 1
+        [record] = [
+            r for r in caplog.records if "mcp_pool.server_disabled_refused" in r.getMessage()
+        ]
+        assert log_has_field(record, "server_name", "pool-srv")
+        assert log_has_field(record, "user_id", "user-1")
+        assert log_has_field(record, "kind", "tool")
+
+    @pytest.mark.parametrize("kind", ["tool", "resource", "prompt"])
+    @pytest.mark.parametrize("flag", [False, None], ids=["disabled", "flag-missing"])
+    def test_each_pool_surface_refuses_before_the_token_lookup(
+        self, running_loop_mgr, storage: SQLiteBackend, kind: str, flag: bool | None
+    ) -> None:
+        mgr, loop, _ = running_loop_mgr
+        self._wire(mgr, storage)
+        row = dict(storage.get_mcp_server_by_name("pool-srv") or {})
+        if flag is None:
+            del row["enabled"]
+        else:
+            row["enabled"] = flag
+        lookup = AsyncMock()
+        common: dict[str, Any] = {"user_id": "user-1", "server_name": "pool-srv", "server_row": row}
+        calls = {
+            "tool": lambda: mgr._dispatch_pool(original_name="do_thing", arguments={}, **common),
+            "resource": lambda: mgr._dispatch_pool_resource(uri="res://x/1", **common),
+            "prompt": lambda: mgr._dispatch_pool_prompt(
+                original_name="p", arguments=None, **common
+            ),
+        }
+
+        with patch.object(mgr, "_pool_lookup_checked", new=lookup):
+            result = _run_on_loop(loop, calls[kind]())
+
+        assert json.loads(result)["error"]["code"] == "mcp_server_disabled"
+        lookup.assert_not_awaited()
+
+    @pytest.mark.parametrize("kind", ["tool", "resource", "prompt"])
+    @pytest.mark.parametrize("change", ["disabled", "removed", "unreadable", "unchanged"])
+    def test_every_call_reads_the_row_again_once_it_holds_its_entry(
+        self, running_loop_mgr, storage: SQLiteBackend, kind: str, change: str
+    ) -> None:
+        """The call was resolved while the server was enabled, and an administrator disabled or
+        removed it before the call held its entry, with no wait for the lock. A read that fails
+        keeps to the resolved row. The 401 the previous call left on the entry does not turn the
+        refusal into an auth retry."""
+        mgr, loop, _ = running_loop_mgr
+        self._wire(mgr, storage)
+        session = self._session()
+        entry = self._warm_entry(mgr, loop, session)
+        row = storage.get_mcp_server_by_name("pool-srv")
+        assert row is not None and row["enabled"] is True
+        entry.auth_capture.status = 401
+        if change == "disabled":
+            storage.update_mcp_server("srv-pool", enabled=False)
+        elif change == "removed":
+            assert storage.delete_mcp_server("srv-pool")
+        lookup = AsyncMock(return_value=(SimpleNamespace(token="access-aaa"), None))
+        unreadable = (
+            patch.object(
+                storage, "get_mcp_server_by_name", side_effect=RuntimeError("database is locked")
+            )
+            if change == "unreadable"
+            else contextlib.nullcontext()
+        )
+
+        with patch.object(mgr, "_pool_lookup_checked", new=lookup), unreadable:
+            result = _run_on_loop(loop, self._dispatch(mgr, kind, row))
+        _drain_background(mgr, loop)
+
+        sdk_call = getattr(session, self._SDK_METHOD[kind])
+        if change in ("disabled", "removed"):
+            assert json.loads(result)["error"]["code"] == "mcp_server_disabled"
+            sdk_call.assert_not_awaited()
+            assert entry.tools is None
+        else:
+            assert self._answered_ok(kind, result)
+            sdk_call.assert_awaited_once()
+
+    def test_a_call_that_arrives_as_the_lock_is_handed_on_reads_the_row_again(
+        self, running_loop_mgr, storage: SQLiteBackend
+    ) -> None:
+        """Releasing the lock wakes the first queued call but leaves the lock reading free until
+        that call runs. A call that arrives in between still queues behind it, and is refused like
+        the call it queued behind."""
+        mgr, loop, _ = running_loop_mgr
+        self._wire(mgr, storage)
+        session = self._session()
+        entry = self._warm_entry(mgr, loop, session)
+        row = storage.get_mcp_server_by_name("pool-srv")
+        assert row is not None
+        lookup = AsyncMock(return_value=(SimpleNamespace(token="access-aaa"), None))
+        connect = AsyncMock()
+
+        async def _scenario() -> list[Any]:
+            await entry.open_lock.acquire()
+            queued = asyncio.create_task(self._dispatch(mgr, "tool", row))
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert not queued.done()
+            await asyncio.to_thread(storage.update_mcp_server, "srv-pool", enabled=False)
+            arrive = asyncio.Event()
+
+            async def _late() -> Any:
+                await arrive.wait()
+                return await self._dispatch(mgr, "tool", row)
+
+            late = asyncio.create_task(_late())
+            for _ in range(3):
+                await asyncio.sleep(0)
+            # The late call resumes first, while the lock reads free between the hand-off and
+            # the queued call's turn.
+            arrive.set()
+            entry.open_lock.release()
+            assert not entry.open_lock.locked()
+            return list(await asyncio.gather(queued, late))
+
+        with (
+            patch.object(mgr, "_pool_lookup_checked", new=lookup),
+            patch.object(mgr, "_connect_one_pool", new=connect),
+        ):
+            results = _run_on_loop(loop, _scenario())
+        _drain_background(mgr, loop)
+
+        assert [json.loads(r)["error"]["code"] for r in results] == ["mcp_server_disabled"] * 2
+        session.call_tool.assert_not_awaited()
+        connect.assert_not_awaited()
+
+    @pytest.mark.parametrize("kind", ["tool", "resource", "prompt"])
+    def test_a_retry_after_a_401_reads_the_row_before_its_forced_refresh(
+        self, running_loop_mgr, storage: SQLiteBackend, kind: str
+    ) -> None:
+        """An administrator disables the server during the first attempt, which the server
+        answers with 401: the retry is refused before it refreshes or mints, and nothing
+        reconnects."""
+        from mcp import MCPError
+
+        mgr, loop, _ = running_loop_mgr
+        self._wire(mgr, storage)
+        session = MagicMock()
+        entry = self._warm_entry(mgr, loop, session)
+        row = storage.get_mcp_server_by_name("pool-srv")
+        assert row is not None
+
+        async def _answer_401(*args: Any, **kwargs: Any) -> Any:
+            await asyncio.to_thread(storage.update_mcp_server, "srv-pool", enabled=False)
+            entry.auth_capture.status = 401
+            raise MCPError(code=-32001, message="Unauthorized")
+
+        setattr(session, self._SDK_METHOD[kind], _answer_401)
+        forced: list[bool] = []
+
+        async def _lookup(
+            server_row: dict[str, Any], user_id: str, server_name: str, *, force_refresh: bool
+        ) -> Any:
+            forced.append(force_refresh)
+            return SimpleNamespace(kind="token", token="access-aaa"), None
+
+        connect = AsyncMock()
+        common: dict[str, Any] = {
+            "user_id": "user-1",
+            "server_name": "pool-srv",
+            "server_row": row,
+            "timeout": 10,
+        }
+        calls = {
+            "tool": lambda: mgr._dispatch_pool_sync(
+                original_name="do_thing", arguments={}, **common
+            ),
+            "resource": lambda: mgr._dispatch_pool_resource_sync(uri="res://x/1", **common),
+            "prompt": lambda: mgr._dispatch_pool_prompt_sync(
+                original_name="p", arguments=None, **common
+            ),
+        }
+
+        with (
+            patch.object(mgr, "_pool_lookup_checked", new=_lookup),
+            patch.object(mgr, "_connect_one_pool", new=connect),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            calls[kind]()
+        _drain_background(mgr, loop)
+
+        assert json.loads(str(exc_info.value))["error"]["code"] == "mcp_server_disabled"
+        assert forced == [False]
+        connect.assert_not_awaited()
+        assert entry.tools is None
+
+    @pytest.mark.parametrize(
+        ("change", "kept"),
+        [
+            ("enabled-again", True),
+            ("still-disabled", False),
+            ("removed", False),
+            ("unreadable", True),
+        ],
+    )
+    def test_a_drop_that_waited_clears_only_a_row_read_as_disabled_or_removed(
+        self, running_loop_mgr, storage: SQLiteBackend, change: str, kept: bool
+    ) -> None:
+        mgr, loop, _ = running_loop_mgr
+        self._wire(mgr, storage)
+        entry = self._warm_entry(mgr, loop, MagicMock())
+        storage.update_mcp_server("srv-pool", enabled=False)
+
+        async def _scenario() -> None:
+            await entry.open_lock.acquire()
+            mgr._schedule_disabled_server_drop(("user-1", "pool-srv"))
+            # The session goes at once, without the lock, so refreshes parked on it give up.
+            assert entry.session is None
+            if change == "enabled-again":
+                await asyncio.to_thread(storage.update_mcp_server, "srv-pool", enabled=True)
+            elif change == "removed":
+                await asyncio.to_thread(storage.delete_mcp_server, "srv-pool")
+            entry.open_lock.release()
+
+        unreadable = (
+            patch.object(
+                storage, "get_mcp_server_by_name", side_effect=RuntimeError("database is locked")
+            )
+            if change == "unreadable"
+            else contextlib.nullcontext()
+        )
+        with unreadable:
+            _run_on_loop(loop, _scenario())
+            _drain_background(mgr, loop)
+
+        assert (entry.tools is not None) is kept
+        assert mgr.is_mcp_tool("mcp__pool-srv__do_thing", user_id="user-1") is kept
+
+    def test_a_drop_with_nothing_left_to_clear_reads_no_row(
+        self, running_loop_mgr, storage: SQLiteBackend
+    ) -> None:
+        """Each refused call schedules a drop; the ones after the first find the catalog gone."""
+        mgr, loop, _ = running_loop_mgr
+        self._wire(mgr, storage)
+        entry = self._warm_entry(mgr, loop, MagicMock())
+        storage.update_mcp_server("srv-pool", enabled=False)
+        key = ("user-1", "pool-srv")
+        _run_on_loop(loop, mgr._drop_disabled_server_catalog(key))
+        assert entry.tools is None
+
+        with patch.object(
+            storage, "get_mcp_server_by_name", wraps=storage.get_mcp_server_by_name
+        ) as read:
+            _run_on_loop(loop, mgr._drop_disabled_server_catalog(key))
+
+        read.assert_not_called()
+
+    def test_a_disabled_obo_server_is_neither_minted_nor_primed(
+        self, running_loop_mgr, storage: SQLiteBackend
+    ) -> None:
+        mgr, loop, _ = running_loop_mgr
+        mgr.set_storage(storage)
+        app_state = _make_app_state(storage, cipher=make_mcp_token_cipher())
+        oauth_context(app_state).oidc_config = SimpleNamespace(issuer="https://idp.example.com")
+        mgr.set_app_state(app_state)
+        storage.upsert_oidc_user_credential(
+            "user-1", "https://idp.example.com", refresh_token_ct=b"ct"
+        )
+        storage.create_mcp_server(
+            server_id="srv-obo",
+            name="obo-srv",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-a",
+        )
+        storage.update_mcp_server("srv-obo", enabled=False)
+        mgr._obo_server_names = {"obo-srv"}
+        mgr._oauth_user_server_names = set()
+        prime = AsyncMock()
+        mint = AsyncMock(return_value=SimpleNamespace(kind="token", token="minted-at"))
+
+        with (
+            patch.object(mgr, "_prime_user_server", new=prime),
+            patch("turnstone.core.mcp_client.get_obo_access_token_classified", new=mint),
+        ):
+            _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+
+        mint.assert_not_awaited()
+        prime.assert_not_awaited()
+
+    def test_a_disabled_oauth_user_server_is_neither_refreshed_nor_primed(
+        self, running_loop_mgr, storage: SQLiteBackend
+    ) -> None:
+        """A process's registry can list the server until its reload: its grant must not be
+        refreshed at the authorization server on the user's behalf meanwhile."""
+        mgr, loop, _ = running_loop_mgr
+        self._wire(mgr, storage)
+        storage.update_mcp_server("srv-pool", enabled=False)
+        prime = AsyncMock()
+        lookup = AsyncMock(return_value=SimpleNamespace(kind="token", token="bearer"))
+
+        with (
+            patch.object(mgr, "_prime_user_server", new=prime),
+            patch("turnstone.core.mcp_client.get_user_access_token_classified", new=lookup),
+        ):
+            _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+
+        lookup.assert_not_awaited()
+        prime.assert_not_awaited()
+
+    def test_a_removed_oauth_user_server_still_has_its_dead_grant_dropped_at_prime(
+        self, running_loop_mgr, storage: SQLiteBackend
+    ) -> None:
+        """A missing row does not stop the oauth_user lookup: a process whose registry still
+        lists the server learns from it that the grant is gone and drops the stale catalog."""
+        mgr, loop, _ = running_loop_mgr
+        self._wire(mgr, storage)
+        self._warm_entry(mgr, loop, None)
+        assert storage.delete_mcp_server("srv-pool")
+        lookup = AsyncMock(return_value=SimpleNamespace(kind="missing", token=None))
+
+        with (
+            patch("turnstone.core.mcp_client.get_user_access_token_classified", new=lookup),
+            patch.object(mgr, "_schedule_dead_grant_drop") as dead_grant_drop,
+        ):
+            _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+
+        lookup.assert_awaited_once()
+        dead_grant_drop.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("change", "connects"),
+        [("disabled", False), ("removed", False), ("unreadable", True), ("unchanged", True)],
+    )
+    def test_a_prime_reads_the_row_again_before_it_connects(
+        self, running_loop_mgr, storage: SQLiteBackend, change: str, connects: bool
+    ) -> None:
+        """The token came from a consent's code exchange or a mint that an administrator's
+        disable or delete overtook."""
+        mgr, loop, _ = running_loop_mgr
+        self._wire(mgr, storage)
+        if change == "disabled":
+            storage.update_mcp_server("srv-pool", enabled=False)
+        elif change == "removed":
+            assert storage.delete_mcp_server("srv-pool")
+        connect = AsyncMock(return_value=SimpleNamespace(session=MagicMock(), tools=[]))
+        unreadable = (
+            patch.object(
+                storage, "get_mcp_server_by_name", side_effect=RuntimeError("database is locked")
+            )
+            if change == "unreadable"
+            else contextlib.nullcontext()
+        )
+
+        with patch.object(mgr, "_connect_one_pool", new=connect), unreadable:
+            _run_on_loop(
+                loop,
+                mgr._prime_user_server(
+                    ("user-1", "pool-srv"), {"url": "https://mcp.example.com/sse"}, "bearer"
+                ),
+            )
+
+        assert connect.await_count == (1 if connects else 0)
+
+    def test_a_disable_during_the_obo_mint_connects_nothing(
+        self, running_loop_mgr, storage: SQLiteBackend
+    ) -> None:
+        mgr, loop, _ = running_loop_mgr
+        mgr.set_storage(storage)
+        app_state = _make_app_state(storage, cipher=make_mcp_token_cipher())
+        oauth_context(app_state).oidc_config = SimpleNamespace(issuer="https://idp.example.com")
+        mgr.set_app_state(app_state)
+        storage.upsert_oidc_user_credential(
+            "user-1", "https://idp.example.com", refresh_token_ct=b"ct"
+        )
+        storage.create_mcp_server(
+            server_id="srv-obo",
+            name="obo-srv",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-a",
+        )
+        mgr._obo_server_names = {"obo-srv"}
+        mgr._oauth_user_server_names = set()
+
+        async def _mint(**kwargs: Any) -> Any:
+            await asyncio.to_thread(storage.update_mcp_server, "srv-obo", enabled=False)
+            return SimpleNamespace(kind="token", token="minted-at")
+
+        connect = AsyncMock()
+        with (
+            patch("turnstone.core.mcp_client.get_obo_access_token_classified", new=_mint),
+            patch.object(mgr, "_connect_one_pool", new=connect),
+        ):
+            _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+
+        connect.assert_not_awaited()
+
+    def test_the_consent_prime_skips_a_disabled_server(self) -> None:
+        mgr = MCPClientManager({})
+        mgr._oauth_user_server_names = {"pool-srv"}
+        mgr._loop = MagicMock()
+        row = {"transport": "streamable-http", "url": "https://mcp.example.com/sse"}
+
+        with patch.object(mgr, "_submit_prime") as submit:
+            mgr.schedule_prime_user_server(
+                user_id="user-1",
+                server_name="pool-srv",
+                access_token="bearer",
+                server_row={**row, "enabled": False},
+            )
+            submit.assert_not_called()
+            mgr.schedule_prime_user_server(
+                user_id="user-1",
+                server_name="pool-srv",
+                access_token="bearer",
+                server_row={**row, "enabled": True},
+            )
+            submit.assert_called_once()

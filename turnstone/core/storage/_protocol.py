@@ -3153,17 +3153,16 @@ class StorageBackend(Protocol):
         """Return ``(user_id, server_name, last_exercised_iso)`` for every MCP
         user-token row — the drive set for the background freshness sweep.
 
-        ``last_exercised = COALESCE(last_refreshed, created)`` is the last time
-        the grant's refresh token was exercised; the sweep force-refreshes once
-        it exceeds the configured keepalive window, so a provider that ages out
-        an *idle* refresh token can't expire one between a user's real sessions.
-        Deliberately UNFILTERED by ``expires_at``: an expired access token backed
-        by a live refresh token is still a consented, reconcilable grant. Only
-        The storage query joins ``mcp_servers`` and keeps only
-        ``auth_type='oauth_user'`` rows. Other auth paths also use the token
-        table as a mint cache, but they are not refresh-grant sweep targets.
-        Ciphertext columns are never touched — only identity + timestamp cross
-        the wire.
+        ``last_exercised = COALESCE(last_refreshed, created)`` is the last time the grant's refresh
+        token was exercised; the sweep force-refreshes once it exceeds the configured keepalive
+        window, so a provider that ages out an *idle* refresh token can't expire one between a
+        user's real sessions. Deliberately UNFILTERED by ``expires_at``: an expired access token
+        backed by a live refresh token is still a consented, reconcilable grant. The storage query
+        joins ``mcp_servers`` and keeps only rows of enabled ``auth_type='oauth_user'`` servers, so
+        the sweep stops refreshing a disabled server's grants on every host without waiting for its
+        reload. Other auth paths also use the token table as a mint cache, but they are not
+        refresh-grant sweep targets. Ciphertext columns are never touched — only identity +
+        timestamp cross the wire.
         """
         ...
 

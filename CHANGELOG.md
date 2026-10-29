@@ -14,12 +14,30 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 > **Before upgrading:** the database advances from migration 084 to 085, which
 > records what each pending MCP sign-in was started against. A sign-in begun
-> before the upgrade fails as expired; connecting again works. Custom storage
-> backends must accept and return the new pending-flow fields (`as_issuer`,
-> `iss_parameter_supported`, `server_id`, `server_url`, `audience`), take
-> `purge_oauth_rows` on `update_mcp_server`, and purge an MCP server's
-> name-keyed OAuth rows inside the transaction that creates, updates or
-> deletes it.
+> before the upgrade fails as expired; connecting again works. A user whose MCP
+> grant was recorded before 1.8.2 with a templated (`{tenantid}`) issuer is
+> asked to connect again at its next refresh.
+>
+> Custom storage backends must:
+> - accept and return the new pending-flow fields (`as_issuer`,
+>   `iss_parameter_supported`, `server_id`, `server_url`, `audience`);
+> - purge an MCP server's name-keyed OAuth rows inside the transaction that
+>   creates, updates or deletes it, and take `purge_oauth_rows`,
+>   `oauth_client_secret_ct` (written in the same statement; the
+>   `MCP_SECRET_UNCHANGED` default leaves it) and `expected` (write only while
+>   those columns hold those values) on `update_mcp_server`;
+> - take `expected_as_issuer` and `expected_access_token_ct` on
+>   `update_oauth_token_after_refresh`, writing only while the row still holds
+>   them, and provide `delete_oauth_token_if_unchanged`;
+> - provide `unlink_oidc_identity`, `replace_consented_oauth_token`,
+>   `replace_delegated_oauth_token` (with `obo_server`, answering
+>   `binding_changed` when that server is no longer an on-behalf-of server),
+>   `upsert_oidc_user_credential_for_identity` and
+>   `delete_prompt_template_if_enabled`, each as one transaction;
+>   `delete_oidc_identity` and `delete_oidc_user_credential` are gone (an
+>   identity and its credential go only through `unlink_oidc_identity`);
+> - return only enabled servers' grants from
+>   `list_mcp_user_token_reconcile_targets`.
 
 ### Security
 
@@ -90,6 +108,19 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   prompt returns to it if the server lists it again. An update to a skill
   deleted meanwhile answers `404` in the admin API, and the `skills` tool
   reports it to the model; neither records the change as done.
+- **A disabled per-user MCP server is no longer called.** Every tool call,
+  resource read and prompt get for an `oauth_user` or `oauth_obo` server
+  checks that the server is still enabled, before any token refresh or mint
+  (the retry after a `401` included), and a disabled one answers
+  `mcp_server_disabled` on every host without waiting for the reload. Each
+  call checks again once it holds the user's connection to the server, which
+  also refuses a call to a server deleted meanwhile. The first refused call
+  takes the server out of the user's live sessions, and each refusal is
+  logged. Connect for a disabled server answers `404`, the admin tab no
+  longer offers it, the dashboard no longer lists it as waiting for consent,
+  and a consent in progress when it is disabled stores no grant. Session
+  starts neither refresh nor connect it, and the token sweep no longer
+  refreshes its grants.
 
 ### Changed
 

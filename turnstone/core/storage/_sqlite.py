@@ -6174,8 +6174,9 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
 
         Unfiltered by expiry: an expired access token with a live refresh token
         is still a consented grant the sweep must keep hot. Joined to
-        ``mcp_servers`` so only ``oauth_user`` grants drive the sweep; synthetic
-        model mint-cache rows are excluded. No ciphertext is projected.
+        ``mcp_servers`` so only grants of enabled ``oauth_user`` servers drive the
+        sweep; synthetic model mint-cache rows are excluded. No ciphertext is
+        projected.
         """
         with self._conn() as conn:
             rows = conn.execute(
@@ -6190,7 +6191,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                         mcp_servers.c.name == oauth_tokens.c.token_key,
                     )
                 )
-                .where(mcp_servers.c.auth_type == "oauth_user")
+                .where((mcp_servers.c.auth_type == "oauth_user") & (mcp_servers.c.enabled == 1))
             ).fetchall()
         return [(row[0], row[1], row[2]) for row in rows]
 

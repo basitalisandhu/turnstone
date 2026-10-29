@@ -135,6 +135,23 @@ class TestListPending:
         assert body["servers"][0]["server_name"] == "srv-x"
         assert body["servers"][0]["error_code"] == "mcp_consent_required"
 
+    def test_a_disabled_server_is_not_listed_until_it_is_enabled_again(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Its Connect would answer 404, so its record waits unlisted."""
+        _seed_oauth_server(storage)
+        _seed_oauth_server(storage, name="srv-y")
+        _seed_pending(storage)
+        _seed_pending(storage, server_name="srv-y")
+        storage.update_mcp_server("srv-id-srv-x", enabled=False)
+        client = TestClient(_build_app(storage))
+
+        listed = client.get("/v1/api/mcp/oauth/pending").json()
+        assert (listed["pending"], [s["server_name"] for s in listed["servers"]]) == (1, ["srv-y"])
+
+        storage.update_mcp_server("srv-id-srv-x", enabled=True)
+        assert client.get("/v1/api/mcp/oauth/pending").json()["pending"] == 2
+
     def test_does_not_leak_cross_user_records(self, storage: SQLiteBackend) -> None:
         _seed_oauth_server(storage)
         _seed_pending(storage, user_id="user-2")

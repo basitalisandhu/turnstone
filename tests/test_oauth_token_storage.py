@@ -499,6 +499,23 @@ class TestGuardedDelegatedWrites:
         assert credential is not None and credential["refresh_token_ct"] == b"rt"
 
 
+def test_the_freshness_sweep_skips_a_disabled_servers_grants(backend: Any) -> None:
+    for server_id, name in (("s-on", "on-srv"), ("s-off", "off-srv")):
+        backend.create_mcp_server(
+            server_id=server_id,
+            name=name,
+            transport="streamable-http",
+            url=f"https://{name}.example.com/mcp",
+            auth_type="oauth_user",
+        )
+        _seed_token(backend, "u1", name)
+    backend.update_mcp_server("s-off", enabled=False)
+
+    targets = backend.list_mcp_user_token_reconcile_targets()
+
+    assert [(user, server) for user, server, _ in targets] == [("u1", "on-srv")]
+
+
 def test_a_server_update_applies_only_while_the_row_holds_what_was_read(backend: Any) -> None:
     backend.create_mcp_server(
         server_id="s1",

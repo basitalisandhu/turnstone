@@ -20,7 +20,8 @@ function _mcpErrorCategory(code) {
   }
   if (
     code === "mcp_token_undecryptable_key_unknown" ||
-    code === "mcp_oauth_url_insecure"
+    code === "mcp_oauth_url_insecure" ||
+    code === "mcp_server_disabled"
   ) {
     return "operator";
   }
@@ -41,6 +42,8 @@ function _mcpErrorTitle(err) {
     case "mcp_token_undecryptable_key_unknown":
     case "mcp_oauth_url_insecure":
       return "Operator action required";
+    case "mcp_server_disabled":
+      return "Server disabled";
     case "mcp_refresh_unavailable":
       return "Temporarily unavailable";
     default:

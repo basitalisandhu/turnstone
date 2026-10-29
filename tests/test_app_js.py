@@ -1230,6 +1230,25 @@ def test_phase8_xss_safe_render_in_build_mcp_error_embed() -> None:
     )
 
 
+def test_mcp_error_card_names_a_disabled_server() -> None:
+    """``mcp_server_disabled`` renders as an operator card titled for the cause, with no
+    button: re-consent cannot help, and the default category would title it Forbidden."""
+    body = _MCP_ERROR_JS.read_text(encoding="utf-8")
+
+    def _function(name: str) -> str:
+        rest = body[body.index(f"function {name}(") :]
+        end = re.search(r"\n}\n", rest)
+        assert end is not None
+        return rest[: end.end()]
+
+    category = _function("_mcpErrorCategory")
+    branch = category[category.index('"mcp_server_disabled"') :]
+    assert branch.index("return") == branch.index('return "operator"')
+    assert 'case "mcp_server_disabled":\n      return "Server disabled";' in _function(
+        "_mcpErrorTitle"
+    )
+
+
 def test_mcp_error_button_gated_on_consent_url_not_code_alone() -> None:
     """Review finding: the chat error card rendered a Connect / Re-consent
     button from the error CODE alone, so an oauth_obo error (consent_url=None,

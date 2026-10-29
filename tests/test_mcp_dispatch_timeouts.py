@@ -20,7 +20,12 @@ from tests.conftest import (
 from turnstone.core.mcp_client import MCPClientManager, PoolEntryState, _decode_tool_result
 
 _KEY = ("user-1", "srv")
-_ROW = {"name": "srv", "transport": "streamable-http", "url": "http://127.0.0.1:1/mcp"}
+_ROW = {
+    "name": "srv",
+    "transport": "streamable-http",
+    "url": "http://127.0.0.1:1/mcp",
+    "enabled": True,
+}
 _SDK_METHODS = {"tool": "call_tool", "resource": "read_resource", "prompt": "get_prompt"}
 
 

@@ -1353,6 +1353,7 @@ _BUG1_STRUCTURED_ERROR_CODES = (
     "mcp_tool_call_forbidden",
     "mcp_token_undecryptable_key_unknown",
     "mcp_oauth_url_insecure",
+    "mcp_server_disabled",
 )
 
 
@@ -1791,7 +1792,10 @@ class TestPoolPrimingAndTokenRotation:
         mgr._prime_user_server_logged = _fake_logged.__get__(mgr, type(mgr))  # type: ignore[method-assign]
 
         mgr.schedule_prime_user_server(
-            user_id="user-1", server_name="not-oauth", access_token="t", server_row={}
+            user_id="user-1",
+            server_name="not-oauth",
+            access_token="t",
+            server_row={"enabled": True},
         )
         # Give any erroneously-scheduled coroutine a chance to run.
         _run_on_loop(loop, asyncio.sleep(0.05))

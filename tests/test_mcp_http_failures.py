@@ -221,7 +221,13 @@ def dispatch_env(request, upstream_server, monkeypatch):
     # No health-loop reconnect may hide the failed dispatch's eviction or breaker count.
     monkeypatch.setattr(mgr, "_static_health_loop", AsyncMock())
     if pooled:
-        row = {"name": "srv", "transport": "streamable-http", "url": url, "auth_type": "oauth_user"}
+        row = {
+            "name": "srv",
+            "transport": "streamable-http",
+            "url": url,
+            "auth_type": "oauth_user",
+            "enabled": True,
+        }
         storage = MagicMock()
         storage.get_mcp_server_by_name.return_value = row
         mgr.set_storage(storage)
